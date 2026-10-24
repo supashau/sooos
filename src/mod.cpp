@@ -712,19 +712,10 @@ static bool owned() {
     return false;
 }
 
-// puts the leaf in its wheel slot if it isn't there yet; logs once if something else is sitting there
-static bool give_leaf(const char* why) {
-    if (owned()) return false;
-    u8 inSlot = dComIfGs_getItem(leafSlot, false);
-    if (inSlot != dItemNo_NONE_e) {
-        static bool warned;
-        if (!warned) mods::log::warn("ice leaf: slot 7 already holds item {:#x}, can't add it ({})", inSlot, why);
-        warned = true;
-        return false;
-    }
+// puts the leaf in its wheel slot unless it's already owned or the slot is taken
+static void give_leaf() {
+    if (owned() || dComIfGs_getItem(leafSlot, false) != dItemNo_NONE_e) return;
     setLeafSlot(leafItem);
-    mods::log::info("ice leaf added ({})", why);
-    return true;
 }
 
 static void forgetIcon(void* buf) {
@@ -774,7 +765,7 @@ static HookAction exec_pre(ModContext*, void* args, void*, void*) {
         got = rdBlob("got");
         if (rdBlob("hidden")) {
             wrBlob("hidden", 0);
-            give_leaf("turned back on");
+            give_leaf();
         }
     }
 
@@ -797,7 +788,7 @@ static HookAction exec_pre(ModContext*, void* args, void*, void*) {
         wrBlob("got", 1);
         got = true;
         bool fresh = !owned();
-        if (fresh) give_leaf("snowpeak slide");
+        if (fresh) give_leaf();
         if (fresh && !always && fanfareBox == fpcM_ERROR_PROCESS_ID_e) {
             fanfareBox = show_leaf_get();
             mDoAud_subBgmStart(Z2BGM_ITEM_GET);
@@ -811,13 +802,13 @@ static HookAction exec_pre(ModContext*, void* args, void*, void*) {
             wrBlob("got", 1);
             got = true;
         }
-        give_leaf("snowpeak cleared");
+        give_leaf();
     }
 
     // ownership lives in the save's own inventory, the blob only says whether the tree leaf was ever earned.
     // grants happen on the break above or from the toggle, never from the blob alone: it can still be
     // the last save's value for a moment after switching files
-    if (always) give_leaf("always have");
+    if (always) give_leaf();
     else if (wasAlways && !always && !got && gotPoll > 90 && dComIfGs_getItem(leafSlot, true) == leafItem) {
         if (out()) drop(link);
         setLeafSlot(dItemNo_NONE_e);
