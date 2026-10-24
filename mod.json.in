@@ -1,7 +1,7 @@
 {
-  "id": "com.geotypical.lessrestrictivemaps",
-  "name": "Less Restrictive Maps",
-  "version": "0.0.1",
+  "id": "com.geotypical.toolsandexpansion",
+  "name": "Geo's Tools and Expansion",
+  "version": "@PROJECT_VERSION@",
   "author": "Geotypical",
-  "description": "Adds extra QOL map changes and logic to the game."
+  "description": "Adds a bunch of new content and quality of life changes to the land of Hyrule."
 }
