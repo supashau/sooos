@@ -64,10 +64,13 @@ IMPORT_SERVICE(ItemService, svc_item);
 // ======================== settings ========================
 
 // maps
-static const char* eponaStages[] = {"F_SP116", "F_SP127", "F_SP124"};
-static const char* eponaKeys[] = {"castleTown", "fishingHole", "gerudoDesert"};
-static const char* eponaLabels[] = {"Epona in Castle Town", "Epona at the Fishing Hole", "Epona in Gerudo Desert"};
-static ConfigVarHandle eponaToggle[3];
+#define EPONA_AREAS 4
+#define GROVE_AREA 3
+static const char* eponaStages[] = {"F_SP116", "F_SP127", "F_SP124", "F_SP117"};
+static const char* eponaKeys[] = {"castleTown", "fishingHole", "gerudoDesert", "sacredGrove"};
+static const char* eponaLabels[] = {"Epona in Castle Town", "Epona at the Fishing Hole", "Epona in Gerudo Desert",
+                                    "Epona in Sacred Grove"};
+static ConfigVarHandle eponaToggle[EPONA_AREAS];
 
 enum MistMode : int { MIST_OFF, MIST_SEMI, MIST_ON };
 static const char* const mistNames[] = {"Off", "Semi-Default", "On"};
@@ -138,12 +141,18 @@ static int drawingRoom = -1;
 
 static int horse_area(const char* stage) {
     int area = 0;
-    while (stage && area < 3 && strcmp(stage, eponaStages[area]) != 0) area++;
-    return stage && area < 3 ? area : -1;
+    while (stage && area < EPONA_AREAS && strcmp(stage, eponaStages[area]) != 0) area++;
+    return stage && area < EPONA_AREAS ? area : -1;
 }
 
-static bool horse_allowed(int area) {
-    return area >= 0 && cfgOn(eponaToggle[area]);
+// F_SP117 also holds the Temple of Time (room 2); only the Lost Woods (3) and the grove (1) count
+static bool horse_allowed(int area, int room) {
+    if (area < 0 || !cfgOn(eponaToggle[area])) return false;
+    return area != GROVE_AREA || room == 1 || room == 3;
+}
+
+static int room_now() {
+    return dComIfGp_roomControl_getStayNo();
 }
 
 // --- Epona ---
@@ -183,7 +192,11 @@ static HookAction remember_stage(ModContext*, void* args, void* ret, void*) {
 }
 
 // same area = stay mounted, anything else hangs so drop Link off
+static void latch_shop_mode();  // lives with the Chudley's code
+
+// runs on every stage change
 static void check_horse_arrival(ModContext*, void* args, void* ret, void*) {
+    latch_shop_mode();
     rodeIn = false;
     int dest = horse_area(stage_now());
     int src = horse_area(oldStage);
@@ -194,7 +207,7 @@ static void check_horse_arrival(ModContext*, void* args, void* ret, void*) {
     u32 kind = lastMode & 0xF;
     if (kind != 1 && kind != 8) return;
 
-    if (dest == src && horse_allowed(dest))
+    if (dest == src && horse_allowed(dest, dComIfGp_getStartStageRoomNo()))
         rodeIn = true;
     else
         restart.setLastSceneInfo(restart.getLastSpeedF(), lastMode & ~0xFu, restart.getLastAngleY());
@@ -202,7 +215,7 @@ static void check_horse_arrival(ModContext*, void* args, void* ret, void*) {
 
 static void allow_horse_call(ModContext*, void* args, void* ret, void*) {
     u16 item = mods::arg<u16>(args, 0);  // static func, no this
-    if (item == dItemNo_HORSE_FLUTE_e && horse_allowed(horse_area(stage_now())))
+    if (item == dItemNo_HORSE_FLUTE_e && horse_allowed(horse_area(stage_now()), room_now()))
         *(bool*)ret = true;
 }
 
@@ -265,7 +278,7 @@ static void epona_tick() {
     }
 
     int area = horse_area(stage_now());
-    bool allowed = horse_allowed(area);
+    bool allowed = horse_allowed(area, room_now());
 
     // toggled off while she's here
     if (area >= 0 && !allowed && myEpona != fpcM_ERROR_PROCESS_ID_e) {
@@ -313,7 +326,7 @@ static bool mist_room(int room) {
 static bool mist_gone() {
     switch (cfgInt(mistOption, MIST_OFF)) {
     case MIST_ON:
-        return !dComIfGs_isEventBit(0x4510) || dComIfGs_isDarkClearLV(0);  // not mid-twilight
+        return true;
     case MIST_SEMI:
         return dComIfGs_isEventBit(0x0602) && dComIfGs_isEventBit(0x1B08);  // temple + lantern monkey
     default:
@@ -321,8 +334,18 @@ static bool mist_gone() {
     }
 }
 
-static bool in_clear_faron() {
-    return stage_is("F_SP108") && !dKy_darkworld_check() && mist_gone();
+// the mist itself; On clears it in the twilight too
+static bool faron_mist_off() {
+    if (!stage_is("F_SP108") || !mist_gone()) return false;
+    return !dKy_darkworld_check() || cfgInt(mistOption, MIST_OFF) == MIST_ON;
+}
+
+// the daylight swap never runs in the twilight, its palette has to stay. On also skips the
+// stretch between Ordon day 2 and clearing the twilight, when Faron runs on the story's clock
+static bool faron_relit() {
+    if (!stage_is("F_SP108") || dKy_darkworld_check() || !mist_gone()) return false;
+    bool storyStretch = dComIfGs_isEventBit(0x4510) && !dComIfGs_isDarkClearLV(0);
+    return cfgInt(mistOption, MIST_OFF) != MIST_ON || !storyStretch;
 }
 
 static HookAction note_bg_room(ModContext*, void* args, void* ret, void*) {
@@ -337,7 +360,7 @@ static void clear_bg_room(ModContext*, void* args, void* ret, void*) {
 // MA11 = mist sheet
 static void hide_mist_sheet(ModContext*, void* args, void* ret, void*) {
     auto* model = static_cast<J3DModel*>(mods::arg<void*>(args, 0));
-    if (model == nullptr || !mist_room(drawingRoom) || !in_clear_faron()) return;
+    if (model == nullptr || !mist_room(drawingRoom) || !faron_mist_off()) return;
 
     J3DModelData* data = model->getModelData();
     u16 count = data->getMaterialNum();
@@ -365,12 +388,12 @@ static void pause_map_switch(ModContext*, void* args, void* ret, void*) {
 
 static void minimap_switch(ModContext*, void* args, void* ret, void*) {
     int room = mods::arg<renderingDAmap_c*>(args, 0)->mRoomNo;
-    unpurple_group(args, ret, room, in_clear_faron());
+    unpurple_group(args, ret, room, faron_mist_off());
 }
 
 static HookAction kill_mist_tag(ModContext*, void* args, void* ret, void*) {
     kytag08_class* tag = mods::arg<kytag08_class*>(args, 0);
-    bool clear = in_clear_faron();
+    bool clear = faron_mist_off();
 
     if (tag->mpEmitter1) clear ? tag->mpEmitter1->stopDrawParticle() : tag->mpEmitter1->playDrawParticle();
     if (tag->mpEmitter2) clear ? tag->mpEmitter2->stopDrawParticle() : tag->mpEmitter2->playDrawParticle();
@@ -524,7 +547,7 @@ static void faron_lighting_tick() {
     // tables from the last scene are gone already
     if (lightingOn && (!link || fopAcM_GetID(link) != lightingLink)) lightingOn = false;
 
-    if (!inFaron || !in_clear_faron()) {
+    if (!inFaron || !faron_relit()) {
         put_lighting_back();
         return;
     }
@@ -689,6 +712,21 @@ static bool owned() {
     return false;
 }
 
+// puts the leaf in its wheel slot if it isn't there yet; logs once if something else is sitting there
+static bool give_leaf(const char* why) {
+    if (owned()) return false;
+    u8 inSlot = dComIfGs_getItem(leafSlot, false);
+    if (inSlot != dItemNo_NONE_e) {
+        static bool warned;
+        if (!warned) mods::log::warn("ice leaf: slot 7 already holds item {:#x}, can't add it ({})", inSlot, why);
+        warned = true;
+        return false;
+    }
+    setLeafSlot(leafItem);
+    mods::log::info("ice leaf added ({})", why);
+    return true;
+}
+
 static void forgetIcon(void* buf) {
     for (int i = 0; i < nIcons; i++) {
         if (iconOwner[i] != buf) continue;
@@ -736,7 +774,7 @@ static HookAction exec_pre(ModContext*, void* args, void*, void*) {
         got = rdBlob("got");
         if (rdBlob("hidden")) {
             wrBlob("hidden", 0);
-            if (!owned() && dComIfGs_getItem(leafSlot, true) == dItemNo_NONE_e) setLeafSlot(leafItem);
+            give_leaf("turned back on");
         }
     }
 
@@ -759,7 +797,7 @@ static HookAction exec_pre(ModContext*, void* args, void*, void*) {
         wrBlob("got", 1);
         got = true;
         bool fresh = !owned();
-        if (fresh && dComIfGs_getItem(leafSlot, true) == dItemNo_NONE_e) setLeafSlot(leafItem);
+        if (fresh) give_leaf("snowpeak slide");
         if (fresh && !always && fanfareBox == fpcM_ERROR_PROCESS_ID_e) {
             fanfareBox = show_leaf_get();
             mDoAud_subBgmStart(Z2BGM_ITEM_GET);
@@ -773,13 +811,13 @@ static HookAction exec_pre(ModContext*, void* args, void*, void*) {
             wrBlob("got", 1);
             got = true;
         }
-        if (!owned() && dComIfGs_getItem(leafSlot, true) == dItemNo_NONE_e) setLeafSlot(leafItem);
+        give_leaf("snowpeak cleared");
     }
 
     // ownership lives in the save's own inventory, the blob only says whether the tree leaf was ever earned.
     // grants happen on the break above or from the toggle, never from the blob alone: it can still be
     // the last save's value for a moment after switching files
-    if (always && dComIfGs_getItem(leafSlot, true) == dItemNo_NONE_e) setLeafSlot(leafItem);
+    if (always) give_leaf("always have");
     else if (wasAlways && !always && !got && gotPoll > 90 && dComIfGs_getItem(leafSlot, true) == leafItem) {
         if (out()) drop(link);
         setLeafSlot(dItemNo_NONE_e);
@@ -969,8 +1007,17 @@ static void tex_post(ModContext*, void*, void*, void*) {
 
 DEFINE_HOOK(&dSv_event_c::isEventBit, EventBit);
 
+// the shop interior keeps whatever option it was loaded with, like the game's own layers do;
+// changing it while inside only takes effect after leaving and coming back
+static int shopModeLoaded = -1;
+
+static void latch_shop_mode() {
+    shopModeLoaded = cfgInt(shopOption, SHOP_SEMI);
+}
+
 static int shop_mode(bool inside) {
     if (!stage_is(inside ? "R_SP160" : "F_SP116")) return SHOP_OFF;
+    if (inside && shopModeLoaded >= 0) return shopModeLoaded;
     return cfgInt(shopOption, SHOP_SEMI);
 }
 
@@ -1011,31 +1058,59 @@ static void* chunk_data(void* file, OffsetPtr& off) {
 // the tag's own create wrapper, fires before the shopkeeper looks at the shelf
 DEFINE_HOOK_SYMBOL("src/d/actor/d_a_tag_shop_item.cpp#daTag_ShopItem_Create", int(void*), ShelfSpawn);
 
-// use the Malo Mart (ACT1) prompt for the same item
+static bool is_shelf_tag(const stage_actor_data_class* actor) {
+    return strncmp(actor->name, "TGSPITM", 8) == 0;
+}
+
+// Malo Mart swaps a bought Magic Armor for an empty stand (item 0xFF, shown once the armor's
+// sold switch is on). Chudley's layer doesn't have one, so put a copy of it where the armor is.
+static void add_armor_stand(daTag_ShopItem_c* armor, stage_actor_data_class* maloActors, int count) {
+    u8 soldSwitch = (u8)armor->home.angle.z;
+    for (int i = 0; i < count; i++) {
+        stage_actor_data_class* stand = &maloActors[i];
+        u32 params = stand->base.parameters;
+        if (!is_shelf_tag(stand) || (u8)params != 0xFF) continue;
+        csXyz rot = stand->base.angle;
+        if (((u16)rot.z >> 8) != soldSwitch) continue;
+
+        // same shop group and slot as the armor, malo mart's flow and switches
+        u32 standParams = (fopAcM_GetParam(armor) & 0xFFFFFF00) | 0xFF;
+        csXyz standRot(rot.x, armor->home.angle.y, rot.z);
+        fopAcM_create(fpcNm_TAG_SHOPITM_e, standParams, &armor->home.pos, fopAcM_GetRoomNo(armor), &standRot, nullptr, -1);
+        return;
+    }
+}
+
+// use the Malo Mart (ACT1) prompt and stock switches for the same item
 static void malo_shelf_prompt(ModContext*, void* args, void* ret, void*) {
     auto* shelf = static_cast<daTag_ShopItem_c*>(mods::arg<void*>(args, 0));
     int mode = shop_mode(true);
     if (mode != SHOP_SEMI && mode != SHOP_PARTIAL) return;
 
-    if (!real_flag(kMaloOpen)) return;
+    u8 sells = (u8)fopAcM_GetParam(shelf);  // low byte is the item
+    if (sells == 0xFF || !real_flag(kMaloOpen)) return;  // 0xFF = a sold-out spot, ours included
 
     void* room = dComIfG_getStageRes(dComIfG_getRoomArcName(fopAcM_GetRoomNo(shelf)), "room.dzr");
     if (room == nullptr) return;
 
     auto* file = static_cast<dStage_fileHeader*>(room);
-    u8 sells = (u8)fopAcM_GetParam(shelf);  // low byte is the item
     int chunk = 0;
     while (chunk < file->m_chunkCount && memcmp(&file->m_nodes[chunk].m_tag, "ACT1", 4) != 0) chunk++;
     if (chunk == file->m_chunkCount) return;
 
     // ACT1 = the Malo Mart layer's actors
     dStage_nodeHeader* maloLayer = &file->m_nodes[chunk];
-    auto* actor = static_cast<stage_actor_data_class*>(chunk_data(room, maloLayer->m_offset));
-    for (int left = maloLayer->m_entryNum; left > 0; left--, actor++) {
+    auto* maloActors = static_cast<stage_actor_data_class*>(chunk_data(room, maloLayer->m_offset));
+    int count = maloLayer->m_entryNum;
+    for (int i = 0; i < count; i++) {
+        stage_actor_data_class* actor = &maloActors[i];
         u32 params = actor->base.parameters;
-        if (strncmp(actor->name, "TGSPITM", 8) != 0 || (u8)params != sells) continue;
+        if (!is_shelf_tag(actor) || (u8)params != sells) continue;
+
         csXyz rot = actor->base.angle;
         shelf->home.angle.x = rot.x;  // the shelf prompt's flow id lives in angle x
+        shelf->home.angle.z = rot.z;  // and its sold-out switches in z
+        if (sells == dItemNo_ARMOR_e) add_armor_stand(shelf, maloActors, count);
         return;
     }
 }
@@ -1972,7 +2047,7 @@ static ModResult build_panel(ModContext*, UiElementHandle panel, void*, ModError
     UiControlDesc t = UI_CONTROL_DESC_INIT;
     t.kind = UI_CONTROL_TOGGLE;
     t.binding = UI_BINDING_CONFIG_VAR;
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < EPONA_AREAS; i++) {
         t.label = eponaLabels[i];
         t.config_var = eponaToggle[i];
         ui->pane_add_control(mod_ctx, panel, &t, nullptr);
@@ -2012,7 +2087,7 @@ extern "C" {
 
 MOD_EXPORT ModResult mod_initialize(ModError* error) {
     // --- Less Restrictive Maps ---
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < EPONA_AREAS; i++) {
         ConfigVarDesc d = CONFIG_VAR_DESC_INIT;
         d.name = eponaKeys[i];
         d.type = CONFIG_VAR_BOOL;
@@ -2023,6 +2098,7 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     if (!add_int_option("removeFaronMist", MIST_SEMI, &mistOption) ||
         !add_int_option("chudleysMode", SHOP_SEMI, &shopOption))
         return mods::set_error(error, MOD_ERROR, "can't register settings");
+    shopModeLoaded = cfgInt(shopOption, SHOP_SEMI);  // whatever room we start in counts as loaded with it
 
     if (!pre_hook(HorseSavePos, keep_field_spot) || !pre_hook(SetStartStage, remember_stage) ||
         !post_hook(SetStartStage, check_horse_arrival))
