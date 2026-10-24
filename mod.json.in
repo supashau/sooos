@@ -1,7 +1,7 @@
 {
-  "id": "com.example.my_mod",
-  "name": "My Mod",
-  "version": "@PROJECT_VERSION@",
-  "author": "You",
-  "description": "An example Dusklight mod"
+  "id": "com.geotypical.lessrestrictivemaps",
+  "name": "Less Restrictive Maps",
+  "version": "0.0.1",
+  "author": "Geotypical",
+  "description": "Adds extra QOL map changes and logic to the game."
 }
