@@ -63,7 +63,7 @@ IMPORT_SERVICE(ItemService, svc_item);
 
 // ======================== settings ========================
 
-// Less Restrictive Maps
+// maps
 static const char* eponaStages[] = {"F_SP116", "F_SP127", "F_SP124"};
 static const char* eponaKeys[] = {"castleTown", "fishingHole", "gerudoDesert"};
 static const char* eponaLabels[] = {"Epona in Castle Town", "Epona at the Fishing Hole", "Epona in Gerudo Desert"};
@@ -77,7 +77,7 @@ enum ShopMode : int { SHOP_OFF, SHOP_SEMI, SHOP_PARTIAL, SHOP_FULL };
 static const char* const shopNames[] = {"Off", "Semi-Default", "Partial-Default", "On"};
 static ConfigVarHandle shopOption;
 
-// Shop Expansion. 0 = register_var failed, boost stays off
+// shop + ice leaf (0 if registering failed)
 static ConfigVarHandle vBoost, vAlways, vGoron, vChud, vLeaf;
 
 // ======================== shared ========================
@@ -85,7 +85,7 @@ static ConfigVarHandle vBoost, vAlways, vGoron, vChud, vLeaf;
 static constexpr u16 kMaloOpen = 0x2210;  // F_0281, Malo Mart open in Castle Town
 static constexpr u16 kDonation = 0x0F10;  // M_091, Malo Mart donation paid
 
-// set while our own code wants the real flags past the Chudley's hiding
+// lets our own reads see past the flag hiding
 static bool peekRealFlags;
 
 static const char* stage_now() {
@@ -116,19 +116,13 @@ static bool real_flag(u16 bit) {
     return on;
 }
 
-template <class H, class F>
-static bool pre(F f) {
-    if (mods::hook::add_pre<H>(f) == MOD_OK) return true;
-    mods::log::error("pre hook failed");
+static bool hooked(ModResult r, const char* kind) {
+    if (r == MOD_OK) return true;
+    mods::log::error("{} hook failed", kind);
     return false;
 }
-
-template <class H, class F>
-static bool post(F f) {
-    if (mods::hook::add_post<H>(f) == MOD_OK) return true;
-    mods::log::error("post hook failed");
-    return false;
-}
+#define pre_hook(H, fn) hooked(mods::hook::add_pre<H>(fn), "pre")
+#define post_hook(H, fn) hooked(mods::hook::add_post<H>(fn), "post")
 
 // ======================== Less Restrictive Maps ========================
 
@@ -143,10 +137,9 @@ static int faronSaveTable = 2;
 static int drawingRoom = -1;
 
 static int horse_area(const char* stage) {
-    if (stage == nullptr) return -1;
-    for (int i = 0; i < 3; i++)
-        if (strcmp(stage, eponaStages[i]) == 0) return i;
-    return -1;
+    int area = 0;
+    while (stage && area < 3 && strcmp(stage, eponaStages[area]) != 0) area++;
+    return stage && area < 3 ? area : -1;
 }
 
 static bool horse_allowed(int area) {
@@ -213,30 +206,31 @@ static void allow_horse_call(ModContext*, void* args, void* ret, void*) {
         *(bool*)ret = true;
 }
 
-static bool pick_epona_spot(daAlink_c* link, cXyz* out) {
-    static const s16 turns[] = {0, 0x2000, -0x2000, 0x4000, -0x4000, 0x6000, -0x6000, -0x8000};
+// one candidate spot: nothing between Link and it, dry ground near his height
+static bool try_spot(daAlink_c* link, s16 dir, f32 reach, cXyz* out) {
     const cXyz& feet = link->current.pos;
     cXyz eye(feet.x, feet.y + 80.0f, feet.z);
+    cXyz spot(feet.x + cM_ssin(dir) * reach, eye.y, feet.z + cM_scos(dir) * reach);
+    if (fopAcM_lc_c::lineCheck(&eye, &spot, link)) return false;
 
-    for (int reach = 130; reach <= 230; reach += 100) {
-        for (s16 turn : turns) {
-            s16 dir = link->shape_angle.y + turn;
-            cXyz spot(feet.x + cM_ssin(dir) * reach, eye.y, feet.z + cM_scos(dir) * reach);
-            if (fopAcM_lc_c::lineCheck(&eye, &spot, link)) continue;
+    spot.y = feet.y + 150.0f;
+    if (!fopAcM_gc_c::gndCheck(&spot) || fopAcM_gc_c::getHorseNoEntry()) return false;
+    f32 ground = fopAcM_gc_c::getGroundY();
+    if (ground > feet.y + 120.0f || ground < feet.y - 120.0f) return false;
 
-            spot.y = feet.y + 150.0f;
-            if (!fopAcM_gc_c::gndCheck(&spot) || fopAcM_gc_c::getHorseNoEntry()) continue;
-            f32 ground = fopAcM_gc_c::getGroundY();
-            f32 step = ground - feet.y;
-            if (step > 120.0f || step < -120.0f) continue;
+    spot.y = ground;
+    if (fopAcM_wt_c::waterCheck(&spot) && fopAcM_wt_c::getWaterY() > ground + 5.0f) return false;
+    *out = spot;
+    return true;
+}
 
-            spot.y = ground;
-            bool wet = fopAcM_wt_c::waterCheck(&spot) && fopAcM_wt_c::getWaterY() > ground + 5.0f;
-            if (wet) continue;
-
-            *out = spot;
-            return true;
-        }
+// front first, then fanning out to the sides and behind; a closer ring before a wider one
+static bool pick_epona_spot(daAlink_c* link, cXyz* out) {
+    static const s16 turns[] = {0, 0x2000, -0x2000, 0x4000, -0x4000, 0x6000, -0x6000, -0x8000};
+    for (int tries = 0; tries < 16; tries++) {
+        f32 reach = tries < 8 ? 130.0f : 230.0f;
+        s16 dir = link->shape_angle.y + turns[tries % 8];
+        if (try_spot(link, dir, reach, out)) return true;
     }
     return false;
 }
@@ -462,6 +456,24 @@ static int add_pick(const env_tables& live, const env_tables& old, int src, int 
     return pickCount++;
 }
 
+// swap one room's env row for the old one, pointing its picks at the merged tables
+static bool merge_room(const env_tables& live, const env_tables& old, int room, const stage_envr_info_class* coroRoom) {
+    if (room >= live.envrNum || room >= old.envrNum) return true;
+
+    auto row = old.envr[room];
+    for (int t = 0; t < 65; t++) {
+        int src = row.pselect_id[t];
+        if (src >= old.pselNum) continue;  // out of range means selection 0, leave it
+        int coro = -1;
+        if (coroRoom && coroRoom->pselect_id[t] < live.pselNum) coro = coroRoom->pselect_id[t];
+        int idx = add_pick(live, old, src, coro);
+        if (idx < 0) return false;
+        row.pselect_id[t] = (u8)idx;
+    }
+    envRows[room] = row;
+    return true;
+}
+
 static bool merge_old_faron(const env_tables& live, const env_tables& old) {
     bool oldSky = old.sky && old.skyNum > 0;
     int skyTotal = live.skyNum + (oldSky ? old.skyNum : 0);
@@ -486,22 +498,7 @@ static bool merge_old_faron(const env_tables& live, const env_tables& old) {
     pickCount = live.pselNum;
     const stage_envr_info_class* coroRoom = live.envrNum > 4 ? &live.envr[4] : nullptr;
 
-    for (int room : {5, 11}) {
-        if (room >= live.envrNum || room >= old.envrNum) continue;
-
-        auto row = old.envr[room];
-        for (int t = 0; t < 65; t++) {
-            int src = row.pselect_id[t];
-            if (src >= old.pselNum) continue;  // out of range = selection 0, leave it
-            int coro = -1;
-            if (coroRoom && coroRoom->pselect_id[t] < live.pselNum) coro = coroRoom->pselect_id[t];
-            int idx = add_pick(live, old, src, coro);
-            if (idx < 0) return false;
-            row.pselect_id[t] = (u8)idx;
-        }
-        envRows[room] = row;
-    }
-    return true;
+    return merge_room(live, old, 5, coroRoom) && merge_room(live, old, 11, coroRoom);
 }
 
 static void use_env(const env_tables& e) {
@@ -556,7 +553,8 @@ DEFINE_HOOK(&daAlink_c::checkSnowCode, SnowCode);
 DEFINE_HOOK(&daAlink_c::setStickData, Stick);
 DEFINE_HOOK(&dSv_player_item_c::setLineUpItem, LineUp);
 DEFINE_HOOK(&dMeter2Info_c::readItemTexture, ReadTex);
-DEFINE_HOOK(&dMsgObject_c::setMessageIndexDemo, MsgBegin);
+// item-get text box, by name like the two below; arg 1 is the message id
+DEFINE_HOOK_SYMBOL("dMsgObject_c::setMessageIndexDemo", void(dMsgObject_c*, u32, bool), IceLeafGetBox);
 // these two are by name (the second is private); sigs are from the decomp, unchecked against this port
 DEFINE_HOOK_SYMBOL("dMsgStringBase_c::getStringLocal",
     f32(dMsgStringBase_c*, u32, J2DTextBox*, J2DTextBox*, JUTFont*, COutFont_c*, u8), MsgStr);
@@ -574,7 +572,7 @@ static constexpr int iconSz = 96;
 static constexpr u16 spDone = 0x2008;
 static constexpr u8 spShard = 1;
 // 0x65 + item no is the item-get message id
-static constexpr u32 pickMsg = 0x65 + leafItem;
+static constexpr u32 leafFanfareText = 0x65 + leafItem;
 static const char* getText =
     "An iced over leaf from Snowpeak.\n"
     "Rumored to be a part of what was\n"
@@ -583,8 +581,8 @@ static const char* getText =
     "Equip it to sled across Hyrule\n"
     "on downhill slopes.";
 
-// control tags are 1A, total size, group, code (u16 be); the zeros inside are why this is an array and
-// not run through strlen. group 6 is the bullet, group 0 has the pad buttons (B 11, X 15, Y 16)
+// has zero bytes in the tags, so no strlen
+// group 6 = bullet, group 0 = pad buttons (B 11, X 15, Y 16)
 static const char descText[] =
     "A frozen leaf from Snowpeak that\n"
     "lets the rider glide across\n"
@@ -597,7 +595,6 @@ static const char descText[] =
     "\x1A\x05\x00\x00\x0B" " to attack with your sword\n"
     "\x1A\x05\x06\x00\x0B" "and hold to deliver a spin attack.";
 
-struct Icon { void* buf; TextureReplacementHandle h; };
 
 static fpc_ProcID leafId = fpcM_ERROR_PROCESS_ID_e;
 static fpc_ProcID rideId = fpcM_ERROR_PROCESS_ID_e;
@@ -605,13 +602,19 @@ static bool mounting, diveSpawn;
 static int mountTimer;
 static ResourceBuffer iconRes = RESOURCE_BUFFER_INIT;
 static void* iconBuf;
-static Icon icons[32];
+static void* iconOwner[32];
+static TextureReplacementHandle iconTex[32];
 static int nIcons;
 
 static bool got, fell, customMsg, customDesc, wasAlways;
-static fpc_ProcID msgPid = fpcM_ERROR_PROCESS_ID_e;
+static fpc_ProcID fanfareBox = fpcM_ERROR_PROCESS_ID_e;
+
+// same box the game opens when you pick up an item
+static fpc_ProcID show_leaf_get() {
+    return fopMsgM_messageSetDemo(leafFanfareText);
+}
 static int gotPoll;
-// spinner stand-in: set while asking the game whether the spinner could come out here
+// true while we ask the game about the spinner
 static bool simSpin, wantLeaf;
 
 static bool out() { return leafId != fpcM_ERROR_PROCESS_ID_e; }
@@ -621,44 +624,44 @@ static daObjIceLeaf_c* findLeaf() {
 }
 
 // 120 is a guess at head height, shallows don't count as wet
-static bool wet(daAlink_c* lnk) {
-    return lnk->checkModeFlg(daAlink_c::MODE_SWIMMING) || lnk->mWaterY - lnk->current.pos.y > 120.0f;
+static bool wet(daAlink_c* link) {
+    return link->checkModeFlg(daAlink_c::MODE_SWIMMING) || link->mWaterY - link->current.pos.y > 120.0f;
 }
 
-static void stow(daAlink_c* lnk) {
+static void stow(daAlink_c* link) {
     // 0x103 = sword, still allowed
-    if (lnk->mEquipItem != dItemNo_NONE_e && lnk->mEquipItem != 0x103) lnk->allUnequip(TRUE);
+    if (link->mEquipItem != dItemNo_NONE_e && link->mEquipItem != 0x103) link->allUnequip(TRUE);
 }
 
-static void spawn(daAlink_c* lnk) {
-    stow(lnk);
-    cXyz pos = lnk->current.pos;
-    csXyz ang(0, lnk->shape_angle.y, 0);
+static void spawn(daAlink_c* link) {
+    stow(link);
+    cXyz pos = link->current.pos;
+    csXyz ang(0, link->shape_angle.y, 0);
     // ride status 1 skips the drop anim
-    leafId = fopAcM_create(fpcNm_Obj_IceLeaf_e, 0x0001FFFF, &pos, fopAcM_GetRoomNo(lnk), &ang, nullptr, -1);
+    leafId = fopAcM_create(fpcNm_Obj_IceLeaf_e, 0x0001FFFF, &pos, fopAcM_GetRoomNo(link), &ang, nullptr, -1);
     if (!out()) {
         mods::log::warn("couldn't create the ice leaf");
         return;
     }
     mounting = true;
     mountTimer = 0;
-    diveSpawn = wet(lnk);
+    diveSpawn = wet(link);
 }
 
-static void drop(daAlink_c* lnk) {
+static void drop(daAlink_c* link) {
     mounting = diveSpawn = false;
     daObjIceLeaf_c* leaf = findLeaf();
     if (leaf) {
-        if (lnk && lnk->checkBoardRide()) {
-            lnk->setJumpMode();
-            lnk->procBackJumpInit(0);
+        if (link && link->checkBoardRide()) {
+            link->setJumpMode();
+            link->procBackJumpInit(0);
         }
         // same break fx the leaf plays on its own delete, done here so it never gets skipped
         dComIfGp_particle_set(0x8C12, &leaf->eyePos, NULL, NULL);
         dComIfGp_particle_set(0x8C13, &leaf->eyePos, NULL, NULL);
-        if (lnk) lnk->seStartOnlyReverb(Z2SE_AL_SNOBO_ICEBREAK);
+        if (link) link->seStartOnlyReverb(Z2SE_AL_SNOBO_ICEBREAK);
         fopAcM_delete(leaf);
-        if (lnk) lnk->mRideAcKeep.clearData();
+        if (link) link->mRideAcKeep.clearData();
     } else if (out())
         fopAcM_delete(leafId);
     leafId = fpcM_ERROR_PROCESS_ID_e;
@@ -679,26 +682,48 @@ static void setLeafSlot(u8 item) {
 }
 
 static bool owned() {
-    for (int i = 0; i < 24; i++) if (dComIfGs_getItem(i, true) == leafItem) return true;
+    int slot = 24;
+    while (slot--) {
+        if (dComIfGs_getItem(slot, true) == leafItem) return true;
+    }
     return false;
 }
 
 static void forgetIcon(void* buf) {
     for (int i = 0; i < nIcons; i++) {
-        if (icons[i].buf != buf) continue;
-        svc_texture->unregister(mod_ctx, icons[i].h);
-        icons[i] = icons[--nIcons];
+        if (iconOwner[i] != buf) continue;
+        svc_texture->unregister(mod_ctx, iconTex[i]);
+        nIcons--;
+        iconOwner[i] = iconOwner[nIcons];
+        iconTex[i] = iconTex[nIcons];
         return;
     }
 }
 
+static const u8 itemButton[2] = {daAlink_c::BTN_X, daAlink_c::BTN_Y};
+
+// first button holding the leaf: tap it to get off, or hop on if newitem_pre said we can
+static void leaf_buttons(daAlink_c* link, bool want) {
+    for (int btn = 0; btn < 2; btn++) {
+        if (dComIfGp_getSelectItem(btn) != leafItem) continue;
+        if (!out()) {
+            if (want && !link->checkEventRun() && !link->checkRide()) spawn(link);
+            return;
+        }
+        if (link->itemTriggerCheck(itemButton[btn])) {
+            drop(link);
+            return;
+        }
+    }
+}
+
 static HookAction exec_pre(ModContext*, void* args, void*, void*) {
-    daAlink_c* lnk = mods::arg<daAlink_c*>(args, 0);
+    daAlink_c* link = mods::arg<daAlink_c*>(args, 0);
 
     // leaf switched off: put it away and take it off the wheel, "hidden" (per save) brings it back later
     if (!cfgOn(vLeaf)) {
-        if (out()) drop(lnk);
-        if (dComIfGs_getItem(leafSlot, true) == leafItem && !lnk->checkEventRun()) {
+        if (out()) drop(link);
+        if (dComIfGs_getItem(leafSlot, true) == leafItem && !link->checkEventRun()) {
             setLeafSlot(dItemNo_NONE_e);
             wrBlob("hidden", 1);
         }
@@ -719,23 +744,24 @@ static HookAction exec_pre(ModContext*, void* args, void*, void*) {
     if (vAlways) svc_config->get_bool(mod_ctx, vAlways, &always);
 
     // snowpeak slide ends -> the game's own leaf is deleted while we were on it
-    fopAc_ac_c* ra = lnk->mRideAcKeep.getActor();
-    if (lnk->checkBoardRide() && ra && fopAcM_GetName(ra) == fpcNm_Obj_IceLeaf_e && fopAcM_GetID(ra) != leafId)
-        rideId = fopAcM_GetID(ra);
+    fopAc_ac_c* board = link->mRideAcKeep.getActor();
+    bool onGameLeaf = board && fopAcM_GetName(board) == fpcNm_Obj_IceLeaf_e && fopAcM_GetID(board) != leafId;
+    if (link->checkBoardRide() && onGameLeaf)
+        rideId = fopAcM_GetID(board);
     else if (rideId != fpcM_ERROR_PROCESS_ID_e && !fopAcM_SearchByID(rideId)) {
         rideId = fpcM_ERROR_PROCESS_ID_e;
         fell = true;
     }
 
     // the snowpeak leaf broke: remember it for this save, prompt every time unless the toggle's on
-    if (fell && !lnk->checkEventRun()) {
+    if (fell && !link->checkEventRun()) {
         fell = false;
         wrBlob("got", 1);
         got = true;
         bool fresh = !owned();
         if (fresh && dComIfGs_getItem(leafSlot, true) == dItemNo_NONE_e) setLeafSlot(leafItem);
-        if (fresh && !always && msgPid == fpcM_ERROR_PROCESS_ID_e) {
-            msgPid = fopMsgM_messageSetDemo(pickMsg);
+        if (fresh && !always && fanfareBox == fpcM_ERROR_PROCESS_ID_e) {
+            fanfareBox = show_leaf_get();
             mDoAud_subBgmStart(Z2BGM_ITEM_GET);
             dComIfGp_setMesgBgmOn();
         }
@@ -755,43 +781,34 @@ static HookAction exec_pre(ModContext*, void* args, void*, void*) {
     // the last save's value for a moment after switching files
     if (always && dComIfGs_getItem(leafSlot, true) == dItemNo_NONE_e) setLeafSlot(leafItem);
     else if (wasAlways && !always && !got && gotPoll > 90 && dComIfGs_getItem(leafSlot, true) == leafItem) {
-        if (out()) drop(lnk);
+        if (out()) drop(link);
         setLeafSlot(dItemNo_NONE_e);
     }
     wasAlways = always;
-    if (msgPid != fpcM_ERROR_PROCESS_ID_e && !fopMsgM_SearchByID(msgPid)) msgPid = fpcM_ERROR_PROCESS_ID_e;
+    if (fanfareBox != fpcM_ERROR_PROCESS_ID_e && !fopMsgM_SearchByID(fanfareBox)) fanfareBox = fpcM_ERROR_PROCESS_ID_e;
 
     // leaf can vanish on its own (room change etc)
     if (out() && !mounting && !findLeaf()) leafId = fpcM_ERROR_PROCESS_ID_e;
 
-    bool heavy = lnk->checkHeavyStateOn(TRUE, TRUE);
-    if (out() && dComIfGp_getSelectItem(0) != leafItem && dComIfGp_getSelectItem(1) != leafItem) drop(lnk);
+    bool heavy = link->checkHeavyStateOn(TRUE, TRUE);
+    if (out() && dComIfGp_getSelectItem(0) != leafItem && dComIfGp_getSelectItem(1) != leafItem) drop(link);
 
     // a dunk only keeps it if it was summoned underwater in iron boots
-    if (out() && !mounting && wet(lnk) && (!diveSpawn || !heavy)) drop(lnk);
+    if (out() && !mounting && wet(link) && (!diveSpawn || !heavy)) drop(link);
 
     // summoning is decided in newitem_pre (same rules as the spinner), this only acts on it
     bool want = wantLeaf;
     wantLeaf = false;
-    for (int btn = 0; btn < 2; btn++) {
-        if (dComIfGp_getSelectItem(btn) != leafItem) continue;
-        if (out()) {
-            if (!lnk->itemTriggerCheck(1 << btn)) continue;
-            drop(lnk);
-        } else if (want && !lnk->checkEventRun() && !lnk->checkRide()) {
-            spawn(lnk);
-        }
-        break;
-    }
+    leaf_buttons(link, want);
 
-    if (out()) stow(lnk);
+    if (out()) stow(link);
 
     if (mounting) {
         daObjIceLeaf_c* leaf = findLeaf();
-        if (!out() || ++mountTimer > 300) drop(lnk);
+        if (!out() || ++mountTimer > 300) drop(link);
         else if (leaf && fopAcM_IsExecuting(leafId)) {
             mounting = false;
-            lnk->procBoardWaitInit(leaf);
+            link->procBoardWaitInit(leaf);
         }
     }
 
@@ -800,35 +817,39 @@ static HookAction exec_pre(ModContext*, void* args, void*, void*) {
 
 static HookAction newitem_pre(ModContext*, void* args, void* retval, void*) {
     if (simSpin) return HOOK_CONTINUE;
-    daAlink_c* lnk = mods::arg<daAlink_c*>(args, 0);
-    u8 idx = mods::arg<u8>(args, 1);
-    bool leaf = dComIfGp_getSelectItem(idx) == leafItem;
-    if (!out() && !leaf) return HOOK_CONTINUE;
-    if (!out() && idx < 2) {
-        // ask the full hook chain (no-restriction mods included) what the spinner would do on this button
-        simSpin = true;
-        g_dComIfG_gameInfo.play.setSelectItem(idx, dItemNo_SPINNER_e);
-        int r = lnk->checkNewItemChange(idx);
-        g_dComIfG_gameInfo.play.setSelectItem(idx, leafItem);
-        simSpin = false;
-        // 4 = spinner ready; the trigger check also marks the button usable so the icon isn't dimmed
-        if (r == 4 && lnk->itemTriggerCheck(1 << idx)) wantLeaf = true;
-    }
+    daAlink_c* link = mods::arg<daAlink_c*>(args, 0);
+    u8 btn = mods::arg<u8>(args, 1);
+    bool onLeaf = dComIfGp_getSelectItem(btn) == leafItem;
+    if (!out() && !onLeaf) return HOOK_CONTINUE;
     if (retval) *(int*)retval = 0;
+    if (out() || btn >= 2) return HOOK_SKIP_ORIGINAL;
+
+    // ask the full hook chain (no-restriction mods included) what the spinner would do on this button
+    simSpin = true;
+    g_dComIfG_gameInfo.play.setSelectItem(btn, dItemNo_SPINNER_e);
+    int spinner = link->checkNewItemChange(btn);
+    g_dComIfG_gameInfo.play.setSelectItem(btn, leafItem);
+    simSpin = false;
+
+    if (spinner != 4) return HOOK_SKIP_ORIGINAL;  // 4 = spinner ready
+
+    // has to run even if we already want the leaf, it's what keeps the icon from dimming
+    BOOL pressedNow = link->itemTriggerCheck(itemButton[btn]);
+    if (pressedNow) wantLeaf = true;
     return HOOK_SKIP_ORIGINAL;
 }
 
-// the pickup prompt is a plain demo message, nothing stops link once its second box is up
+// keep link still while the pickup text is up
 static void stick_post(ModContext*, void* args, void*, void*) {
-    if (msgPid == fpcM_ERROR_PROCESS_ID_e || !fopMsgM_SearchByID(msgPid)) return;
-    daAlink_c* lnk = mods::arg<daAlink_c*>(args, 0);
-    lnk->mStickValue = lnk->mMoveValue = 0.0f;
-    lnk->mItemTrigger = lnk->mItemButton = 0;
+    if (fanfareBox == fpcM_ERROR_PROCESS_ID_e || !fopMsgM_SearchByID(fanfareBox)) return;
+    daAlink_c* link = mods::arg<daAlink_c*>(args, 0);
+    link->mStickValue = link->mMoveValue = 0.0f;
+    link->mItemTrigger = link->mItemButton = 0;
 }
 
 static void snow_post(ModContext*, void* args, void* retval, void*) {
-    daAlink_c* lnk = mods::arg<daAlink_c*>(args, 0);
-    if (out() && retval && lnk->checkBoardRide()) *(bool*)retval = true;
+    daAlink_c* link = mods::arg<daAlink_c*>(args, 0);
+    if (out() && retval && link->checkBoardRide()) *(bool*)retval = true;
 }
 
 static void lineup_post(ModContext*, void* args, void*, void*) {
@@ -862,21 +883,21 @@ static HookAction msg_pre(ModContext*, void* args, void* retval, void*) {
 }
 
 static void exec_post(ModContext*, void* args, void*, void*) {
-    daAlink_c* lnk = mods::arg<daAlink_c*>(args, 0);
+    daAlink_c* link = mods::arg<daAlink_c*>(args, 0);
     // riding: keep the leaf's button lit so it reads as "press to get off"
     if (out())
         for (int btn = 0; btn < 2; btn++)
-            if (dComIfGp_getSelectItem(btn) == leafItem) lnk->field_0x2faf |= (u8)(1 << btn);
-    if (!out() || mounting || !lnk->checkBoardRide() || !mDoCPd_c::getHoldR(PAD_1)) return;
+            if (dComIfGp_getSelectItem(btn) == leafItem) link->field_0x2faf |= (u8)(1 << btn);
+    if (!out() || mounting || !link->checkBoardRide() || !mDoCPd_c::getHoldR(PAD_1)) return;
 
     bool on = false;
     if (vBoost) svc_config->get_bool(mod_ctx, vBoost, &on);
-    f32 sp = lnk->mNormalSpeed + 2.5f;
-    if (on) lnk->mNormalSpeed = sp > 75.0f ? 75.0f : sp;
+    f32 sp = link->mNormalSpeed + 2.5f;
+    if (on) link->mNormalSpeed = sp > 75.0f ? 75.0f : sp;
 }
 
 static HookAction msgbegin_pre(ModContext*, void* args, void*, void*) {
-    customMsg = mods::arg<u32>(args, 1) == pickMsg;
+    customMsg = mods::arg<u32>(args, 1) == leafFanfareText;
     return HOOK_CONTINUE;
 }
 
@@ -894,48 +915,55 @@ static void msgseq_post(ModContext*, void* args, void* retval, void*) {
 }
 
 static HookAction tex_pre(ModContext*, void* args, void*, void*) {
-    void* buf = mods::arg<void*>(args, 2);
-    forgetIcon(buf);
-    u8& no = mods::arg_ref<u8>(args, 1);
+    void* texBuf = mods::arg<void*>(args, 2);
+    forgetIcon(texBuf);
+    u8& wheelItem = mods::arg_ref<u8>(args, 1);
     iconBuf = nullptr;
-    if (no == leafItem) {
-        no = dItemNo_BOOMERANG_e;
-        iconBuf = buf;
-    }
+    if (wheelItem != leafItem) return HOOK_CONTINUE;
+
+    // borrow the boomerang's icon slot, tex_post paints ours over it
+    wheelItem = dItemNo_BOOMERANG_e;
+    iconBuf = texBuf;
     return HOOK_CONTINUE;
 }
 
 static void tex_post(ModContext*, void*, void*, void*) {
-    void* buf = iconBuf;
+    void* texBuf = iconBuf;
     iconBuf = nullptr;
-    if (!buf || !iconRes.data || iconRes.size != (size_t)iconSz * iconSz * 4) return;
+    if (!texBuf || !iconRes.data || iconRes.size != (size_t)iconSz * iconSz * 4) return;
 
-    uint32_t off = ((const ResTIMG*)buf)->imageOffset;
-    if (off > 0xC00) off = ((off >> 24) & 0xFF) | ((off >> 8) & 0xFF00) | ((off << 8) & 0xFF0000) | (off << 24);
-    if (off == 0 || off >= 0xC00) off = 0x20;
+    // where the pixels start; might still be big endian
+    uint32_t pixels = ((const ResTIMG*)texBuf)->imageOffset;
+    if (pixels > 0xC00)
+        pixels = ((pixels >> 24) & 0xFF) | ((pixels >> 8) & 0xFF00) | ((pixels << 8) & 0xFF0000) | (pixels << 24);
+    if (pixels == 0 || pixels >= 0xC00) pixels = 0x20;
 
     if (nIcons >= 32) {
-        svc_texture->unregister(mod_ctx, icons[0].h);
-        icons[0] = icons[--nIcons];
+        svc_texture->unregister(mod_ctx, iconTex[0]);
+        nIcons--;
+        iconOwner[0] = iconOwner[nIcons];
+        iconTex[0] = iconTex[nIcons];
     }
 
     TextureKey key = TEXTURE_KEY_INIT;
     key.kind = TEXTURE_KEY_POINTER;
-    key.pointer = (uint8_t*)buf + off;
+    key.pointer = (uint8_t*)texBuf + pixels;
 
-    TextureData d = TEXTURE_DATA_INIT;
-    d.data = iconRes.data;
-    d.size = iconRes.size;
-    d.width = iconSz;
-    d.height = iconSz;
-    d.gx_format = GX_TF_RGBA8_PC;
+    TextureData leafPic = TEXTURE_DATA_INIT;
+    leafPic.data = iconRes.data;
+    leafPic.size = iconRes.size;
+    leafPic.width = iconSz;
+    leafPic.height = iconSz;
+    leafPic.gx_format = GX_TF_RGBA8_PC;
 
-    TextureReplacementHandle h = 0;
-    if (svc_texture->register_data(mod_ctx, &key, &d, &h) == MOD_OK) icons[nIcons++] = {buf, h};
+    TextureReplacementHandle swapped = 0;
+    if (svc_texture->register_data(mod_ctx, &key, &leafPic, &swapped) != MOD_OK) return;
+    iconOwner[nIcons] = texBuf;
+    iconTex[nIcons++] = swapped;
 }
 
 // ======================== Castle Town shops ========================
-// Revert to Chudley's (Map Checks) and the shop swaps (Shop Expansion) work on the same shop
+// both of these touch the same shop
 
 // --- Revert to Chudley's ---
 
@@ -994,21 +1022,21 @@ static void malo_shelf_prompt(ModContext*, void* args, void* ret, void*) {
     void* room = dComIfG_getStageRes(dComIfG_getRoomArcName(fopAcM_GetRoomNo(shelf)), "room.dzr");
     if (room == nullptr) return;
 
-    auto* hdr = static_cast<dStage_fileHeader*>(room);
-    u8 want = fopAcM_GetParam(shelf) & 0xFF;
-    int c = 0;
-    while (c < hdr->m_chunkCount && memcmp(&hdr->m_nodes[c].m_tag, "ACT1", 4) != 0) c++;
-    if (c == hdr->m_chunkCount) return;
+    auto* file = static_cast<dStage_fileHeader*>(room);
+    u8 sells = (u8)fopAcM_GetParam(shelf);  // low byte is the item
+    int chunk = 0;
+    while (chunk < file->m_chunkCount && memcmp(&file->m_nodes[chunk].m_tag, "ACT1", 4) != 0) chunk++;
+    if (chunk == file->m_chunkCount) return;
 
-    dStage_nodeHeader* act1 = &hdr->m_nodes[c];
-    auto* a = static_cast<stage_actor_data_class*>(chunk_data(room, act1->m_offset));
-    for (int n = act1->m_entryNum; n > 0; n--, a++) {
-        u32 prm = a->base.parameters;
-        if (strncmp(a->name, "TGSPITM", 8) == 0 && (prm & 0xFF) == want) {
-            csXyz ang = a->base.angle;
-            shelf->home.angle.x = ang.x;
-            break;
-        }
+    // ACT1 = the Malo Mart layer's actors
+    dStage_nodeHeader* maloLayer = &file->m_nodes[chunk];
+    auto* actor = static_cast<stage_actor_data_class*>(chunk_data(room, maloLayer->m_offset));
+    for (int left = maloLayer->m_entryNum; left > 0; left--, actor++) {
+        u32 params = actor->base.parameters;
+        if (strncmp(actor->name, "TGSPITM", 8) != 0 || (u8)params != sells) continue;
+        csXyz rot = actor->base.angle;
+        shelf->home.angle.x = rot.x;  // the shelf prompt's flow id lives in angle x
+        return;
     }
 }
 
@@ -1038,19 +1066,22 @@ static constexpr u16 kGrp = 4;
 static constexpr u16 kGoronPrice = 110;
 static constexpr const char* kGoronCheck = "shop:F_SP116:0:16";
 
-static dShopSystem_c* g_inShop;
-static dShopSystem_c* g_lastShop;
-static fpc_ProcID g_lastShopId = fpcM_ERROR_PROCESS_ID_e;
-static bool g_reused;
-static u16 g_jump, g_nodeShop, g_nodeGoron;
-static bool g_net, g_netGot;
-static int g_netWait;
-static ItemGiveHandle g_obs;
+static dShopSystem_c* activeShop;
+static dShopSystem_c* recentShop;
+static fpc_ProcID recentShopId = fpcM_ERROR_PROCESS_ID_e;
+static bool oilOnPotion;
+static u16 jumpTo, noBottleShop, noBottleGoron;
+static bool potionPending, potionGiven;
+static int potionWait;
 
-static flw::Graph g_graph;
-static std::vector<flw::RegisteredMessage> g_msgs;
-static std::vector<flw::MessageOverride> g_ovr;
-static std::vector<uint8_t> g_out;
+// the two "need an empty bottle" lines and the node graph that plays them
+static flw::Graph bottleNodes;
+static flw::RegisteredMessage bottleLines[2];
+static int bottleCount;
+
+// every castle town / common message gets our text hook (5000 + 2500 ids)
+static flw::MessageOverride textHooks[7500];
+static int textHookCount;
 
 static bool in_shop_room() {
     return stage_is("R_SP160") && dComIfGp_roomControl_getStayNo() == 0;
@@ -1064,158 +1095,327 @@ static bool is_pot(int no) {
     return no == dItemNo_RED_BOTTLE_e || no == dItemNo_BLUE_BOTTLE_e;
 }
 
-static int slot_item(dShopSystem_c* s, int i) {
-    fopAc_ac_c* it = fopAcM_SearchByID((fpc_ProcID)s->mItemCtrl.getItemIndex(i));
-    return it ? (int)(fopAcM_GetParam(it) & 0xFF) : -1;
+static int slot_item(dShopSystem_c* shop, int slot) {
+    fopAc_ac_c* tag = fopAcM_SearchByID((fpc_ProcID)shop->mItemCtrl.getItemIndex(slot));
+    return tag ? (int)(fopAcM_GetParam(tag) & 0xFF) : -1;
 }
 
-static int shop_item(dShopSystem_c* s) {
-    u8 c = s->mCursorPos;
-    if (c == 0 || c > dShopSystem_c::ITEM_MAX_e) return -1;
-    return slot_item(s, c - 1);
+static int shop_item(dShopSystem_c* shop) {
+    int cursor = shop->mCursorPos;
+    bool onShelf = cursor > 0;  // 0 is the shopkeeper himself
+    onShelf = onShelf && cursor <= dShopSystem_c::ITEM_MAX_e;
+    return onShelf ? slot_item(shop, cursor - 1) : -1;
 }
 
-static Who shop_who(dShopSystem_c* s) {
-    if (!s || !cfgOn(vChud) || !in_shop_room() || !is_arrow(shop_item(s))) return NOBODY;
+static Who shop_who(dShopSystem_c* shop) {
+    if (!shop || !cfgOn(vChud) || !in_shop_room() || !is_arrow(shop_item(shop))) return NOBODY;
     return malo_pricing() ? MALO : CHUDLEY;
 }
 
 static dShopSystem_c* live_shop() {
-    if (g_lastShop && fopAcM_SearchByID(g_lastShopId) == (fopAc_ac_c*)g_lastShop) return g_lastShop;
+    if (recentShop && fopAcM_SearchByID(recentShopId) == (fopAc_ac_c*)recentShop) return recentShop;
     return nullptr;
 }
 
 // another mod (the randomizer, with shop items on) can claim the goron's check; then he's left alone
 static bool goron_ours() {
     if (!cfgOn(vGoron)) return false;
-    ItemCheckResolution r{};
-    if (svc_item->resolve_check_full(mod_ctx, kGoronCheck, dItemNo_ARROW_30_e, &r) != MOD_OK) return true;
+    ItemCheckResolution goronCheck;
+    goronCheck.item = goronCheck.display_item = 0;
+    goronCheck.was_resolved = false;
+    if (svc_item->resolve_check_full(mod_ctx, kGoronCheck, dItemNo_ARROW_30_e, &goronCheck) != MOD_OK) return true;
     // claimed = swapped for a real item; NONE is just a sync mod marking the check as taken
-    return r.item == dItemNo_ARROW_30_e || r.item == dItemNo_NONE_e;
+    return goronCheck.item == dItemNo_ARROW_30_e || goronCheck.item == dItemNo_NONE_e;
 }
 
-static Who who(fopAc_ac_c* sp) {
-    if (!sp) return NOBODY;
-    if (stage_is("F_SP116") && fopAcM_GetName(sp) == fpcNm_NPC_GRA_e) return goron_ours() ? GORON : NOBODY;
-    return sp == (fopAc_ac_c*)g_inShop ? shop_who(g_inShop) : NOBODY;
+static Who who(fopAc_ac_c* speaker) {
+    if (!speaker) return NOBODY;
+    if (stage_is("F_SP116") && fopAcM_GetName(speaker) == fpcNm_NPC_GRA_e) return goron_ours() ? GORON : NOBODY;
+    return speaker == (fopAc_ac_c*)activeShop ? shop_who(activeShop) : NOBODY;
 }
 
-static u32 price(Who w) {
-    return w == GORON ? kGoronPrice : w == MALO ? 15 : w == CHUDLEY ? 12000 : 0;
-}
-
-struct Tk {
-    bool tag;
-    std::string s;
-};
-
-static std::vector<Tk> lex(const uint8_t* p, size_t n) {
-    std::vector<Tk> v;
-    size_t i = 0;
-    while (i < n && p[i]) {
-        if (p[i] == 0x1A && i + 1 < n && p[i + 1] >= 5) {
-            size_t l = p[i + 1];
-            v.push_back({true, std::string((const char*)p + i, l)});
-            i += l;
-        } else {
-            if (v.empty() || v.back().tag) v.push_back({false, {}});
-            v.back().s += (char)p[i++];
-        }
+static u32 price(Who seller) {
+    switch (seller) {
+    case GORON: return kGoronPrice;
+    case MALO: return 15;
+    case CHUDLEY: return 12000;
+    default: return 0;
     }
-    return v;
 }
 
-static void unlex(const std::vector<Tk>& v) {
-    g_out.clear();
-    for (auto& t : v) g_out.insert(g_out.end(), t.s.begin(), t.s.end());
-    g_out.push_back(0);
+// The message being rewritten, cut into runs of plain text and control tags. Only one message
+// gets rewritten at a time, so it all lives in fixed buffers. Color tags have zero bytes in
+// them, so every run keeps its own length instead of relying on the terminator.
+static const int kMaxParts = 128;
+static const int kPartRoom = 512;
+
+static char partText[kMaxParts][kPartRoom];
+static int partLen[kMaxParts];
+static bool isTag[kMaxParts];
+static int parts;
+
+static char joined[4096];
+static int joinedLen;
+
+// replace `cut` bytes at `at` with `with`; false (and untouched) if it wouldn't fit
+static bool splice(char* buf, int* len, int at, int cut, const char* with, int withLen) {
+    int grown = *len - cut + withLen;
+    if (grown >= kPartRoom) return false;
+    memmove(buf + at + withLen, buf + at + cut, *len - at - cut);
+    memcpy(buf + at, with, withLen);
+    *len = grown;
+    buf[grown] = 0;
+    return true;
 }
 
-static std::string col(u8 c) {
-    std::string s("\x1A\x06\xFF\x00\x00", 5);
-    s += (char)c;
-    return s;
+static int find_in(const char* buf, int len, const char* word, int from, bool anyCase) {
+    int wlen = (int)strlen(word);
+    for (int at = from; at + wlen <= len; at++) {
+        int k = 0;
+        while (k < wlen) {
+            char a = buf[at + k], b = word[k];
+            if (anyCase) a = (char)tolower((unsigned char)a);
+            if (a != b) break;
+            k++;
+        }
+        if (k == wlen) return at;
+    }
+    return -1;
 }
 
-static bool is_col(const Tk& t) {
-    return t.tag && t.s.size() == 6 && (u8)t.s[2] == 0xFF && t.s[3] == 0 && t.s[4] == 0;
+static int find_text(const char* buf, int len, const char* word, int from = 0) {
+    return find_in(buf, len, word, from, false);
 }
 
-static std::string low(std::string s) {
-    for (auto& c : s) c = (char)tolower((unsigned char)c);
-    return s;
+// `word` has to be lowercase already
+static int find_nocase(const char* buf, int len, const char* word, int from = 0) {
+    return find_in(buf, len, word, from, true);
 }
 
-static bool has(const std::vector<Tk>& v, const char* w) {
-    for (auto& t : v)
-        if (!t.tag && low(t.s).find(w) != std::string::npos) return true;
+static int first_non_space(const char* buf, int len) {
+    for (int at = 0; at < len; at++)
+        if (buf[at] != ' ') return at;
+    return -1;
+}
+
+static void swap_all(char* buf, int* len, const char* from, const char* to) {
+    int toLen = (int)strlen(to);
+    int at = find_text(buf, *len, from);
+    while (at >= 0) {
+        if (!splice(buf, len, at, (int)strlen(from), to, toLen)) return;
+        at = find_text(buf, *len, from, at + toLen);
+    }
+}
+
+// little writers for building replacement text
+static int put_bytes(char* out, int at, const char* bytes, int n) {
+    memcpy(out + at, bytes, n);
+    return at + n;
+}
+
+static int put_words(char* out, int at, const char* words) {
+    return put_bytes(out, at, words, (int)strlen(words));
+}
+
+static int put_color(char* out, int at, u8 color) {
+    const char tag[6] = {0x1A, 0x06, (char)0xFF, 0, 0, (char)color};
+    return put_bytes(out, at, tag, 6);
+}
+
+// "Blue Potion" in blue, then back to white
+static int put_blue_potion(char* out, int at) {
+    at = put_color(out, at, MESSAGE_COLOR_BLUE);
+    at = put_words(out, at, "Blue Potion");
+    return put_color(out, at, 0);
+}
+
+static bool new_part(bool tagged) {
+    if (parts == kMaxParts) return false;
+    isTag[parts] = tagged;
+    partLen[parts] = 0;
+    partText[parts][0] = 0;
+    parts++;
+    return true;
+}
+
+static void copy_part(int to, int from) {
+    memcpy(partText[to], partText[from], partLen[from] + 1);
+    partLen[to] = partLen[from];
+    isTag[to] = isTag[from];
+}
+
+static bool insert_part(int at, const char* bytes, int n) {
+    if (parts == kMaxParts || n >= kPartRoom) return false;
+    for (int i = parts; i > at; i--) copy_part(i, i - 1);
+    memcpy(partText[at], bytes, n);
+    partText[at][n] = 0;
+    partLen[at] = n;
+    isTag[at] = false;
+    parts++;
+    return true;
+}
+
+// drops parts [from, to)
+static void erase_parts(int from, int to) {
+    int gone = to - from;
+    for (int i = from; i + gone < parts; i++) copy_part(i, i + gone);
+    parts -= gone;
+}
+
+static bool starts_tag(const uint8_t* raw, size_t at, size_t len) {
+    return raw[at] == 0x1A && at + 1 < len && raw[at + 1] >= 5;
+}
+
+// false if the message doesn't fit the buffers; it's left vanilla then
+static bool split_text(const uint8_t* raw, size_t len) {
+    parts = 0;
+    size_t at = 0;
+    while (at < len && raw[at]) {
+        if (starts_tag(raw, at, len)) {
+            int tagLen = raw[at + 1];
+            if (tagLen >= kPartRoom || !new_part(true)) return false;
+            memcpy(partText[parts - 1], raw + at, tagLen);
+            partLen[parts - 1] = tagLen;
+            at += tagLen;
+            continue;
+        }
+        if ((parts == 0 || isTag[parts - 1]) && !new_part(false)) return false;
+        int p = parts - 1;
+        if (partLen[p] + 1 >= kPartRoom) return false;
+        partText[p][partLen[p]++] = (char)raw[at++];
+        partText[p][partLen[p]] = 0;
+    }
+    return true;
+}
+
+static bool join_text() {
+    joinedLen = 0;
+    for (int i = 0; i < parts; ++i) {
+        if (joinedLen + partLen[i] >= (int)sizeof(joined)) return false;
+        joinedLen = put_bytes(joined, joinedLen, partText[i], partLen[i]);
+    }
+    joined[joinedLen] = 0;
+    return true;
+}
+
+static bool is_color(int i) {
+    const char* t = partText[i];
+    return isTag[i] && partLen[i] == 6 && (u8)t[2] == 0xFF && t[3] == 0 && t[4] == 0;
+}
+
+static bool mentions(const char* word) {
+    for (int i = 0; i < parts; i++) {
+        if (isTag[i]) continue;
+        if (find_nocase(partText[i], partLen[i], word) >= 0) return true;
+    }
     return false;
 }
 
-static void sub(std::string& s, const std::string& a, const std::string& b) {
-    for (size_t p = s.find(a); p != std::string::npos; p = s.find(a, p + b.size()))
-        s.replace(p, a.size(), b);
+// --- prices ---
+
+// old price -> new price, 0 keeps the old one
+using PriceFn = u32 (*)(u32);
+
+static int skip_spaces_back(const char* buf, int end) {
+    while (end > 0 && buf[end - 1] == ' ') end--;
+    return end;
 }
 
-static std::string commas(u32 v) {
-    std::string n = std::to_string(v);
-    for (int i = (int)n.size() - 3; i > 0; i -= 3) n.insert(i, ",");
-    return n;
+// digits, or a comma sitting right after a digit ("3,000")
+static bool price_char(const char* buf, int at) {
+    if (isdigit((unsigned char)buf[at])) return true;
+    return buf[at] == ',' && at > 0 && isdigit((unsigned char)buf[at - 1]);
 }
 
-// rewrites the "<number> Rupee" amounts in s; numbers may carry thousands commas ("3,000"),
-// the new one copies the old style, five digits and up always get one. fn maps old -> new, 0 = leave it
-template <class F>
-static void reprice(std::string& s, F fn) {
-    for (size_t p = s.find("Rupee"); p != std::string::npos; p = s.find("Rupee", p + 5)) {
-        size_t e = p;
-        while (e > 0 && s[e - 1] == ' ') e--;
-        size_t b = e;
-        while (b > 0 && (isdigit((unsigned char)s[b - 1]) || (s[b - 1] == ',' && b > 1 && isdigit((unsigned char)s[b - 2])))) b--;
-        if (b == e) continue;
-        std::string old = s.substr(b, e - b);
-        bool comma = old.find(',') != std::string::npos;
-        std::string digits;
-        for (char c : old) if (c != ',') digits += c;
-        u32 nv = fn((u32)strtoul(digits.c_str(), nullptr, 10));
-        if (!nv) continue;
-        std::string n = (comma || nv >= 10000) ? commas(nv) : std::to_string(nv);
-        s.replace(b, e - b, n);
-        p = b + n.size() + (p - e);
+static int number_start(const char* buf, int end) {
+    int start = end;
+    while (start > 0 && price_char(buf, start - 1)) start--;
+    return start;
+}
+
+static int write_amount(char* out, u32 amount, bool withCommas) {
+    char digits[16];
+    int n = snprintf(digits, sizeof(digits), "%u", (unsigned)amount);
+    int o = 0;
+    for (int i = 0; i < n; i++) {
+        if (withCommas && i > 0 && (n - i) % 3 == 0) out[o++] = ',';
+        out[o++] = digits[i];
+    }
+    return o;
+}
+
+// rewrites the amount in front of one "Rupee", returns where to keep searching from
+static int swap_amount(char* buf, int* len, int hit, PriceFn newPrice) {
+    int end = skip_spaces_back(buf, hit);
+    int start = number_start(buf, end);
+    if (start == end) return hit;
+
+    bool hadComma = false;
+    u32 oldAmount = 0;
+    for (int i = start; i < end; i++) {
+        if (buf[i] == ',') hadComma = true;
+        else oldAmount = oldAmount * 10 + (u32)(buf[i] - '0');
+    }
+
+    u32 amount = newPrice(oldAmount);
+    if (amount == 0) return hit;
+    char shown[24];
+    int shownLen = write_amount(shown, amount, hadComma || amount >= 10000);
+    if (!splice(buf, len, start, end - start, shown, shownLen)) return hit;
+    return start + shownLen + (hit - end);
+}
+
+static void reprice(char* buf, int* len, PriceFn newPrice) {
+    int hit = find_text(buf, *len, "Rupee");
+    while (hit >= 0) {
+        hit = swap_amount(buf, len, hit, newPrice);
+        hit = find_text(buf, *len, "Rupee", hit + 5);
     }
 }
 
-// whole-message version: the number is often colored on its own ("[purple]3,000[white] Rupees"), so when
-// "Rupee" has nothing but spaces before it, the amount is the tail of the previous text run
-template <class F>
-static void reprice_v(std::vector<Tk>& v, F fn) {
-    for (size_t i = 0; i < v.size(); i++) {
-        if (v[i].tag) continue;
-        reprice(v[i].s, fn);
-        size_t p = v[i].s.find("Rupee");
-        if (p == std::string::npos || v[i].s.find_first_not_of(' ') != p) continue;
-        size_t j = i;
-        while (j > 0 && v[j - 1].tag) j--;
-        if (j == 0) continue;
-        std::string& prev = v[j - 1].s;
-        size_t e = prev.size();
-        while (e > 0 && prev[e - 1] == ' ') e--;
-        size_t b = e;
-        while (b > 0 && (isdigit((unsigned char)prev[b - 1]) || (prev[b - 1] == ',' && b > 1 && isdigit((unsigned char)prev[b - 2])))) b--;
-        if (b == e) continue;
-        std::string tail = prev.substr(b) + " Rupee";
-        reprice(tail, fn);
-        prev.replace(b, e - b, tail.substr(0, tail.find(' ')));
+// "[purple]3,000[white] Rupees": the number is the end of an earlier piece
+static void reprice_split_number(int i, PriceFn newPrice) {
+    int hit = find_text(partText[i], partLen[i], "Rupee");
+    if (hit < 0 || first_non_space(partText[i], partLen[i]) != hit) return;
+
+    int j = i;
+    while (j > 0 && isTag[j - 1]) j--;
+    if (j == 0) return;
+
+    char* prev = partText[j - 1];
+    int end = skip_spaces_back(prev, partLen[j - 1]);
+    int start = number_start(prev, end);
+    if (start == end) return;
+
+    // price "<number><spaces> Rupee" on its own, then put just the new number back
+    char scratch[kPartRoom];
+    int scratchLen = put_bytes(scratch, 0, prev + start, partLen[j - 1] - start);
+    scratchLen = put_words(scratch, scratchLen, " Rupee");
+    scratch[scratchLen] = 0;
+    reprice(scratch, &scratchLen, newPrice);
+    int numberLen = find_text(scratch, scratchLen, " ");
+    splice(prev, &partLen[j - 1], start, end - start, scratch, numberLen);
+}
+
+static void reprice_all(PriceFn newPrice) {
+    for (int i = 0; i < parts; i++) {
+        if (isTag[i]) continue;
+        reprice(partText[i], &partLen[i], newPrice);
+        reprice_split_number(i, newPrice);
     }
 }
 
-static void repr_v(std::vector<Tk>& v, u32 amt) {
-    reprice_v(v, [amt](u32) { return amt; });
+static u32 flatPrice;
+static u32 use_flat_price(u32) { return flatPrice; }
+
+static void set_price(u32 amount) {
+    flatPrice = amount;
+    reprice_all(use_flat_price);
 }
 
 // chudley's tags in hd money (x4). the oil sits on the red potion's flow, so its 3,000 lands here too
-static u32 chud_hd(u32 v) {
-    switch (v) {
+static u32 chud_hd(u32 old) {
+    switch (old) {
     case 2000:
     case 3000: return 12000;
     case 6000: return 24000;
@@ -1226,287 +1426,405 @@ static u32 chud_hd(u32 v) {
     }
 }
 
-static void add_a(std::vector<Tk>& v, size_t at) {
-    if (at > 0 && !v[at - 1].tag) {
-        std::string& s = v[at - 1].s;
-        while (!s.empty() && (s.back() == ' ' || isdigit((unsigned char)s.back()))) s.pop_back();
-        s += (s.empty() || s.back() == '\n') ? "a " : " a ";
-    } else {
-        v.insert(v.begin() + at, Tk{false, "a "});
+// --- wrapping, same rule as the randomizer: break at the last space past 17 font cells ---
+
+static JUTFont* wrapFont;
+static f32 wrapCell;
+static f32 lineW;
+static char* breakIn;
+static int breakAt;
+
+static f32 glyph_width(char c) {
+    if (wrapCell <= 0.0f) return 0.55f;
+    return (f32)wrapFont->getWidth((u8)c) / wrapCell;
+}
+
+// the "a" in front of the item name shouldn't end up alone on a line
+static bool lone_a(const char* buf, int i) {
+    if (i == 0 || buf[i - 1] != 'a') return false;
+    return i == 1 || buf[i - 2] == ' ' || buf[i - 2] == '\n';
+}
+
+static void wrap_piece(int p) {
+    char* buf = partText[p];
+    for (int i = 0; i < partLen[p]; i++) {
+        char c = buf[i];
+        if (c == '\n') {
+            lineW = 0.0f;
+            breakIn = nullptr;
+            continue;
+        }
+        if (c == ' ' && !lone_a(buf, i)) {
+            breakIn = buf;
+            breakAt = i;
+        }
+        lineW += glyph_width(c);
+        if (lineW <= 17.0f || breakIn == nullptr) continue;
+
+        breakIn[breakAt] = '\n';
+        lineW = 0.0f;
+        int k = breakIn == buf ? breakAt + 1 : i + 1;  // what's already past the new break
+        while (k <= i) lineW += glyph_width(buf[k++]);
+        breakIn = nullptr;
     }
 }
 
-// same rule the randomizer uses for its own text: break at the last space once a line passes
-// 17 font cells. tags take no room
-static void rewrap(std::vector<Tk>& v) {
-    JUTFont* f = mDoExt_getMesgFont();
-    f32 cell = f ? (f32)f->getCellWidth() : 0.0f;
-    f32 w = 0.0f;
-    std::string* sp = nullptr;
-    size_t spAt = 0;
-    for (auto& t : v) {
-        if (t.tag) continue;
-        for (size_t i = 0; i < t.s.size(); i++) {
-            char c = t.s[i];
-            if (c == '\n') {
-                w = 0.0f;
-                sp = nullptr;
-                continue;
-            }
-            // never strand the "a" from the item name
-            bool lone_a = i > 0 && t.s[i - 1] == 'a' && (i == 1 || t.s[i - 2] == ' ' || t.s[i - 2] == '\n');
-            if (c == ' ' && !lone_a) {
-                sp = &t.s;
-                spAt = i;
-            }
-            w += cell > 0.0f ? (f32)f->getWidth((u8)c) / cell : 0.55f;
-            if (w > 17.0f && sp) {
-                (*sp)[spAt] = '\n';
-                w = 0.0f;
-                if (sp == &t.s)
-                    for (size_t k = spAt + 1; k <= i; k++)
-                        w += cell > 0.0f ? (f32)f->getWidth((u8)t.s[k]) / cell : 0.55f;
-                sp = nullptr;
-            }
-        }
+static void rewrap() {
+    wrapFont = mDoExt_getMesgFont();
+    wrapCell = wrapFont ? (f32)wrapFont->getCellWidth() : 0.0f;
+    lineW = 0.0f;
+    breakIn = nullptr;
+    breakAt = 0;
+    for (int p = 0; p < parts; p++) {
+        if (!isTag[p]) wrap_piece(p);
     }
 }
 
-static bool goron_text(std::vector<Tk>& v) {
-    if (!has(v, "arrow")) return false;
-    for (size_t i = 0; i < v.size(); i++) {
-        if (!is_col(v[i]) || v[i].s[5] == 0) continue;
-        size_t j = i + 1;
-        std::string seg;
-        while (j < v.size() && !is_col(v[j])) {
-            if (!v[j].tag) seg += v[j].s;
-            j++;
+// --- goron's lines ---
+
+static void add_article(int at) {
+    if (at == 0 || isTag[at - 1]) {
+        insert_part(at, "a ", 2);
+        return;
+    }
+    char* before = partText[at - 1];
+    int& n = partLen[at - 1];
+    while (n > 0 && (before[n - 1] == ' ' || isdigit((unsigned char)before[n - 1]))) n--;
+    before[n] = 0;
+    const char* article = (n == 0 || before[n - 1] == '\n') ? "a " : " a ";
+    splice(before, &n, n, 0, article, (int)strlen(article));
+}
+
+static bool word_after_color(int colorAt) {
+    if (colorAt + 1 >= parts || !is_color(colorAt)) return false;
+    int next = colorAt + 1;
+    return !isTag[next] && partLen[next] > 0 && isalnum((unsigned char)partText[next][0]);
+}
+
+// colored "Arrows" -> blue "Blue Potion"
+static void recolor_arrow_names() {
+    for (int i = 0; i < parts; i++) {
+        if (!is_color(i) || partText[i][5] == 0) continue;
+
+        // everything up to the next color change
+        char inColor[2048];
+        int inLen = 0;
+        int j = i + 1;
+        for (; j < parts && !is_color(j); j++) {
+            if (isTag[j] || inLen + partLen[j] >= (int)sizeof(inColor)) continue;
+            inLen = put_bytes(inColor, inLen, partText[j], partLen[j]);
         }
-        if (low(seg).find("arrow") == std::string::npos) continue;
-        size_t ws = seg.find_last_not_of(' ');
-        std::string tail = ws == std::string::npos ? "" : seg.substr(ws + 1);
-        v[i].s[5] = (char)MESSAGE_COLOR_BLUE;
-        v.erase(v.begin() + i + 1, v.begin() + j);
-        v.insert(v.begin() + i + 1, Tk{false, "Blue Potion" + tail});
-        if (tail.empty() && i + 2 < v.size() && is_col(v[i + 2]) && i + 3 < v.size() && !v[i + 3].tag &&
-            !v[i + 3].s.empty() && isalnum((unsigned char)v[i + 3].s[0]))
-            v[i + 3].s.insert(0, " ");
-        add_a(v, i);
+        if (find_nocase(inColor, inLen, "arrow") < 0) continue;
+
+        // keep any trailing spaces the old name had
+        int last = inLen - 1;
+        while (last >= 0 && inColor[last] == ' ') last--;
+        int spaces = last < 0 ? 0 : inLen - 1 - last;
+
+        char name[32];
+        int nameLen = put_words(name, 0, "Blue Potion");
+        while (spaces-- > 0) name[nameLen++] = ' ';
+
+        partText[i][5] = (char)MESSAGE_COLOR_BLUE;
+        erase_parts(i + 1, j);
+        if (!insert_part(i + 1, name, nameLen)) return;
+        bool noSpace = nameLen == 11;
+        if (noSpace && word_after_color(i + 2)) splice(partText[i + 3], &partLen[i + 3], 0, 0, " ", 1);
+        add_article(i);
         i += 2;
     }
-    for (size_t i = 1; i < v.size(); i++) {
-        if (v[i].tag || !v[i - 1].tag || is_col(v[i - 1])) continue;
-        std::string l = low(v[i].s);
-        size_t k = l.find_first_not_of(' ');
-        if (k == std::string::npos || l.compare(k, 5, "arrow") != 0) continue;
-        size_t e = l.find("arrows", k) == k ? k + 6 : k + 5;
-        v[i].s.replace(0, e, col(MESSAGE_COLOR_BLUE) + "Blue Potion" + col(0));
-        v.erase(v.begin() + i - 1);
-        add_a(v, i - 1);
+}
+
+// "Arrows" right after a non-color tag gets the blue name too
+static void plain_arrow_names() {
+    for (int i = 1; i < parts; i++) {
+        if (isTag[i] || !isTag[i - 1] || is_color(i - 1)) continue;
+        char* buf = partText[i];
+        int word = first_non_space(buf, partLen[i]);
+        if (word < 0 || find_nocase(buf, partLen[i], "arrow", word) != word) continue;
+
+        int cut = find_nocase(buf, partLen[i], "arrows", word) == word ? word + 6 : word + 5;
+        char blue[32];
+        int blueLen = put_blue_potion(blue, 0);
+        splice(buf, &partLen[i], 0, cut, blue, blueLen);
+        erase_parts(i - 1, i);
+        add_article(i - 1);
     }
-    for (auto& t : v) {
-        if (t.tag) continue;
-        std::string l = low(t.s);
-        size_t p = l.find("30 arrows");
-        if (p != std::string::npos)
-            t.s.replace(p, 9, "a " + col(MESSAGE_COLOR_BLUE) + "Blue Potion" + col(0));
-        sub(t.s, "ARROWS", "POTIONS");
-        sub(t.s, "Arrows", "Potions");
-        sub(t.s, "arrows", "potions");
-        sub(t.s, "Arrow", "Potion");
-        sub(t.s, "arrow", "potion");
+}
+
+static const char* const arrowToPotion[][2] = {
+    {"ARROWS", "POTIONS"}, {"Arrows", "Potions"}, {"arrows", "potions"}, {"Arrow", "Potion"}, {"arrow", "potion"},
+};
+
+static void potion_words(int p) {
+    int at = find_nocase(partText[p], partLen[p], "30 arrows");
+    if (at >= 0) {
+        char swapIn[32];
+        int n = put_words(swapIn, 0, "a ");
+        n = put_blue_potion(swapIn, n);
+        splice(partText[p], &partLen[p], at, 9, swapIn, n);
     }
-    repr_v(v, kGoronPrice);
-    rewrap(v);
+    for (auto& words : arrowToPotion) swap_all(partText[p], &partLen[p], words[0], words[1]);
+}
+
+static bool goron_text() {
+    if (!mentions("arrow")) return false;
+    recolor_arrow_names();
+    plain_arrow_names();
+    for (int p = 0; p < parts; p++)
+        if (!isTag[p]) potion_words(p);
+    set_price(kGoronPrice);
+    rewrap();
     return true;
 }
 
-static bool shop_text(std::vector<Tk>& v, dShopSystem_c* s, Who w) {
-    if (s->chkExplainItem() && has(v, "rupee")) {
-        std::vector<Tk> o;
-        for (auto& t : v) {
-            if (!t.tag) break;
-            if (!is_col(t)) o.push_back(t);
-        }
-        std::string b = col(MESSAGE_COLOR_YELLOW) + "Lantern Oil" + col(0) + " ";
-        if (w == MALO)
-            b += col(MESSAGE_COLOR_RED) + "!Nice Deal!" + col(0) + " " + col(MESSAGE_COLOR_PURPLE) +
-                 "15 Rupees" + col(0) + "\nYou can't live without it!\n(Requires an empty bottle.)";
-        else
-            b += col(MESSAGE_COLOR_PURPLE) + "12,000 Rupees" + col(0) +
-                 "\nThis liquid sears its way into\nhouseholds worldwide.";
-        o.push_back({false, b});
-        v = o;
+// --- chudley's / malo mart lines ---
+
+static int oil_blurb(char* out, Who seller) {
+    int n = put_color(out, 0, MESSAGE_COLOR_YELLOW);
+    n = put_words(out, n, "Lantern Oil");
+    n = put_color(out, n, 0);
+    n = put_words(out, n, " ");
+    if (seller == MALO) {
+        n = put_color(out, n, MESSAGE_COLOR_RED);
+        n = put_words(out, n, "!Nice Deal!");
+        n = put_color(out, n, 0);
+        n = put_words(out, n, " ");
+        n = put_color(out, n, MESSAGE_COLOR_PURPLE);
+        n = put_words(out, n, "15 Rupees");
+        n = put_color(out, n, 0);
+        return put_words(out, n, "\nYou can't live without it!\n(Requires an empty bottle.)");
+    }
+    n = put_color(out, n, MESSAGE_COLOR_PURPLE);
+    n = put_words(out, n, "12,000 Rupees");
+    n = put_color(out, n, 0);
+    return put_words(out, n, "\nThis liquid sears its way into\nhouseholds worldwide.");
+}
+
+// the shelf description: keep the leading tags (minus colors), then our blurb
+static void oil_explain(Who seller) {
+    int kept = 0;
+    for (int i = 0; i < parts && isTag[i]; i++) {
+        if (!is_color(i)) copy_part(kept++, i);
+    }
+    parts = kept;
+
+    char blurb[256];
+    int blurbLen = oil_blurb(blurb, seller);
+    insert_part(parts, blurb, blurbLen);
+}
+
+static const char* const oilCounts[] = {"10 ", "20 ", "30 "};
+static const char* const oilNames[] = {"Red Potion", "Blue Potion", "Arrows", "Arrow", "Potion"};
+static const char* const oilNamesLow[] = {"red potion", "blue potion", "arrows", "arrow", "potion"};
+
+static void oil_words(int p) {
+    char* buf = partText[p];
+    int* len = &partLen[p];
+    char countName[24];
+    for (const char* count : oilCounts) {
+        snprintf(countName, sizeof(countName), "%sArrows", count);
+        swap_all(buf, len, countName, "Lantern Oil");
+        snprintf(countName, sizeof(countName), "%sarrows", count);
+        swap_all(buf, len, countName, "lantern oil");
+    }
+    swap_all(buf, len, " (10)", "");
+    swap_all(buf, len, " (20)", "");
+    swap_all(buf, len, " (30)", "");
+    for (const char* name : oilNames) swap_all(buf, len, name, "Lantern Oil");
+    for (const char* name : oilNamesLow) swap_all(buf, len, name, "lantern oil");
+}
+
+static bool shop_text(dShopSystem_c* shop, Who seller) {
+    if (shop->chkExplainItem() && mentions("rupee")) {
+        oil_explain(seller);
         return true;
     }
-    if (!has(v, "arrow") && !has(v, "potion") && !has(v, "rupee")) return false;
-    for (auto& t : v) {
-        if (t.tag) continue;
-        for (const char* n : {"10 ", "20 ", "30 "}) {
-            sub(t.s, std::string(n) + "Arrows", "Lantern Oil");
-            sub(t.s, std::string(n) + "arrows", "lantern oil");
-        }
-        sub(t.s, " (10)", "");
-        sub(t.s, " (20)", "");
-        sub(t.s, " (30)", "");
-        for (const char* a : {"Red Potion", "Blue Potion", "Arrows", "Arrow", "Potion"})
-            sub(t.s, a, "Lantern Oil");
-        for (const char* a : {"red potion", "blue potion", "arrows", "arrow", "potion"})
-            sub(t.s, a, "lantern oil");
+    if (!mentions("arrow") && !mentions("potion") && !mentions("rupee")) return false;
+    for (int p = 0; p < parts; p++) {
+        if (isTag[p]) continue;
+        oil_words(p);
     }
-    repr_v(v, price(w));
+    set_price(price(seller));
     return true;
 }
 
-static bool on_text(ModContext*, const MessageOverrideContext* m, MessageTextData* out, void*) {
-    if (!m->original_text || !out) return false;
-    bool goron = m->group == kGrp && stage_is("F_SP116");
-    dShopSystem_c* s = goron ? nullptr : live_shop();
-    bool chud = s && in_shop_room() && cfgOn(vChud) && !malo_pricing();
-    if (!goron && !s) return false;
-    auto v = lex(m->original_text, m->original_text_size);
-    bool ok = false;
+static bool on_text(ModContext*, const MessageOverrideContext* ctx, MessageTextData* out, void*) {
+    if (!ctx->original_text || !out) return false;
+    bool goron = ctx->group == kGrp && stage_is("F_SP116");
+    dShopSystem_c* shop = goron ? nullptr : live_shop();
+    if (!goron && !shop) return false;
+    bool chudPrices = shop && in_shop_room() && cfgOn(vChud) && !malo_pricing();
+
+    if (!split_text(ctx->original_text, ctx->original_text_size)) return false;
+    bool changed = false;
     if (goron) {
-        ok = goron_ours() && goron_text(v);
+        changed = goron_ours() && goron_text();
     } else {
-        Who w = shop_who(s);
-        if (w != NOBODY) ok = shop_text(v, s, w);
-        if (chud && has(v, "rupee")) {
-            reprice_v(v, chud_hd);
-            ok = true;
+        Who seller = shop_who(shop);
+        if (seller != NOBODY) changed = shop_text(shop, seller);
+        if (chudPrices && mentions("rupee")) {
+            reprice_all(chud_hd);
+            changed = true;
         }
     }
-    if (!ok) return false;
-    unlex(v);
-    out->text = g_out.data();
-    out->text_size = g_out.size();
+    if (!changed || !join_text()) return false;
+
+    out->text = (const uint8_t*)joined;
+    out->text_size = joinedLen + 1;  // with the terminator
     return true;
 }
 
-static HookAction shop_pre(ModContext*, void* a, void*, void*) {
-    g_inShop = mods::arg<dShopSystem_c*>(a, 0);
-    g_lastShop = g_inShop;
-    g_lastShopId = fopAcM_GetID(g_inShop);
+static HookAction shop_pre(ModContext*, void* args, void*, void*) {
+    activeShop = mods::arg<dShopSystem_c*>(args, 0);
+    recentShop = activeShop;
+    recentShopId = fopAcM_GetID(activeShop);
     return HOOK_CONTINUE;
 }
 
 static void shop_post(ModContext*, void*, void*, void*) {
-    g_inShop = nullptr;
+    activeShop = nullptr;
 }
 
-static void search_post(ModContext*, void* a, void* r, void*) {
-    auto* s = mods::arg<dShopSystem_c*>(a, 0);
-    if (!r || !*static_cast<bool*>(r) || !in_shop_room() || !cfgOn(vChud)) return;
-    int pot = -1;
-    for (int i = 0; i < dShopSystem_c::ITEM_MAX_e; i++) {
-        int no = slot_item(s, i);
-        if (no == dItemNo_RED_BOTTLE_e || (pot < 0 && is_pot(no))) pot = i;
+// The oil prompt hangs off a potion's flow: a red potion if there is one (the last one on the
+// shelf), otherwise the first potion. Arrows get collected as a bitmask on the same pass.
+static void search_post(ModContext*, void* args, void* found, void*) {
+    auto* shop = mods::arg<dShopSystem_c*>(args, 0);
+    if (!found || !*static_cast<bool*>(found) || !in_shop_room() || !cfgOn(vChud)) return;
+
+    // walked back to front: the first red seen is the last one on the shelf,
+    // and the last potion seen is the first one
+    int red = -1, firstPotion = -1;
+    u32 arrowSlots = 0;
+    int slot = dShopSystem_c::ITEM_MAX_e;
+    do {
+        --slot;
+        int sold = slot_item(shop, slot);
+        if (is_arrow(sold)) arrowSlots |= 1u << slot;
+        if (is_pot(sold)) firstPotion = slot;
+        if (sold == dItemNo_RED_BOTTLE_e && red < 0) red = slot;
+    } while (slot > 0);
+
+    int pot = red >= 0 ? red : firstPotion;
+    oilOnPotion = pot >= 0;
+    if (!oilOnPotion) return;
+
+    u16 flow = shop->mItemCtrl.getMessageIndex(pot);
+    for (int slot = 0; arrowSlots != 0; slot++, arrowSlots >>= 1) {
+        if (arrowSlots & 1) shop->mItemCtrl.setMessageIndex(slot, flow);
     }
-    g_reused = pot >= 0;
-    if (!g_reused) return;
-    for (int i = 0; i < dShopSystem_c::ITEM_MAX_e; i++)
-        if (is_arrow(slot_item(s, i))) s->mItemCtrl.setMessageIndex(i, s->mItemCtrl.getMessageIndex(pot));
 }
 
-static HookAction arc_pre(ModContext*, void* a, void*, void*) {
-    auto* it = mods::arg<daShopItem_c*>(a, 0);
-    if (is_arrow(it->m_itemNo) && in_shop_room() && cfgOn(vChud)) it->m_itemNo = dItemNo_OIL_BOTTLE_e;
+static HookAction arc_pre(ModContext*, void* args, void*, void*) {
+    auto* shelfItem = mods::arg<daShopItem_c*>(args, 0);
+    if (is_arrow(shelfItem->m_itemNo) && in_shop_room() && cfgOn(vChud)) shelfItem->m_itemNo = dItemNo_OIL_BOTTLE_e;
     return HOOK_CONTINUE;
 }
 
-static HookAction rupee_pre(ModContext*, void* a, void*, void*) {
-    auto* nd = mods::arg<mesg_flow_node_branch*>(a, 1);
-    Who w = who(mods::arg<fopAc_ac_c*>(a, 2));
-    if (w == NOBODY || !nd || nd->param == 0) return HOOK_CONTINUE;
-    nd->param = (u16)price(w);
-    if ((w == GORON || !g_reused) && mods::arg<int>(a, 3) != 0 && dComIfGs_checkEmptyBottle() == 0)
-        g_jump = w == GORON ? g_nodeGoron : g_nodeShop;
+static HookAction rupee_pre(ModContext*, void* args, void*, void*) {
+    auto* branch = mods::arg<mesg_flow_node_branch*>(args, 1);
+    Who seller = who(mods::arg<fopAc_ac_c*>(args, 2));
+    if (seller == NOBODY || !branch || branch->param == 0) return HOOK_CONTINUE;
+
+    branch->param = (u16)price(seller);
+    bool needsBottle = seller == GORON || !oilOnPotion;
+    if (needsBottle && mods::arg<int>(args, 3) != 0 && dComIfGs_checkEmptyBottle() == 0)
+        jumpTo = seller == GORON ? noBottleGoron : noBottleShop;
     return HOOK_CONTINUE;
 }
 
-static void branch_post(ModContext*, void* a, void*, void*) {
-    if (!g_jump) return;
-    u16 n = g_jump;
-    g_jump = 0;
-    mods::arg<dMsgFlow_c*>(a, 0)->setNodeIndex(n, mods::arg<fopAc_ac_c**>(a, 2));
+static void branch_post(ModContext*, void* args, void*, void*) {
+    if (!jumpTo) return;
+    u16 node = jumpTo;
+    jumpTo = 0;
+    mods::arg<dMsgFlow_c*>(args, 0)->setNodeIndex(node, mods::arg<fopAc_ac_c**>(args, 2));
 }
 
-static HookAction owned_pre(ModContext*, void* a, void* r, void*) {
-    auto* nd = mods::arg<mesg_flow_node_branch*>(a, 1);
-    if (!nd || who(mods::arg<fopAc_ac_c*>(a, 2)) != GORON) return HOOK_CONTINUE;
-    if ((nd->param & 0xFF) != dItemNo_BOW_e) return HOOK_CONTINUE;
-    if (r) *static_cast<u16*>(r) = 0;
+// "do you have a bow?" -> no, so he doesn't talk about arrows
+static HookAction owned_pre(ModContext*, void* args, void* ret, void*) {
+    auto* branch = mods::arg<mesg_flow_node_branch*>(args, 1);
+    if (!branch || who(mods::arg<fopAc_ac_c*>(args, 2)) != GORON) return HOOK_CONTINUE;
+    if ((branch->param & 0xFF) != dItemNo_BOW_e) return HOOK_CONTINUE;
+    if (ret) *static_cast<u16*>(ret) = 0;
     return HOOK_SKIP_ORIGINAL;
 }
 
-static HookAction arrows_pre(ModContext*, void* a, void* r, void*) {
-    if (who(mods::arg<fopAc_ac_c*>(a, 2)) != GORON) return HOOK_CONTINUE;
-    if (r) *static_cast<u16*>(r) = 1;
+static HookAction arrows_pre(ModContext*, void* args, void* ret, void*) {
+    if (who(mods::arg<fopAc_ac_c*>(args, 2)) != GORON) return HOOK_CONTINUE;
+    if (ret) *static_cast<u16*>(ret) = 1;
     return HOOK_SKIP_ORIGINAL;
 }
 
-static HookAction fill_pre(ModContext*, void* a, void* r, void*) {
-    if (who(mods::arg<fopAc_ac_c*>(a, 2)) != GORON) return HOOK_CONTINUE;
-    g_net = true;
-    g_netGot = false;
-    g_netWait = 0;
-    if (r) *static_cast<int*>(r) = 1;
+static HookAction fill_pre(ModContext*, void* args, void* ret, void*) {
+    if (who(mods::arg<fopAc_ac_c*>(args, 2)) != GORON) return HOOK_CONTINUE;
+    potionPending = true;
+    potionGiven = false;
+    potionWait = 0;
+    if (ret) *static_cast<int*>(ret) = 1;
     return HOOK_SKIP_ORIGINAL;
 }
 
-static void on_give(ModContext*, const ItemGiveInfo* gi, void*) {
-    if (!g_net || !gi) return;
-    if (gi->item == dItemNo_BLUE_BOTTLE_e || (gi->check_name && !strcmp(gi->check_name, kGoronCheck)))
-        g_netGot = true;
+// every item the game hands out comes through here; we only care while the goron's potion is owed
+static void watch_gifts(ModContext*, const ItemGiveInfo* handedOver, void*) {
+    if (!potionPending || !handedOver) return;
+    const char* check = handedOver->check_name;
+    bool ours = handedOver->item == dItemNo_BLUE_BOTTLE_e || (check && !strcmp(check, kGoronCheck));
+    potionGiven = potionGiven || ours;
 }
 
 // swap the item inside his "give" event instead of through the shop check: the check is a one-time
 // collectible to randomizer/online sync mods ("Already collected"), the potion has to stay repeatable.
 // a blue potion isn't his check item, so the game hands it over without touching the check at all
 // same for the lantern oil: the shop's give event hands out oil directly, so no check gets resolved
-static HookAction start_pre(ModContext*, void* a, void*, void*) {
-    auto* nd = mods::arg<mesg_flow_node_event*>(a, 1);
-    Who w = who(mods::arg<fopAc_ac_c*>(a, 2));
-    if (!nd || w == NOBODY || nd->params[0] != 0 || nd->params[1] != 1 || nd->params[2] != 0) return HOOK_CONTINUE;
-    u8& item = nd->params[3];
-    if (w == GORON && item == dItemNo_ARROW_30_e)
+static HookAction start_pre(ModContext*, void* args, void*, void*) {
+    auto* event = mods::arg<mesg_flow_node_event*>(args, 1);
+    Who seller = who(mods::arg<fopAc_ac_c*>(args, 2));
+    if (!event || seller == NOBODY) return HOOK_CONTINUE;
+    if (event->params[0] != 0 || event->params[1] != 1 || event->params[2] != 0) return HOOK_CONTINUE;
+
+    u8& item = event->params[3];
+    if (seller == GORON && item == dItemNo_ARROW_30_e)
         item = dItemNo_BLUE_BOTTLE_e;
-    else if (w != GORON && (is_arrow(item) || is_pot(item)))
+    else if (seller != GORON && (is_arrow(item) || is_pot(item)))
         item = dItemNo_OIL_BOTTLE_e;
     return HOOK_CONTINUE;
 }
 
-static HookAction pay_pre(ModContext*, void* a, void*, void*) {
-    auto* nd = mods::arg<mesg_flow_node_event*>(a, 1);
-    Who w = who(mods::arg<fopAc_ac_c*>(a, 2));
-    if (w == NOBODY || !nd || !(nd->params[0] | nd->params[1] | nd->params[2] | nd->params[3]))
-        return HOOK_CONTINUE;
-    u32 p = price(w);
-    nd->params[0] = (u8)(p >> 24);
-    nd->params[1] = (u8)(p >> 16);
-    nd->params[2] = (u8)(p >> 8);
-    nd->params[3] = (u8)p;
+static HookAction pay_pre(ModContext*, void* args, void*, void*) {
+    auto* event = mods::arg<mesg_flow_node_event*>(args, 1);
+    Who seller = who(mods::arg<fopAc_ac_c*>(args, 2));
+    if (seller == NOBODY || !event) return HOOK_CONTINUE;
+    u8* cost = event->params;
+    if (!(cost[0] | cost[1] | cost[2] | cost[3])) return HOOK_CONTINUE;
+
+    u32 amount = price(seller);
+    cost[0] = (u8)(amount >> 24);
+    cost[1] = (u8)(amount >> 16);
+    cost[2] = (u8)(amount >> 8);
+    cost[3] = (u8)amount;
     return HOOK_CONTINUE;
 }
 
 static ModResult reg_msg(const char* txt, u16& id) {
     auto mb = flw::MessageBuilder{flw::MessageStyle{}.trailing_data(0x0400)}.text(txt);
-    std::vector<flw::MessageVariant> vs;
-    for (auto l : {MESSAGE_LANGUAGE_ENGLISH, MESSAGE_LANGUAGE_GERMAN, MESSAGE_LANGUAGE_FRENCH,
-             MESSAGE_LANGUAGE_SPANISH, MESSAGE_LANGUAGE_ITALIAN, MESSAGE_LANGUAGE_JAPANESE})
-        vs.push_back(mb.build(l));
-    auto m = flw::register_message(kGrp, vs);
-    if (!m) return m.result();
-    id = m.id();
-    g_msgs.push_back(std::move(m));
+    // same text for every language
+    auto en = mb.build(MESSAGE_LANGUAGE_ENGLISH), de = mb.build(MESSAGE_LANGUAGE_GERMAN);
+    auto fr = mb.build(MESSAGE_LANGUAGE_FRENCH), es = mb.build(MESSAGE_LANGUAGE_SPANISH);
+    auto it = mb.build(MESSAGE_LANGUAGE_ITALIAN), jp = mb.build(MESSAGE_LANGUAGE_JAPANESE);
+    if (bottleCount >= 2) return MOD_ERROR;
+    flw::RegisteredMessage& line = bottleLines[bottleCount];
+    line = flw::register_message(kGrp, {en, de, fr, es, it, jp});
+    if (!line) return line.result();
+    id = line.id();
+    bottleCount++;
     return MOD_OK;
 }
 
 // shop side never fails the mod, the leaf has to keep working on its own
 static void shop_init() {
-    g_inShop = g_lastShop = nullptr;
-    g_jump = 0;
-    g_reused = g_net = false;
+    activeShop = recentShop = nullptr;
+    jumpTo = 0;
+    oilOnPotion = potionPending = false;
     u16 shopMsg, goronMsg;
     if (reg_msg("Sorry, I can only sell this to\ncustomers with empty bottles.\nNext time, maybe.", shopMsg) != MOD_OK ||
         reg_msg("You'll need an empty bottle for\nthis, Brother!", goronMsg) != MOD_OK) {
@@ -1515,54 +1833,74 @@ static void shop_init() {
     }
     {
         flw::GraphBuilder gb{kGrp};
-        g_nodeShop = gb.add_message(shopMsg).next(flw::kEnd).id();
-        g_nodeGoron = gb.add_message(goronMsg).next(flw::kEnd).id();
-        g_graph = gb.commit();
-        if (!g_graph) {
+        noBottleShop = gb.add_message(shopMsg).next(flw::kEnd).id();
+        noBottleGoron = gb.add_message(goronMsg).next(flw::kEnd).id();
+        bottleNodes = gb.commit();
+        if (!bottleNodes) {
             mods::log::warn("shop swap: couldn't commit flow nodes, shops stay vanilla");
             return;
         }
     }
     // castle town text, plus the common group where generic shop prompts may live
-    for (u16 id = 4000; id < 9000; id++) g_ovr.push_back(flw::override_message_fn(kGrp, id, MESSAGE_LANGUAGE_ENGLISH, on_text));
-    for (u16 id = 0; id < 2500; id++) g_ovr.push_back(flw::override_message_fn(0, id, MESSAGE_LANGUAGE_ENGLISH, on_text));
-    svc_item->observe_gives(mod_ctx, on_give, nullptr, &g_obs);
-    bool ok = pre<ShopProc>(shop_pre) && post<ShopProc>(shop_post) && post<ShopSearch>(search_post) &&
-              pre<ShopArc>(arc_pre) && post<BranchProc>(branch_post) && pre<QRupee>(rupee_pre) &&
-              pre<EPay>(pay_pre) && pre<QOwned>(owned_pre) && pre<QArrows>(arrows_pre) &&
-              pre<EFillArrows>(fill_pre) && pre<EStart>(start_pre);
+    textHookCount = 0;
+    for (u16 id = 4000; id < 9000; id++)
+        textHooks[textHookCount++] = flw::override_message_fn(kGrp, id, MESSAGE_LANGUAGE_ENGLISH, on_text);
+    for (u16 id = 0; id < 2500; id++)
+        textHooks[textHookCount++] = flw::override_message_fn(0, id, MESSAGE_LANGUAGE_ENGLISH, on_text);
+    static ItemGiveHandle giftWatch;  // tells the goron fallback when the potion landed
+    svc_item->observe_gives(mod_ctx, watch_gifts, nullptr, &giftWatch);
+    // stops at the first one that fails, like before
+    bool ok = pre_hook(ShopProc, shop_pre);
+    if (ok) ok = post_hook(ShopProc, shop_post);
+    if (ok) ok = post_hook(ShopSearch, search_post);
+    if (ok) ok = pre_hook(ShopArc, arc_pre);
+    if (ok) ok = post_hook(BranchProc, branch_post);
+    if (ok) ok = pre_hook(QRupee, rupee_pre);
+    if (ok) ok = pre_hook(EPay, pay_pre);
+    if (ok) ok = pre_hook(QOwned, owned_pre);
+    if (ok) ok = pre_hook(QArrows, arrows_pre);
+    if (ok) ok = pre_hook(EFillArrows, fill_pre);
+    if (ok) ok = pre_hook(EStart, start_pre);
     if (!ok) mods::log::warn("shop swap: some hooks failed, shops may act vanilla");
 }
 
 static void shop_update() {
-    if (!g_net) return;
-    if (!stage_is("F_SP116") || g_netGot) {
-        g_net = false;
+    if (!potionPending) return;
+    if (!stage_is("F_SP116") || potionGiven) {
+        potionPending = false;
         return;
     }
     if (dComIfGp_event_runCheck()) {
-        g_netWait = 0;
+        potionWait = 0;
         return;
     }
-    if (++g_netWait > 30) {
+    if (++potionWait > 30) {
         dComIfGs_setEmptyBottleItemIn(dItemNo_BLUE_BOTTLE_e);
-        g_net = false;
+        potionPending = false;
     }
 }
 
 static void shop_shutdown() {
-    g_ovr.clear();
-    g_graph.reset();
-    g_msgs.clear();
-    g_inShop = g_lastShop = nullptr;
+    while (textHookCount > 0) textHooks[--textHookCount].reset();
+    bottleNodes.reset();
+    bottleLines[0].reset();
+    bottleLines[1].reset();
+    bottleCount = 0;
+    activeShop = recentShop = nullptr;
 }
 
 // ======================== mod page ========================
 
+// plain text lines that sit above each group of toggles
+
+static void subtitle(UiElementHandle panel, const char* line) {
+    svc_ui->pane_add_text(mod_ctx, panel, line, nullptr);
+}
+
 static bool leaf_off(ModContext*, void*);
 
 static ModResult shop_panel(UiElementHandle panel) {
-    svc_ui->pane_add_text(mod_ctx, panel, "Regular Shop Changes", nullptr);
+    subtitle(panel, "Regular Shop Changes");
 
     UiControlDesc gor = UI_CONTROL_DESC_INIT;
     gor.kind = UI_CONTROL_TOGGLE;
@@ -1586,7 +1924,7 @@ static ModResult shop_panel(UiElementHandle panel) {
         if (r != MOD_OK) return r;
     }
 
-    svc_ui->pane_add_text(mod_ctx, panel, "Ice Leaf", nullptr);
+    subtitle(panel, "Ice Leaf");
 
     if (vLeaf) {
         UiControlDesc en = UI_CONTROL_DESC_INIT;
@@ -1630,7 +1968,7 @@ static ModResult build_panel(ModContext*, UiElementHandle panel, void*, ModError
     auto* ui = svc_ui;
     ui->pane_add_section(mod_ctx, panel, "Less Restrictive Maps");
 
-    ui->pane_add_text(mod_ctx, panel, "Epona Locations", nullptr);
+    subtitle(panel, "Epona Locations");
     UiControlDesc t = UI_CONTROL_DESC_INIT;
     t.kind = UI_CONTROL_TOGGLE;
     t.binding = UI_BINDING_CONFIG_VAR;
@@ -1643,7 +1981,7 @@ static ModResult build_panel(ModContext*, UiElementHandle panel, void*, ModError
     UiControlDesc dd = UI_CONTROL_DESC_INIT;
     dd.kind = UI_CONTROL_DROPDOWN;
     dd.binding = UI_BINDING_CONFIG_VAR;
-    ui->pane_add_text(mod_ctx, panel, "Map Checks", nullptr);
+    subtitle(panel, "Map Checks");
 
     dd.label = "Remove faron woods mist";
     dd.options = mistNames;
@@ -1686,25 +2024,25 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
         !add_int_option("chudleysMode", SHOP_SEMI, &shopOption))
         return mods::set_error(error, MOD_ERROR, "can't register settings");
 
-    if (!pre<HorseSavePos>(keep_field_spot) || !pre<SetStartStage>(remember_stage) ||
-        !post<SetStartStage>(check_horse_arrival))
+    if (!pre_hook(HorseSavePos, keep_field_spot) || !pre_hook(SetStartStage, remember_stage) ||
+        !post_hook(SetStartStage, check_horse_arrival))
         return mods::set_error(error, MOD_ERROR, "horse hooks failed");
 
-    if (!post<TownUseItem>(allow_horse_call)) mods::log::warn("Horse Call stays blocked in Castle Town");
-    if (!pre<HorseSearchEnemy>(calm_epona)) mods::log::warn("Epona may still spook at fish");
+    if (!post_hook(TownUseItem, allow_horse_call)) mods::log::warn("Horse Call stays blocked in Castle Town");
+    if (!pre_hook(HorseSearchEnemy, calm_epona)) mods::log::warn("Epona may still spook at fish");
 
     int faronFails = 0;
-    faronFails += !pre<BgDraw>(note_bg_room);
-    faronFails += !post<BgDraw>(clear_bg_room);
-    faronFails += !post<BgMaterialProc>(hide_mist_sheet);
-    faronFails += !post<FieldMapGroupSwitch>(pause_map_switch);
-    faronFails += !post<MiniMapGroupSwitch>(minimap_switch);
-    faronFails += !pre<FogTagExecute>(kill_mist_tag);
+    faronFails += !pre_hook(BgDraw, note_bg_room);
+    faronFails += !post_hook(BgDraw, clear_bg_room);
+    faronFails += !post_hook(BgMaterialProc, hide_mist_sheet);
+    faronFails += !post_hook(FieldMapGroupSwitch, pause_map_switch);
+    faronFails += !post_hook(MiniMapGroupSwitch, minimap_switch);
+    faronFails += !pre_hook(FogTagExecute, kill_mist_tag);
     if (faronFails) mods::log::warn("Faron mist option won't fully work");
 
-    if (!post<EventBit>(hide_malo_flags)) mods::log::warn("Chudley's option off");
-    if (!pre<BgObjExec>(posters_down)) mods::log::warn("posters will stay up");
-    if (!post<ShelfSpawn>(malo_shelf_prompt)) mods::log::warn("shelves keep Chudley's prices");
+    if (!post_hook(EventBit, hide_malo_flags)) mods::log::warn("Chudley's option off");
+    if (!pre_hook(BgObjExec, posters_down)) mods::log::warn("posters will stay up");
+    if (!post_hook(ShelfSpawn, malo_shelf_prompt)) mods::log::warn("shelves keep Chudley's prices");
 
     // --- Shop Expansion ---
     ModResult res = mods::hook::add_pre<Exec>(exec_pre);
@@ -1729,7 +2067,7 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     if (svc_resource->load(mod_ctx, "iceleaf_icon.rgba", &iconRes) != MOD_OK)
         mods::log::warn("iceleaf_icon.rgba missing, wheel will show the boomerang icon");
 
-    res = mods::hook::add_pre<MsgBegin>(msgbegin_pre);
+    res = mods::hook::add_pre<IceLeafGetBox>(msgbegin_pre);
     if (res == MOD_OK) res = mods::hook::add_post<MsgSeq>(msgseq_post);
     if (res != MOD_OK)
         mods::log::warn("pickup text hooks failed ({}), prompt will show the vanilla text", (int)res);
@@ -1777,8 +2115,7 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
     put_lighting_back();
     if (out()) drop((daAlink_c*)dComIfGp_getPlayer(0));
     if (dComIfGs_getItem(leafSlot, true) == leafItem) setLeafSlot(dItemNo_NONE_e);
-    for (int i = 0; i < nIcons; i++) svc_texture->unregister(mod_ctx, icons[i].h);
-    nIcons = 0;
+    while (nIcons > 0) svc_texture->unregister(mod_ctx, iconTex[--nIcons]);
     if (iconRes.data) svc_resource->free(mod_ctx, &iconRes);
     shop_shutdown();
     return MOD_OK;
