@@ -65,11 +65,10 @@ IMPORT_SERVICE(ItemService, svc_item);
 
 // maps
 #define EPONA_AREAS 4
-#define GROVE_AREA 3
 static const char* eponaStages[] = {"F_SP116", "F_SP127", "F_SP124", "F_SP117"};
 static const char* eponaKeys[] = {"castleTown", "fishingHole", "gerudoDesert", "sacredGrove"};
-static const char* eponaLabels[] = {"Epona in Castle Town", "Epona at the Fishing Hole", "Epona in Gerudo Desert",
-                                    "Epona in Sacred Grove"};
+static const char* eponaLabels[] = {"Epona in Castle Town", "Epona at the Fishing Hole", "Epona in Gerudo Desert", "Epona in Sacred Grove"};
+static const int eponaNoRoom[] = {-1, -1, -1, 2};  // F_SP117's room 2 is the Temple of Time
 static ConfigVarHandle eponaToggle[EPONA_AREAS];
 
 enum MistMode : int { MIST_OFF, MIST_SEMI, MIST_ON };
@@ -145,10 +144,8 @@ static int horse_area(const char* stage) {
     return stage && area < EPONA_AREAS ? area : -1;
 }
 
-// F_SP117 also holds the Temple of Time (room 2); only the Lost Woods (3) and the grove (1) count
 static bool horse_allowed(int area, int room) {
-    if (area < 0 || !cfgOn(eponaToggle[area])) return false;
-    return area != GROVE_AREA || room == 1 || room == 3;
+    return area >= 0 && cfgOn(eponaToggle[area]) && room != eponaNoRoom[area];
 }
 
 static int room_now() {
