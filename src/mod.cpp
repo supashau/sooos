@@ -645,6 +645,34 @@ static stage_scls_info_class* lake_exit(void* file, const stage_actor_data_class
     return strncmp(scenes[which].mStage, "F_SP115", 8) == 0 ? &scenes[which] : nullptr;
 }
 
+// The three crates at the near end of the bridge just block the walkway in normal Hyrule, so they stay
+// in twilight. They sit in a strip starting at this spot and running north along the deck.
+static const float kNearEndX = -93621.0f;
+static const float kNearEndZ = 43150.0f;
+
+static bool near_end_crate(const cXyz& at) {
+    // the deck heads almost straight up +Z here (Link's facing was 857, about 5 degrees)
+    float dx = at.x - kNearEndX;
+    float dz = at.z - kNearEndZ;
+    float along = dx * 0.0822f + dz * 0.9966f;
+    float across = dx * 0.9966f - dz * 0.0822f;
+    return along > -600.0f && along < 4000.0f && fabsf(across) < 1000.0f;
+}
+
+// Three of the twilight crates just block the walkway in normal Hyrule, so they stay in twilight:
+// the pair at the near end of the deck and the lone one further up on the left.
+static const float kSkipCrateX[2] = {-93621.0f, -93587.0f};
+static const float kSkipCrateZ[2] = {43150.0f, 46835.0f};
+
+static bool blocking_crate(const cXyz& at) {
+    for (int s = 0; s < 2; s++) {
+        float dx = at.x - kSkipCrateX[s];
+        float dz = at.z - kSkipCrateZ[s];
+        if (dx * dx + dz * dz < 900.0f * 900.0f) return true;
+    }
+    return false;
+}
+
 // `room` is where the copies go; `fromStage` means `file` is stage.dzs, whose crates only count near the bridge
 static void copy_bridge_jump(void* file, int room, bool fromStage) {
     static const char* const tags[2] = {"SCOe", "ACTe"};
@@ -685,6 +713,8 @@ static void copy_bridge_jump(void* file, int room, bool fromStage) {
             cXyz at = rec->base.position;
             bool wanted = fromStage ? at.abs(kBridgeSpot) < 6000.0f : room == kBridgeRoom;
             for (int d = 0; d < drops && !wanted; d++) wanted = at.abs(drop[d]) < 3000.0f;
+            if (wanted && near_end_crate(at)) wanted = false;
+            if (blocking_crate(at)) wanted = false;
             if (!wanted) continue;
 
             const fopAcM_prmScale_class* size = t == 0 ? &((const stage_tgsc_data_class*)rec)->scale : nullptr;
