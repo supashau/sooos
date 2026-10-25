@@ -78,6 +78,7 @@ static ConfigVarHandle mistOption;
 enum ShopMode : int { SHOP_OFF, SHOP_SEMI, SHOP_PARTIAL, SHOP_FULL };
 static const char* const shopNames[] = {"Off", "Semi-Default", "Partial-Default", "On"};
 static ConfigVarHandle shopOption;
+static ConfigVarHandle bridgeJump;
 
 // shop + ice leaf (0 if registering failed)
 static ConfigVarHandle vBoost, vAlways, vGoron, vChud, vLeaf;
@@ -116,6 +117,27 @@ static bool real_flag(u16 bit) {
     bool on = dComIfGs_isEventBit(bit);
     peekRealFlags = false;
     return on;
+}
+
+// stage file offsets are file-relative until the loader fixes them up
+static void* chunk_data(void* file, OffsetPtr& off) {
+    u32 raw = (u32)(s32)off.value;
+    if ((raw & 0x80000000u) == 0) return (u8*)file + raw;
+    s32 rel = (raw & 0x40000000u) ? (s32)raw : (s32)(raw & 0x7FFFFFFFu);
+    return (u8*)&off + rel;
+}
+
+// a room's actor list etc. by its 4-letter tag, nullptr if the room file doesn't have it
+static void* find_chunk(void* roomFile, const char* tag, int& count) {
+    auto* file = static_cast<dStage_fileHeader*>(roomFile);
+    for (int c = 0; c < file->m_chunkCount; c++) {
+        dStage_nodeHeader& node = file->m_nodes[c];
+        if (memcmp(&node.m_tag, tag, 4) != 0) continue;
+        count = node.m_entryNum;
+        return chunk_data(roomFile, node.m_offset);
+    }
+    count = 0;
+    return nullptr;
 }
 
 static bool hooked(ModResult r, const char* kind) {
@@ -563,6 +585,151 @@ static void faron_lighting_tick() {
     use_env(merged);
     lightingOn = true;
     lightingLink = fopAcM_GetID(link);
+}
+
+// --- Lake Hylia jump from the Great Bridge ---
+
+// The twilight version of the bridge has crates to climb and a load zone that drops you into
+// Lake Hylia. Once the wagon escort is done the field's normal layer doesn't have them, so they're
+// copied out of the twilight layer (14, chunk tags ending in 'e') of whichever field room holds them.
+static const int kMaxBridgeBits = 24;
+static fpc_ProcID bridgeBits[kMaxBridgeBits];
+static s8 bridgeBitRoom[kMaxBridgeBits];
+static int bridgeBitCount;
+static u64 bridgeRooms;  // rooms we've already copied into
+static fpc_ProcID bridgeLink = fpcM_ERROR_PROCESS_ID_e;
+
+static void* room_file(int room) {
+    return dComIfG_getStageRes(dComIfG_getRoomArcName(room), "room.dzr");
+}
+
+static bool is_crate(s16 proc) {
+    return proc == fpcNm_Obj_Movebox_e || proc == fpcNm_OBJ_KBOX_e || proc == fpcNm_OBJ_LBOX_e ||
+           proc == fpcNm_Obj_BBox_e;
+}
+
+static void spawn_copy(const stage_actor_data_class* rec, const fopAcM_prmScale_class* size, int room, u32 params,
+                       csXyz rot) {
+    dStage_objectNameInf* info = dStage_searchName(rec->name);
+    if (info == nullptr || bridgeBitCount == kMaxBridgeBits) return;
+
+    cXyz pos = rec->base.position;
+    cXyz scale(1.0f, 1.0f, 1.0f);
+    if (size) scale.set(size->x * 0.1f, size->y * 0.1f, size->z * 0.1f);
+    fpc_ProcID id = fopAcM_create(info->procname, params, &pos, room, &rot, &scale, info->argument);
+    if (id == fpcM_ERROR_PROCESS_ID_e) return;
+    bridgeBitRoom[bridgeBitCount] = (s8)room;
+    bridgeBits[bridgeBitCount++] = id;
+}
+
+// a twilight-layer record, either a plain actor (ACTe, 0x20 bytes) or one with a size (SCOe, 0x24)
+static const stage_actor_data_class* twilight_record(void* list, int i, bool sized) {
+    u8* base = static_cast<u8*>(list);
+    return reinterpret_cast<const stage_actor_data_class*>(base + i * (sized ? 0x24 : 0x20));
+}
+
+// the exit's target, from the room's own scene list
+static stage_scls_info_class* lake_exit(void* file, const stage_actor_data_class* rec) {
+    s16 proc = -1;
+    if (dStage_objectNameInf* info = dStage_searchName(rec->name)) proc = info->procname;
+    if (proc != fpcNm_SCENE_EXIT_e && proc != fpcNm_SCENE_EXIT2_e) return nullptr;
+
+    int exits = 0;
+    auto* scenes = static_cast<stage_scls_info_class*>(find_chunk(file, "SCLS", exits));
+    u32 params = rec->base.parameters;
+    int which = params & 0xFF;
+    if (scenes == nullptr || which >= exits) return nullptr;
+    return strncmp(scenes[which].mStage, "F_SP115", 8) == 0 ? &scenes[which] : nullptr;
+}
+
+static void copy_bridge_jump(void* file, int room) {
+    static const char* const tags[2] = {"SCOe", "ACTe"};
+    cXyz drop[4];
+    int drops = 0;
+
+    // the load zones into the lake first
+    for (int t = 0; t < 2; t++) {
+        int count = 0;
+        void* list = find_chunk(file, tags[t], count);
+        for (int i = 0; list && i < count; i++) {
+            const stage_actor_data_class* rec = twilight_record(list, i, t == 0);
+            stage_scls_info_class* exit = lake_exit(file, rec);
+            if (exit == nullptr || drops == 4) continue;
+
+            // land in whatever layer the lake would normally load, not the twilight one
+            exit->field_0xb |= 0x0F;
+            // and drop the twilight-only switch / event conditions
+            u32 params = rec->base.parameters | 0xFF000000;
+            csXyz rot = rec->base.angle;
+            rot.x = rot.z = 0x0FFF;
+            const fopAcM_prmScale_class* size = t == 0 ? &((const stage_tgsc_data_class*)rec)->scale : nullptr;
+            spawn_copy(rec, size, room, params, rot);
+            drop[drops++] = rec->base.position;
+        }
+    }
+
+    // then the crates that sit near them
+    for (int t = 0; t < 2 && drops > 0; t++) {
+        int count = 0;
+        void* list = find_chunk(file, tags[t], count);
+        for (int i = 0; list && i < count; i++) {
+            const stage_actor_data_class* rec = twilight_record(list, i, t == 0);
+            dStage_objectNameInf* info = dStage_searchName(rec->name);
+            if (info == nullptr || !is_crate(info->procname)) continue;
+
+            cXyz at = rec->base.position;
+            bool close = false;
+            for (int d = 0; d < drops && !close; d++) close = at.abs(drop[d]) < 3000.0f;
+            if (!close) continue;
+
+            const fopAcM_prmScale_class* size = t == 0 ? &((const stage_tgsc_data_class*)rec)->scale : nullptr;
+            spawn_copy(rec, size, room, rec->base.parameters, rec->base.angle);
+        }
+    }
+}
+
+// rooms come and go as you cross the field; drop our copies with them and redo them on the way back
+static void forget_room(int room) {
+    int kept = 0;
+    for (int i = 0; i < bridgeBitCount; i++) {
+        if (bridgeBitRoom[i] == room) {
+            fopAc_ac_c* bit = fopAcM_SearchByID(bridgeBits[i]);
+            if (bit) fopAcM_delete(bit);
+            continue;
+        }
+        bridgeBitRoom[kept] = bridgeBitRoom[i];
+        bridgeBits[kept++] = bridgeBits[i];
+    }
+    bridgeBitCount = kept;
+    bridgeRooms &= ~(1ull << room);
+}
+
+static bool bridge_jump_wanted() {
+    if (!stage_is("F_SP121") || dKy_darkworld_check() || !cfgOn(bridgeJump)) return false;
+    return dComIfGs_isEventBit(dSv_event_flag_c::saveBitLabels[68]);  // wagon escort done
+}
+
+static void bridge_tick() {
+    daAlink_c* link = daAlink_getAlinkActorClass();
+    fpc_ProcID now = link ? fopAcM_GetID(link) : fpcM_ERROR_PROCESS_ID_e;
+    if (now != bridgeLink) {  // new scene, the old copies went with it
+        bridgeLink = now;
+        bridgeRooms = 0;
+        bridgeBitCount = 0;
+    }
+    if (link == nullptr) return;
+
+    bool wanted = bridge_jump_wanted();
+    if (!wanted && bridgeRooms == 0) return;  // nothing to add or take away
+    for (int room = 0; room < 64; room++) {
+        bool done = (bridgeRooms >> room) & 1;
+        void* file = room_file(room);
+        if (done && (!wanted || file == nullptr)) forget_room(room);
+        if (done || !wanted || file == nullptr) continue;
+
+        bridgeRooms |= 1ull << room;
+        copy_bridge_jump(file, room);
+    }
 }
 
 // ======================== Ice Leaf ========================
@@ -1033,14 +1200,6 @@ static HookAction posters_down(ModContext*, void* args, void* ret, void*) {
     }
     *(int*)ret = 1;
     return HOOK_SKIP_ORIGINAL;
-}
-
-// file-relative until the loader fixes it up
-static void* chunk_data(void* file, OffsetPtr& off) {
-    u32 raw = (u32)(s32)off.value;
-    if ((raw & 0x80000000u) == 0) return (u8*)file + raw;
-    s32 rel = (raw & 0x40000000u) ? (s32)raw : (s32)(raw & 0x7FFFFFFFu);
-    return (u8*)&off + rel;
 }
 
 // the tag's own create wrapper, fires before the shopkeeper looks at the shelf
@@ -2059,6 +2218,10 @@ static ModResult build_panel(ModContext*, UiElementHandle panel, void*, ModError
     dd.config_var = shopOption;
     ui->pane_add_control(mod_ctx, panel, &dd, nullptr);
 
+    t.label = "Jump to Lake Hylia from Bridge";
+    t.config_var = bridgeJump;
+    ui->pane_add_control(mod_ctx, panel, &t, nullptr);
+
     ui->pane_add_section(mod_ctx, panel, "Shop Expansion");
     return shop_panel(panel);
 }
@@ -2087,6 +2250,13 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
         !add_int_option("chudleysMode", SHOP_SEMI, &shopOption))
         return mods::set_error(error, MOD_ERROR, "can't register settings");
     shopModeLoaded = cfgInt(shopOption, SHOP_SEMI);  // whatever room we start in counts as loaded with it
+
+    ConfigVarDesc jump = CONFIG_VAR_DESC_INIT;
+    jump.name = "bridgeJump";
+    jump.type = CONFIG_VAR_BOOL;
+    jump.default_bool = true;
+    if (svc_config->register_var(mod_ctx, &jump, &bridgeJump) != MOD_OK)
+        return mods::set_error(error, MOD_ERROR, "can't register settings");
 
     if (!pre_hook(HorseSavePos, keep_field_spot) || !pre_hook(SetStartStage, remember_stage) ||
         !post_hook(SetStartStage, check_horse_arrival))
@@ -2171,6 +2341,7 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
 MOD_EXPORT ModResult mod_update(ModError*) {
     epona_tick();
     faron_lighting_tick();
+    bridge_tick();
     shop_update();
     return MOD_OK;
 }
