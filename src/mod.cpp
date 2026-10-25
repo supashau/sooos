@@ -592,6 +592,8 @@ static void faron_lighting_tick() {
 // The twilight version of the bridge has crates to climb and a load zone that drops you into
 // Lake Hylia. Once the wagon escort is done the field's normal layer doesn't have them, so they're
 // copied out of the twilight layer (14, chunk tags ending in 'e') of whichever field room holds them.
+static const int kBridgeRoom = 13;  // Hyrule Field room the Great Bridge of Hylia sits in
+static const cXyz kBridgeSpot(-93705.0f, -5951.0f, 42867.0f);  // on the bridge, by the twilight crates
 static const int kMaxBridgeBits = 24;
 static fpc_ProcID bridgeBits[kMaxBridgeBits];
 static s8 bridgeBitRoom[kMaxBridgeBits];
@@ -608,8 +610,9 @@ static bool is_crate(s16 proc) {
            proc == fpcNm_Obj_BBox_e;
 }
 
-static void spawn_copy(const stage_actor_data_class* rec, const fopAcM_prmScale_class* size, int room, u32 params,
-                       csXyz rot) {
+// `owner` is the room whose unloading takes the copy with it; `room` is what the actor itself gets
+static void spawn_copy(const stage_actor_data_class* rec, const fopAcM_prmScale_class* size, int room, int owner,
+                       u32 params, csXyz rot) {
     dStage_objectNameInf* info = dStage_searchName(rec->name);
     if (info == nullptr || bridgeBitCount == kMaxBridgeBits) return;
 
@@ -618,7 +621,7 @@ static void spawn_copy(const stage_actor_data_class* rec, const fopAcM_prmScale_
     if (size) scale.set(size->x * 0.1f, size->y * 0.1f, size->z * 0.1f);
     fpc_ProcID id = fopAcM_create(info->procname, params, &pos, room, &rot, &scale, info->argument);
     if (id == fpcM_ERROR_PROCESS_ID_e) return;
-    bridgeBitRoom[bridgeBitCount] = (s8)room;
+    bridgeBitRoom[bridgeBitCount] = (s8)owner;
     bridgeBits[bridgeBitCount++] = id;
 }
 
@@ -642,7 +645,8 @@ static stage_scls_info_class* lake_exit(void* file, const stage_actor_data_class
     return strncmp(scenes[which].mStage, "F_SP115", 8) == 0 ? &scenes[which] : nullptr;
 }
 
-static void copy_bridge_jump(void* file, int room) {
+// `room` is where the copies go; `fromStage` means `file` is stage.dzs, whose crates only count near the bridge
+static void copy_bridge_jump(void* file, int room, bool fromStage) {
     static const char* const tags[2] = {"SCOe", "ACTe"};
     cXyz drop[4];
     int drops = 0;
@@ -663,13 +667,14 @@ static void copy_bridge_jump(void* file, int room) {
             csXyz rot = rec->base.angle;
             rot.x = rot.z = 0x0FFF;
             const fopAcM_prmScale_class* size = t == 0 ? &((const stage_tgsc_data_class*)rec)->scale : nullptr;
-            spawn_copy(rec, size, room, params, rot);
+            spawn_copy(rec, size, fromStage ? -1 : room, room, params, rot);
             drop[drops++] = rec->base.position;
         }
     }
 
-    // then the crates that sit near them
-    for (int t = 0; t < 2 && drops > 0; t++) {
+    // then the crates (Kkiba in the twilight data): all of them in the bridge's own room,
+    // plus any that sit next to a lake load zone found somewhere else
+    for (int t = 0; t < 2; t++) {
         int count = 0;
         void* list = find_chunk(file, tags[t], count);
         for (int i = 0; list && i < count; i++) {
@@ -678,12 +683,12 @@ static void copy_bridge_jump(void* file, int room) {
             if (info == nullptr || !is_crate(info->procname)) continue;
 
             cXyz at = rec->base.position;
-            bool close = false;
-            for (int d = 0; d < drops && !close; d++) close = at.abs(drop[d]) < 3000.0f;
-            if (!close) continue;
+            bool wanted = fromStage ? at.abs(kBridgeSpot) < 6000.0f : room == kBridgeRoom;
+            for (int d = 0; d < drops && !wanted; d++) wanted = at.abs(drop[d]) < 3000.0f;
+            if (!wanted) continue;
 
             const fopAcM_prmScale_class* size = t == 0 ? &((const stage_tgsc_data_class*)rec)->scale : nullptr;
-            spawn_copy(rec, size, room, rec->base.parameters, rec->base.angle);
+            spawn_copy(rec, size, room, room, rec->base.parameters, rec->base.angle);
         }
     }
 }
@@ -728,7 +733,10 @@ static void bridge_tick() {
         if (done || !wanted || file == nullptr) continue;
 
         bridgeRooms |= 1ull << room;
-        copy_bridge_jump(file, room);
+        copy_bridge_jump(file, room, false);
+        // some of it may live in the stage file instead of the room's; those copies go with the room too
+        void* stageFile = room == kBridgeRoom ? dComIfG_getStageRes("stage.dzs") : nullptr;
+        if (stageFile) copy_bridge_jump(stageFile, room, true);
     }
 }
 
