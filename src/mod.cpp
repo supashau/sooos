@@ -37,7 +37,6 @@
 #include "d/actor/d_a_tag_shop_item.h"
 #include "d/d_a_shop_item_static.h"
 #include "d/d_bomb.h"
-#include "d/d_camera.h"
 #include "d/d_cc_uty.h"
 #include "d/d_com_inf_game.h"
 #include "d/d_item_data.h"
@@ -101,7 +100,6 @@ enum ShopMode : int { SHOP_OFF, SHOP_SEMI, SHOP_PARTIAL, SHOP_FULL };
 static const char* const shopNames[] = {"Off", "Semi-Default", "Partial-Default", "On"};
 static ConfigVarHandle shopOption;
 static ConfigVarHandle bridgeJump;
-static ConfigVarHandle vTransformMove;  // Link: move while transforming
 
 // shop + ice leaf (0 if registering failed)
 static ConfigVarHandle vBoost, vAlways, vGoron, vChud, vLeaf;
@@ -2174,75 +2172,6 @@ static void shop_shutdown() {
     activeShop = recentShop = nullptr;
 }
 
-// ======================== Link ========================
-
-// Move while transforming: the human/wolf change Link starts himself runs as a short event, so
-// his stick reads as zero. The pad is read here instead and fed to the speed and heading the
-// game's own move step uses after the transform's frame runs; walls and floors work as normal.
-// Story transformations (cutscenes) are left alone.
-
-// Human Link's body is split in two (legs and upper body each blend their own animations, the
-// same split that lets him walk while aiming the bow). While he's moving in his human half, the
-// run cycle goes on the legs and the transformation stays on the upper body; standing still, the
-// whole body plays the transformation again. The transformation's own timing (when the models
-// swap, when it ends) keeps running on its usual frame counter either way. The wolf body has no
-// such split, so the wolf half just glides.
-
-static bool legsRunning;  // the run cycle is loaded in Link's second leg slot
-
-// how much of each slot shows: legs on the run (slot 1) or the transformation (slot 0)
-static void legs_on_run(daAlink_c* lnk, bool run) {
-    lnk->mNowAnmPackUnder[0].setRatio(run ? 0.0f : 1.0f);
-    lnk->mNowAnmPackUnder[1].setRatio(run ? 1.0f : 0.0f);
-    lnk->mNowAnmPackUpper[0].setRatio(1.0f);
-    lnk->mNowAnmPackUpper[1].setRatio(0.0f);
-}
-
-static void start_leg_run(daAlink_c* lnk) {
-    J3DAnmTransform* legs = nullptr;
-    J3DAnmTransform* chest = nullptr;
-    lnk->getUnderUpperAnime(daAlink_c::ANM_RUN, &legs, &chest, 1, 0x2C00);
-    if (legs == nullptr) return;
-    lnk->setFrameCtrl(&lnk->mUnderFrameCtrl[1], legs->getAttribute(), 0, legs->getFrameMax(),
-                      lnk->mpHIO->mMove.m.mRunAnmSpeed, 0.0f);
-    legs->setFrame(0.0f);
-    lnk->mNowAnmPackUnder[1].setAnmTransform(legs);
-    legsRunning = true;
-}
-
-static void steer_while_transforming(daAlink_c* lnk) {
-    bool active = cfgOn(vTransformMove) && lnk->mProcID == daAlink_c::PROC_METAMORPHOSE;
-    bool startedByPlayer = active && lnk->field_0x3198 != 0 && lnk->mProcVar1.field_0x300a == 0;
-    f32 push = startedByPlayer ? mDoCPd_c::getStickValue(PAD_1) : 0.0f;
-    bool moving = push >= 0.1f;
-
-    // the legs: only in the human half, and only while there's somewhere to go
-    bool runLegs = moving && !lnk->checkWolf();
-    if (runLegs && !legsRunning) start_leg_run(lnk);
-    if (legsRunning && !lnk->checkWolf() && active) legs_on_run(lnk, runLegs);
-    if (!runLegs) legsRunning = false;  // the next animation the game sets clears our slot anyway
-    if (legsRunning) lnk->mUnderFrameCtrl[1].setRate(lnk->mpHIO->mMove.m.mRunAnmSpeed * push);
-
-    if (!startedByPlayer) return;
-    if (!moving) {
-        lnk->mNormalSpeed = 0.0f;
-        return;
-    }
-    // same stick-to-world turn the game does in setStickData
-    s16 heading = mDoCPd_c::getStickAngle3D(PAD_1) + 0x8000 +
-                  dCam_getControledAngleY(dComIfGp_getCamera(lnk->field_0x317c));
-    cLib_chaseAngleS(&lnk->shape_angle.y, heading, 0x1000);
-    lnk->current.angle.y = lnk->shape_angle.y;
-    // full speed for whichever body he's in at the moment
-    f32 top = lnk->checkWolf() ? lnk->mpHIO->mWolf.mWlMove.m.mMaxSpeed : lnk->mpHIO->mMove.m.mMaxSpeed;
-    lnk->mNormalSpeed = push * top;
-}
-
-static HookAction transform_move_pre(ModContext*, void* args, void*, void*) {
-    steer_while_transforming(mods::arg<daAlink_c*>(args, 0));
-    return HOOK_CONTINUE;
-}
-
 // ======================== Sword Flourish ========================
 
 // The flourish is only an option on the A "Put away" press while the kill timer
@@ -2352,13 +2281,16 @@ static void redraw_buttons() {
 }
 
 // --- Fire Arrows: the bow with the lantern, through the game's own combining ---
-// The ring's combining only knows the Hawkeye and the bombs. While it combines, the lantern's slot
-// briefly holds the Hawkeye instead, then gets the lantern back; the save ends up with the
-// lantern's slot on the button and the bow as its mix, and the button acts as the plain bow.
-// (Same trick baxlek's Fire Arrows mod uses.)
+// The ring only combines the Hawkeye and the bombs with the bow. While the ring decides what R
+// does on the lantern, the lantern's slot briefly holds the Hawkeye instead, so the ring's own
+// prompt, sound, fly-in and split all happen as normal; it's put back straight after. The save
+// then has the lantern's slot on the button with the bow as its mix, and the button acts as the
+// plain bow. (Same trick baxlek's Fire Arrows mod uses.)
 
 DEFINE_HOOK(&dMenu_Ring_c::setMixItem, RingMixItem);
-
+DEFINE_HOOK(&dMenu_Ring_c::isMixItemOn, RingCanMix);
+DEFINE_HOOK(&dMenu_Ring_c::isMixItemOff, RingCanSplit);
+DEFINE_HOOK(&dMenu_Ring_c::setActiveCursor, RingCursor);
 
 static int lanternPosing = -1;  // slot holding the Hawkeye in place of the lantern, -1 if none
 
@@ -2372,12 +2304,20 @@ static HookAction lantern_poses(ModContext*, void* args, void*, void*) {
     return HOOK_CONTINUE;
 }
 
-// after combining, the ring drew the flying icon as the Hawkeye; draw it again as the lantern
-static void lantern_back_after_mix(ModContext*, void* args, void*, void*) {
-    if (lanternPosing < 0) return;
+static bool lantern_back() {
+    if (lanternPosing < 0) return false;
     dComIfGs_setItem(lanternPosing, dItemNo_KANTERA_e);
     lanternPosing = -1;
-    mods::arg<dMenu_Ring_c*>(args, 0)->setJumpItem(false);
+    return true;
+}
+
+static void lantern_back_post(ModContext*, void*, void*, void*) {
+    lantern_back();
+}
+
+// after combining, the ring drew the flying icon as the Hawkeye; draw it again as the lantern
+static void lantern_back_after_mix(ModContext*, void* args, void*, void*) {
+    if (lantern_back()) mods::arg<dMenu_Ring_c*>(args, 0)->setJumpItem(false);
 }
 
 // the button with fire arrows on it: the bow, with the lantern's slot as its partner
@@ -2390,32 +2330,20 @@ static int fire_button() {
     return -1;
 }
 
-// --- combining in the item ring ---
-// With combinations on, R alone no longer combines. Hold L or R (LT/RT) and press the button
-// (X or Y) whose item you want the highlighted item joined to, or split from. The ring's line
-// reads "Combine" over "(+ Select Button)", with "/ RT" after the trigger icon, and the words
-// pulse instead of the sparkle.
-
-static bool joins_the_bow(u8 item) {
-    return bomb_kind(item) >= 0 || item == dItemNo_HAWK_EYE_e || (item == dItemNo_KANTERA_e && fire_on());
+static bool bow_on_a_button() {
+    for (int b = 0; b < 2; b++)
+        if (dComIfGs_getSelectItemIndex(b) == SLOT_4 || dComIfGs_getMixItemIndex(b) == SLOT_4) return true;
+    return false;
 }
 
-// what joining the highlighted slot to button b would do: 1 combine, -1 split, 0 nothing
-static int combo_change(u8 slot, int b) {
-    u8 item = dComIfGs_getItem(slot, false);
-    u8 onButton = dComIfGs_getSelectItemIndex(b);
-    u8 mix = dComIfGs_getMixItemIndex(b);
+// --- the item ring, for the Gale-Bomb combo (the boomerang isn't in the game's combining) ---
 
-    if (joins_the_bow(item)) {
-        if (mix == SLOT_4) return onButton == slot ? -1 : 1;  // already a bow combo: split or swap
-        if (onButton == SLOT_4) return 1;                    // the plain bow
-    }
-    if (gale_on(bomb_kind(item)) && boomerang_button() == b) return tied_bag() == slot ? -1 : 1;
-    return 0;
-}
-
-static bool any_combo(u8 slot) {
-    return combo_change(slot, 0) != 0 || combo_change(slot, 1) != 0;
+// what R would do on the highlighted slot: 1 tie on, -1 split, 0 nothing of ours
+static int ring_r_action(u8 slot) {
+    int kind = bomb_kind(dComIfGs_getItem(slot, false));
+    // a bow on X or Y gets the bombs first, like in the normal game
+    if (!gale_on(kind) || boomerang_button() < 0 || bow_on_a_button()) return 0;
+    return tied_bag() == slot ? -1 : 1;
 }
 
 // the item flies from its ring slot onto the button (or back), using the ring's own
@@ -2434,215 +2362,65 @@ static void fly_item_icon(dMenu_Ring_c* ring, int button, u8 item, bool ontoButt
     ring->field_0x674[button] = 1;
 }
 
-static void combine_onto(dMenu_Ring_c* ring, int b) {
-    u8 slot = ring->mItemSlots[ring->mCurrentSlot];
-    int change = combo_change(slot, b);
-    if (change == 0) {
-        mDoAud_seStart(Z2SE_SYS_ERROR, nullptr, 0, 0);
-        return;
-    }
-    u8 item = dComIfGs_getItem(slot, false);
+static bool promptOurs;  // we're the ones showing the combine line in the ring
+// the sparkle's speed field is really its running frame; the game zeroes it every frame it isn't
+// showing its own line, so ours is carried across from before the ring's update
+static f32 sparkleFrame;
 
-    if (joins_the_bow(item) && boomerang_button() != b) {
-        // the game's own combining does the rest, sound and fly-in included
-        for (int i = 0; i < 4; i++) ring->setSelectItemForce(i);
-        ring->setMixItem();
-        return;
-    }
-    bool joining = change > 0;
-    tie_bag(joining ? slot : -1);
-    mDoAud_seStart(joining ? Z2SE_SY_ITEM_COMBINE_ON : Z2SE_SY_ITEM_COMBINE_OFF, nullptr, 0, 0);
-    fly_item_icon(ring, b, item, joining);
-    redraw_buttons();
-}
-
-static bool ring_idle(dMenu_Ring_c* ring) {
-    return ring->mStatus == dMenu_Ring_c::STATUS_WAIT && !ring->mPlayerIsWolf &&
-           ring->mpItemExplain->getStatus() == 0;
-}
-
-// The ring reads X/Y/R inside its own update (setActiveCursor runs inline there), so the presses
-// we handle are taken out of this frame's pad state before it looks, and put back after.
-static const u32 kComboButtons = PAD_BUTTON_X | PAD_BUTTON_Y | PAD_TRIGGER_L | PAD_TRIGGER_R;
-static u32 heldBackPresses;
-
-static void hold_back_presses(u32 which) {
-    interface_of_controller_pad& pad = mDoCPd_c::getCpadInfo(PAD_1);
-    heldBackPresses = pad.mPressedButtonFlags & which;
-    pad.mPressedButtonFlags &= ~which;
-}
-
-static void give_back_presses() {
-    mDoCPd_c::getCpadInfo(PAD_1).mPressedButtonFlags |= heldBackPresses;
-    heldBackPresses = 0;
-}
-
-// --- the ring's combine line ---
-//           [LT] / RT
-// Combine
-//           (+ Select Button)
-// "Combine" stays where the game puts its line, level with the middle of the trigger icon. The
-// icon and "/ RT" go up half a row and "(+ Select Button)" half a row down, lined up with the
-// icon's left edge. Positions are measured off the panes that are already on screen ("Combine"
-// and the icon), once the line has been drawn, and the other text is placed from those.
-
-static dMenu_Ring_c* dressedRing;  // the ring whose line has its new words
-static dMenu_Ring_c* laidOutRing;  // ...and whose line has been moved into place
-static int lineShownFrames;
-static J2DTextBox* triggerText[5];  // "/ RT", made from the line's unused language copy
-static JUtility::TColor wordWhite[5], wordBlack[5];
-static int pulse;
-
-// a freshly opened ring has the game's own words again, even if it lands at the same address
-DEFINE_HOOK(&dMenu_Ring_c::_create, RingOpen);
-static void ring_opened(ModContext*, void*, void*, void*) {
-    dressedRing = laidOutRing = nullptr;
-    lineShownFrames = 0;
-}
-
-static J2DPane* ring_pane(dMenu_Ring_c* ring, u64 tag) {
-    return ring->mpScreen->search(tag);
-}
-
-static void dress_ring_words(dMenu_Ring_c* ring) {
-    if (dressedRing == ring) return;
-    dressedRing = ring;
-
-    static const u64 jpLine[5] = {MULTI_CHAR('gr_t_on'), MULTI_CHAR('g_tof_s5'), MULTI_CHAR('g_tof_s6'),
-                                  MULTI_CHAR('g_tof_s7'), MULTI_CHAR('g_tof_s8')};
-    static const u64 enLine[5] = {MULTI_CHAR('fr_t_on'), MULTI_CHAR('f_tof_s5'), MULTI_CHAR('f_tof_s6'),
-                                  MULTI_CHAR('f_tof_s7'), MULTI_CHAR('f_tof_s8')};
-    bool englishShown = ring_pane(ring, enLine[0]) == ring->mpComboOffString[0];
-    const u64* spare = englishShown ? jpLine : enLine;
-
-    for (int i = 0; i < 5; i++) {
-        J2DTextBox* word = ring->mpComboOffString[i];
-        J2DTextBox* under = ring->mpBowArrowComboString[i];
-        word->setString("Combine");
-        under->setString("(+ Select Button)");
-        wordWhite[i] = word->getWhite();
-        wordBlack[i] = word->getBlack();
-
-        J2DTextBox::TFontSize size;
-        word->getFontSize(size);
-        under->setFontSize(size.mSizeX * 0.7f, size.mSizeY * 0.7f);
-        under->resize(word->getWidth() * 1.6f, word->getHeight());
-
-        triggerText[i] = static_cast<J2DTextBox*>(ring_pane(ring, spare[i]));
-        if (triggerText[i] == nullptr) continue;
-        triggerText[i]->setFont(mDoExt_getMesgFont());
-        triggerText[i]->setFontSize(size);
-        triggerText[i]->setBlackWhite(wordBlack[i], wordWhite[i]);
-        triggerText[i]->resize(word->getWidth(), word->getHeight());
-        triggerText[i]->setString("/ RT");
-    }
-}
-
-// puts `pane` at a spot given relative to `anchor`'s top-left, in `anchor`'s own units
-static void place_beside(J2DPane* pane, J2DPane* anchor, f32 dx, f32 dy) {
-    pane->translate(anchor->getTranslateX() + dx, anchor->getTranslateY() + dy);
-}
-
-static void lay_out_ring_line(dMenu_Ring_c* ring) {
-    if (laidOutRing == ring) return;
-    J2DPane* icon = ring_pane(ring, MULTI_CHAR('gr_btn'));
-    J2DTextBox* word = ring->mpComboOffString[0];
-    if (icon == nullptr) return;
-
-    // screen size of one of the word's own units, so screen distances can be turned back
-    Vec wTop = word->getGlbVtx(0);
-    Vec wBottom = word->getGlbVtx(3);
-    f32 unitX = word->getWidth() > 0.0f ? (wBottom.x - wTop.x) / word->getWidth() : 0.0f;
-    f32 unitY = word->getHeight() > 0.0f ? (wBottom.y - wTop.y) / word->getHeight() : 0.0f;
-    if (unitX <= 0.0f || unitY <= 0.0f) return;  // not drawn yet, try again next frame
-    laidOutRing = ring;
-
-    Vec iTop = icon->getGlbVtx(0);
-    Vec iBottom = icon->getGlbVtx(3);
-    f32 row = wBottom.y - wTop.y;
-    f32 iconMiddle = (iTop.y + iBottom.y) * 0.5f;
-
-    // in the word's units, from the word's top-left
-    f32 rtX = (iBottom.x + 6.0f - wTop.x) / unitX;
-    f32 rtY = (iconMiddle - row - wTop.y) / unitY;            // half a row above the middle
-    f32 underX = (iTop.x - wTop.x) / unitX;
-    f32 underY = (iconMiddle - wTop.y) / unitY;               // half a row below it
-
-    for (int i = 0; i < 5; i++) {
-        J2DTextBox* layer = ring->mpComboOffString[i];  // each shadow layer keeps its own offset
-        if (triggerText[i]) place_beside(triggerText[i], layer, rtX, rtY);
-        place_beside(ring->mpBowArrowComboString[i], layer, underX, underY);
-    }
-    f32 iconUnitY = icon->getHeight() > 0.0f ? (iBottom.y - iTop.y) / icon->getHeight() : unitY;
-    icon->translate(icon->getTranslateX(), icon->getTranslateY() - (row * 0.5f) / iconUnitY);
-}
-
-static void ring_line(dMenu_Ring_c* ring, bool show) {
-    CPaneMgr* line = ring->mpTextParent[4];
-    if (line == nullptr) return;
-    ring->mPikariFlashingSpeed = 0.0f;  // no sparkle; the word pulses instead
-    if (!show) {
-        line->hide();
-        lineShownFrames = 0;
-        return;
-    }
-    dress_ring_words(ring);
-    if (++lineShownFrames > 2) lay_out_ring_line(ring);  // measured after it's been drawn
-
-    // the pulse goes through the text's colours; the menu sets the panes' own alpha every draw
-    pulse++;
-    f32 glow = 0.45f + 0.55f * (0.5f + 0.5f * cM_scos((s16)(pulse * 0x480)));
-    for (int i = 0; i < 5; i++) {
-        JUtility::TColor white = wordWhite[i];
-        JUtility::TColor black = wordBlack[i];
-        white.a = (u8)(wordWhite[i].a * glow);
-        black.a = (u8)(wordBlack[i].a * glow);
-        ring->mpComboOffString[i]->setBlackWhite(black, white);
-        ring->mpComboOffString[i]->show();
-        ring->mpBowArrowComboString[i]->show();
-        if (triggerText[i]) triggerText[i]->show();
-    }
-    line->show();
-}
-
-// before the ring's update: LT/RT + X/Y combines, a trigger alone does nothing
 static HookAction ring_pre(ModContext*, void* args, void*, void*) {
-    auto* ring = mods::arg<dMenu_Ring_c*>(args, 0);
-    heldBackPresses = 0;
-    if (!combos_on() || !ring_idle(ring)) return HOOK_CONTINUE;
-
-    bool trigger = mDoCPd_c::getHoldL(PAD_1) || mDoCPd_c::getHoldR(PAD_1);
-    bool x = mDoCPd_c::getTrigX(PAD_1) != 0;
-    bool y = mDoCPd_c::getTrigY(PAD_1) != 0;
-    if (trigger && (x || y)) {
-        int b = x ? 0 : 1;
-        u8 slot = ring->mItemSlots[ring->mCurrentSlot];
-        mods::log::info("combine: slot {} item {} onto button {} -> {}", slot, dComIfGs_getItem(slot, false), b,
-                        combo_change(slot, b));
-        combine_onto(ring, b);
-        hold_back_presses(kComboButtons);  // so the ring doesn't also put the item on that button
-        return HOOK_CONTINUE;
-    }
-    if (mDoCPd_c::getTrigL(PAD_1) || mDoCPd_c::getTrigR(PAD_1)) hold_back_presses(PAD_TRIGGER_L | PAD_TRIGGER_R);
+    sparkleFrame = mods::arg<dMenu_Ring_c*>(args, 0)->mPikariFlashingSpeed;
     return HOOK_CONTINUE;
 }
 
+// the ring's "combine" line: shown the same way setMixMessage does it for the bow
+static void ring_prompt(dMenu_Ring_c* ring, int change) {
+    CPaneMgr* line = ring->mpTextParent[4];
+    if (line == nullptr) return;
+    if (change == 0) {
+        promptOurs = false;  // the game's own setMixMessage already decided this frame
+        return;
+    }
+    for (int i = 0; i < 5; i++) {
+        if (change > 0) {
+            ring->mpComboOffString[i]->show();
+            ring->mpBowArrowComboString[i]->hide();
+        } else {
+            ring->mpComboOffString[i]->hide();
+            ring->mpBowArrowComboString[i]->show();
+        }
+    }
+    if (!promptOurs) {
+        mDoAud_seStart(Z2SE_SY_ITEM_COMBINE_ICON, nullptr, 0, 0);
+        sparkleFrame = 18.0f - g_ringHIO.mPikariAnimSpeed;  // where the game starts it
+    }
+    promptOurs = true;
+    ring->mPikariFlashingSpeed = sparkleFrame;
+    line->show();
+}
+
 static void ring_post(ModContext*, void* args, void*, void*) {
-    give_back_presses();
     auto* ring = mods::arg<dMenu_Ring_c*>(args, 0);
-    if (!combos_on()) return;  // the game's own ring, untouched
-    bool idle = ring_idle(ring);
+    bool idle = ring->mStatus == dMenu_Ring_c::STATUS_WAIT && !ring->mPlayerIsWolf &&
+                ring->mpItemExplain->getStatus() == 0;
     u8 slot = ring->mItemSlots[ring->mCurrentSlot];
-    ring_line(ring, idle && any_combo(slot));
+    int change = idle ? ring_r_action(slot) : 0;
+    ring_prompt(ring, change);
     if (!idle) return;
 
     // putting the boomerang on X or Y by itself splits the bombs off, like re-setting the bow does
     bool setButton = mDoCPd_c::getTrigX(PAD_1) || mDoCPd_c::getTrigY(PAD_1);
-    bool trigger = mDoCPd_c::getHoldL(PAD_1) || mDoCPd_c::getHoldR(PAD_1);
-    if (setButton && !trigger && tied_bag() >= 0 && dComIfGs_getItem(slot, false) == dItemNo_BOOMERANG_e) {
+    if (setButton && tied_bag() >= 0 && dComIfGs_getItem(slot, false) == dItemNo_BOOMERANG_e) {
         tie_bag(-1);
         redraw_buttons();
+        return;
     }
+
+    if (change == 0 || !mDoCPd_c::getTrigR(PAD_1)) return;
+    bool joining = change > 0;
+    tie_bag(joining ? slot : -1);
+    mDoAud_seStart(joining ? Z2SE_SY_ITEM_COMBINE_ON : Z2SE_SY_ITEM_COMBINE_OFF, nullptr, 0, 0);
+    fly_item_icon(ring, boomerang_button(), dComIfGs_getItem(slot, false), joining);
+    redraw_buttons();
 }
 
 // --- the boomerang button icon: the bow-combo layout, with the boomerang where the bow would be ---
@@ -2829,8 +2607,12 @@ static void arrow_post(ModContext*, void* args, void*, void*) {
     auto* arrow = mods::arg<daArrow_c*>(args, 0);
     if (arrow->mArrowType != 0) return;  // bomb, light and slingshot shots stay as they are
     fpc_ProcID id = fopAcM_GetID(arrow);
-    bool nocked = arrow->mProcFunc == &daArrow_c::procWait;
-    bool flying = arrow->mProcFunc == &daArrow_c::procMove;
+    // Which state it's in is read off Link and the arrow itself, not by comparing its proc against
+    // the game's function addresses: on Windows a mod only sees a jump stub for those, so the
+    // comparison never matched there and the arrows never caught fire.
+    daAlink_c* link = daAlink_getAlinkActorClass();
+    bool nocked = link != nullptr && link->mItemAcKeep.getID() == id;
+    bool flying = !nocked && arrow->speed.abs2() > 4.0f;
 
     // the burning tip, a little ahead of the arrow's middle
     cXyz ahead(0.0f, 0.0f, 20.0f);
@@ -3504,9 +3286,6 @@ static void quality_rows() {
     heading("Epona Locations");
     for (int area = 0; area < EPONA_AREAS; area++) toggle(eponaLabels[area], eponaToggle[area]);
 
-    heading("Link");
-    toggle("Move while transforming", vTransformMove);
-
     heading("Map Checks");
     choice("Remove faron woods mist", mistOption, mistNames, 3);
     choice("Revert to Chudley's", shopOption, shopNames, 4);
@@ -3547,7 +3326,7 @@ static void item_rows() {
     heading("Ice Leaf");
     toggle("Enable Ice Leaf", vLeaf);
     toggle("Always Have Ice Sled", vAlways, leaf_off);
-    toggle("RT Speed Boost Cheat", vBoost, leaf_off);
+    toggle("R Speed Boost Cheat", vBoost, leaf_off);
 
     heading("Item Combinations");
     toggle("Enable Combinations", vCombos);
@@ -3777,10 +3556,6 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     if (missed) mods::log::warn("{} unarmed settings didn't register, those use their defaults", missed);
     unarmed_init();
 
-    // --- Link ---
-    add_bool_option("transformMove", true, &vTransformMove);
-    if (!pre_hook(Exec, transform_move_pre)) mods::log::warn("Link stays still while transforming");
-
     // --- Sword Flourish ---
     if (!add_int_option("swordFlourish", FLOURISH_DEFAULT, &flourishOption)) flourishOption = 0;
     // rides along on Link's update, next to the Ice Leaf's own hooks there
@@ -3796,9 +3571,14 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
 
     // the item ring: who combines with what, and the line that says so
     bool ringOk = pre_hook(RingMove, ring_pre) && post_hook(RingMove, ring_post);
-    ringOk = ringOk && pre_hook(RingMixItem, lantern_poses) && post_hook(RingMixItem, lantern_back_after_mix);
-    ringOk = ringOk && post_hook(RingOpen, ring_opened);
-    if (!ringOk) mods::log::warn("item ring combining stays as the game has it");
+    if (!ringOk) mods::log::warn("can't tie bombs to the boomerang in the item ring");
+    // the lantern poses as the Hawkeye wherever the ring decides what R does with it
+    int lanternMiss = 0;
+    lanternMiss += !pre_hook(RingMixItem, lantern_poses) + !post_hook(RingMixItem, lantern_back_after_mix);
+    lanternMiss += !pre_hook(RingCanMix, lantern_poses) + !post_hook(RingCanMix, lantern_back_post);
+    lanternMiss += !pre_hook(RingCanSplit, lantern_poses) + !post_hook(RingCanSplit, lantern_back_post);
+    lanternMiss += !pre_hook(RingCursor, lantern_poses) + !post_hook(RingCursor, lantern_back_post);
+    if (lanternMiss) mods::log::warn("the lantern can't be combined with the bow in the item ring");
 
     // Gale-Bomb
     bool iconOk = pre_hook(ButtonIcon, button_icon_pre) && post_hook(ButtonIcon, button_icon_post);
