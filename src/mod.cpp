@@ -2146,49 +2146,49 @@ static void shop_shutdown() {
 
 // ======================== Sword Flourish ========================
 
-// the game flourishes on a kill timer and skips the wooden sword; we fib about both for one call
-DEFINE_HOOK(&daAlink_c::checkItemChangeFromButton, PutAwayButton);
+// The flourish is only an option on the A "Put away" press while the kill timer
+// (mSwordFlourishTimer) is still running, and the wooden sword is never allowed. That check sits
+// deep in Link's update where a hook can't reach, so On and Wooden start the flourish themselves
+// right before Link updates, and Off just keeps the kill timer at zero.
 
-static s16 realFlourishTimer;
-static bool timerFaked, woodSwapped;
-
-static dSv_player_status_a_c& player_status() {
-    return g_dComIfG_gameInfo.info.getPlayer().getPlayerStatusA();
+// the same gate the game runs before a put-away, minus the timer and the wooden sword
+static bool could_put_away(daAlink_c* lnk) {
+    if (!mDoCPd_c::getTrigA(PAD_1) || dComIfGp_getDoStatus() != BUTTON_STATUS_PUT_AWAY) return false;
+    if (lnk->mEquipItem != 0x103 || !daAlink_c::checkSwordGet() || lnk->checkWolf()) return false;
+    if (!lnk->checkModeFlg(4) || lnk->checkModeFlg(0x402)) return false;
+    if (lnk->checkEquipAnime() || lnk->checkBoomerangThrowAnime() || lnk->checkCopyRodThrowAnime()) return false;
+    if (lnk->checkKandelaarSwingAnime() || lnk->checkNoResetFlg2(daAlink_c::FLG2_UNK_1)) return false;
+    return !lnk->checkCanoeRide() && !lnk->checkRideOn() && !lnk->checkEventRun();
 }
 
-static HookAction flourish_pre(ModContext*, void* args, void*, void*) {
+// runs before Link's own update every frame
+static void flourish_before(daAlink_c* lnk) {
     int mode = cfgInt(flourishOption, FLOURISH_DEFAULT);
-    if (mode == FLOURISH_DEFAULT) return HOOK_CONTINUE;
-    daAlink_c* lnk = mods::arg<daAlink_c*>(args, 0);
+    if (mode == FLOURISH_OFF) lnk->mSwordFlourishTimer = 0;
+    if (mode != FLOURISH_ON && mode != FLOURISH_WOODEN) return;
+    if (!could_put_away(lnk)) return;
 
-    // Wooden: same timing as normal, the stick just passes for the Ordon Sword while it's checked.
-    // only when this call can actually be a put-away, so nothing else sees the swap
+    // Wooden leaves the real swords to the game and only steps in for the stick, on the normal timing.
+    // the game ticks the timer down once before it checks, hence > 1
     if (mode == FLOURISH_WOODEN) {
-        bool puttingAway = lnk->mEquipItem == 0x103 && dComIfGp_getDoStatus() == BUTTON_STATUS_PUT_AWAY;
-        if (puttingAway && daPy_py_c::checkWoodSwordEquip()) {
-            player_status().setSelectEquip(COLLECT_SWORD, dItemNo_SWORD_e);
-            woodSwapped = true;
-        }
-        return HOOK_CONTINUE;
+        bool stick = daPy_py_c::checkWoodSwordEquip();
+        if (!stick || lnk->mSwordFlourishTimer <= 1) return;
     }
+    lnk->procSwordUnequipSpInit();
+}
 
-    realFlourishTimer = lnk->mSwordFlourishTimer;
-    // On only counts with a real sword out, not an unarmed swing borrowing the sword slot
-    lnk->mSwordFlourishTimer = mode == FLOURISH_ON && daAlink_c::checkSwordGet() ? 1 : 0;
-    timerFaked = true;
+// and after it, so a kill this frame can't sneak one past Off
+static void flourish_after(daAlink_c* lnk) {
+    if (cfgInt(flourishOption, FLOURISH_DEFAULT) == FLOURISH_OFF) lnk->mSwordFlourishTimer = 0;
+}
+
+static HookAction flourish_exec_pre(ModContext*, void* args, void*, void*) {
+    flourish_before(mods::arg<daAlink_c*>(args, 0));
     return HOOK_CONTINUE;
 }
 
-static void flourish_post(ModContext*, void* args, void*, void*) {
-    if (woodSwapped) {
-        player_status().setSelectEquip(COLLECT_SWORD, dItemNo_WOOD_STICK_e);
-        woodSwapped = false;
-    }
-    if (!timerFaked) return;
-    timerFaked = false;
-    daAlink_c* lnk = mods::arg<daAlink_c*>(args, 0);
-    // a flourish that did start can keep the timer it started with
-    if (lnk->mProcID != daAlink_c::PROC_SWORD_UNEQUIP_SP) lnk->mSwordFlourishTimer = realFlourishTimer;
+static void flourish_exec_post(ModContext*, void* args, void*, void*) {
+    flourish_after(mods::arg<daAlink_c*>(args, 0));
 }
 
 // ======================== Unarmed Combat ========================
@@ -2791,8 +2791,9 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
 
     // --- Sword Flourish ---
     if (!add_int_option("swordFlourish", FLOURISH_DEFAULT, &flourishOption)) flourishOption = 0;
-    if (!pre_hook(PutAwayButton, flourish_pre) || !post_hook(PutAwayButton, flourish_post))
-        mods::log::warn("sword flourish stays at the game's normal behaviour");
+    // rides along on Link's update, next to the Ice Leaf's own hooks there
+    bool flourishOk = pre_hook(Exec, flourish_exec_pre) && post_hook(Exec, flourish_exec_post);
+    if (!flourishOk) mods::log::warn("sword flourish stays at the game's normal behaviour");
 
     settings_init();
 
