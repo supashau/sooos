@@ -28,6 +28,7 @@
 #include "d/actor/d_a_obj_iceleaf.h"
 #include "d/actor/d_a_tag_shop_item.h"
 #include "d/d_a_shop_item_static.h"
+#include "d/d_cc_uty.h"
 #include "d/d_com_inf_game.h"
 #include "d/d_item_data.h"
 #include "d/d_kankyo.h"
@@ -83,6 +84,10 @@ static ConfigVarHandle bridgeJump;
 // shop + ice leaf (0 if registering failed)
 static ConfigVarHandle vBoost, vAlways, vGoron, vChud, vLeaf;
 
+// unarmed combat (0 = registering failed, the default is used)
+static ConfigVarHandle vShield, vBash, vSkill, vSwing, vDamage;
+static ConfigVarHandle vJump, vChargedAll, vSpin, vSpinAll, vEnding, vEndingAll, vHead, vHeadAll, vBackAll;
+
 // ======================== shared ========================
 
 static constexpr u16 kMaloOpen = 0x2210;  // F_0281, Malo Mart open in Castle Town
@@ -100,8 +105,8 @@ static bool stage_is(const char* s) {
     return cur && !strcmp(cur, s);
 }
 
-static bool cfgOn(ConfigVarHandle v) {
-    bool on = true;
+static bool cfgOn(ConfigVarHandle v, bool fallback = true) {
+    bool on = fallback;
     if (v) svc_config->get_bool(mod_ctx, v, &on);
     return on;
 }
@@ -594,7 +599,7 @@ static void faron_lighting_tick() {
 // copied out of the twilight layer (14, chunk tags ending in 'e') of whichever field room holds them.
 static const int kBridgeRoom = 13;  // Hyrule Field room the Great Bridge of Hylia sits in
 static const cXyz kBridgeSpot(-93705.0f, -5951.0f, 42867.0f);  // on the bridge, by the twilight crates
-static const int kMaxBridgeBits = 24;
+static const int kMaxBridgeBits = 40;
 static fpc_ProcID bridgeBits[kMaxBridgeBits];
 static s8 bridgeBitRoom[kMaxBridgeBits];
 static int bridgeBitCount;
@@ -676,7 +681,7 @@ static bool blocking_crate(const cXyz& at) {
 // `room` is where the copies go; `fromStage` means `file` is stage.dzs, whose crates only count near the bridge
 static void copy_bridge_jump(void* file, int room, bool fromStage) {
     static const char* const tags[2] = {"SCOe", "ACTe"};
-    cXyz drop[4];
+    cXyz drop[16];
     int drops = 0;
 
     // the load zones into the lake first
@@ -686,7 +691,7 @@ static void copy_bridge_jump(void* file, int room, bool fromStage) {
         for (int i = 0; list && i < count; i++) {
             const stage_actor_data_class* rec = twilight_record(list, i, t == 0);
             stage_scls_info_class* exit = lake_exit(file, rec);
-            if (exit == nullptr || drops == 4) continue;
+            if (exit == nullptr) continue;
 
             // land in whatever layer the lake would normally load, not the twilight one
             exit->field_0xb |= 0x0F;
@@ -696,7 +701,7 @@ static void copy_bridge_jump(void* file, int room, bool fromStage) {
             rot.x = rot.z = 0x0FFF;
             const fopAcM_prmScale_class* size = t == 0 ? &((const stage_tgsc_data_class*)rec)->scale : nullptr;
             spawn_copy(rec, size, fromStage ? -1 : room, room, params, rot);
-            drop[drops++] = rec->base.position;
+            if (drops < 16) drop[drops++] = rec->base.position;
         }
     }
 
@@ -2149,119 +2154,475 @@ static void shop_shutdown() {
     activeShop = recentShop = nullptr;
 }
 
-// ======================== mod page ========================
+// ======================== Unarmed Combat ========================
 
-// plain text lines that sit above each group of toggles
+DEFINE_HOOK(&daAlink_c::setShieldGuard, SetShieldGuard);
+DEFINE_HOOK(&daAlink_c::checkItemAction, CheckItemAction);
+DEFINE_HOOK(&daAlink_c::decideCommonDoStatus, DoStatus);
+DEFINE_HOOK(&daAlink_c::checkNextAction, NextAction);
+DEFINE_HOOK(&cc_at_check, CcAtCheck);
+DEFINE_HOOK(&daAlink_c::checkCutAction, CutAction);
+DEFINE_HOOK(&daAlink_c::setSwordAtCollision, SwordHit);
+DEFINE_HOOK(&daAlink_c::procCutNormal, CutNormal);
+DEFINE_HOOK(&daAlink_c::procCutDownInit, DownInit);
+DEFINE_HOOK(&daAlink_c::procCutDown, DownAir);
+DEFINE_HOOK(&daAlink_c::procCutDownLand, DownLand);
+DEFINE_HOOK(&daAlink_c::checkDownAttackState, DownState);
+DEFINE_HOOK(&daAlink_c::checkCutHeadState, HeadState);
+DEFINE_HOOK(&daAlink_c::checkCutTypeNoBlur, NoBlur);
+DEFINE_HOOK(&daAlink_c::setSwordChargeEffect, FxCharge);
+DEFINE_HOOK(&daAlink_c::setSwordUpColorEffect, FxUp);
+DEFINE_HOOK(&daAlink_c::setSwordCutSplash, FxSplash);
+DEFINE_HOOK(&daAlink_c::setCutWaterDropEffect, FxDrop);
 
-static void subtitle(UiElementHandle panel, const char* line) {
-    svc_ui->pane_add_text(mod_ctx, panel, line, nullptr);
+static int comboStep, hp0;
+static bool wasGuarding, swinging, swordTucked, hpValid, flipping;
+static bool forcedJump, forcedTurn, forcedDown, forcedHead, forcedBack;
+
+static bool in_cut_proc(daAlink_c* lnk) {
+    return lnk->mProcID >= daAlink_c::PROC_CUT_NORMAL && lnk->mProcID <= daAlink_c::PROC_CUT_LARGE_JUMP_LAND;
 }
 
-static bool leaf_off(ModContext*, void*);
-
-static ModResult shop_panel(UiElementHandle panel) {
-    subtitle(panel, "Regular Shop Changes");
-
-    UiControlDesc gor = UI_CONTROL_DESC_INIT;
-    gor.kind = UI_CONTROL_TOGGLE;
-    gor.label = "Goron Outpost Changes";
-    gor.help_rml = "The Castle Town arrow Goron sells a Blue Potion (needs an empty bottle) for 110 Rupees instead of arrows.";
-    gor.binding = UI_BINDING_CONFIG_VAR;
-    gor.config_var = vGoron;
-    if (vGoron) {
-        ModResult r = svc_ui->pane_add_control(mod_ctx, panel, &gor, nullptr);
-        if (r != MOD_OK) return r;
+// the skill checks accept the training flags too, so we flip those to unlock a move
+static void force_flag(daAlink_c* lnk, daAlink_c::daPy_FLG3 flag, bool want, bool* mine) {
+    if (want && !lnk->checkNoResetFlg3(flag)) {
+        lnk->onNoResetFlg3(flag);
+        *mine = true;
+    } else if (!want && *mine) {
+        lnk->offNoResetFlg3(flag);
+        *mine = false;
     }
-
-    UiControlDesc chud = UI_CONTROL_DESC_INIT;
-    chud.kind = UI_CONTROL_TOGGLE;
-    chud.label = "Chudleys/Malomart Changes";
-    chud.help_rml = "Chudley's and the Castle Town Malo Mart sell Lantern Oil instead of arrows. Shelf changes show after leaving and re-entering the shop.";
-    chud.binding = UI_BINDING_CONFIG_VAR;
-    chud.config_var = vChud;
-    if (vChud) {
-        ModResult r = svc_ui->pane_add_control(mod_ctx, panel, &chud, nullptr);
-        if (r != MOD_OK) return r;
-    }
-
-    subtitle(panel, "Ice Leaf");
-
-    if (vLeaf) {
-        UiControlDesc en = UI_CONTROL_DESC_INIT;
-        en.kind = UI_CONTROL_TOGGLE;
-        en.label = "Enable Ice Leaf";
-        en.help_rml = "Turns the whole Ice Leaf part of the mod on or off. Off takes it off your item wheel until it's turned back on.";
-        en.binding = UI_BINDING_CONFIG_VAR;
-        en.config_var = vLeaf;
-        ModResult r = svc_ui->pane_add_control(mod_ctx, panel, &en, nullptr);
-        if (r != MOD_OK) return r;
-    }
-
-    UiControlDesc always = UI_CONTROL_DESC_INIT;
-    always.kind = UI_CONTROL_TOGGLE;
-    always.label = "Always Have Ice Sled";
-    always.help_rml = "Gives you the Ice Leaf without knocking it off the tree in Snowpeak. Turning it off removes it again unless you already did.";
-    always.binding = UI_BINDING_CONFIG_VAR;
-    always.config_var = vAlways;
-    always.is_disabled = leaf_off;
-    if (vAlways) {
-        ModResult res = svc_ui->pane_add_control(mod_ctx, panel, &always, nullptr);
-        if (res != MOD_OK) return res;
-    }
-
-    UiControlDesc boost = UI_CONTROL_DESC_INIT;
-    boost.kind = UI_CONTROL_TOGGLE;
-    boost.label = "RT Speed Boost Cheat";
-    boost.help_rml = "While riding the Ice Leaf, hold RT to build up extra speed.";
-    boost.binding = UI_BINDING_CONFIG_VAR;
-    boost.config_var = vBoost;
-    boost.is_disabled = leaf_off;
-    if (!vBoost) return MOD_OK;
-    return svc_ui->pane_add_control(mod_ctx, panel, &boost, nullptr);
 }
 
-static ModResult panel_update(ModContext*, void*, ModError*) { return MOD_OK; }
+static HookAction guard_pre(ModContext*, void* args, void*, void*) {
+    daAlink_c* lnk = mods::arg<daAlink_c*>(args, 0);
+    wasGuarding = lnk->checkUpperGuardAnime() != 0;
+    return HOOK_CONTINUE;
+}
 
+// no shield = setShieldGuard clears the guard flag, and checkShieldGet is inline so we can't hook that.
+// put the flag back after it runs, setCollision comes later this frame and still sees it
+static void guard_post(ModContext*, void* args, void*, void*) {
+    daAlink_c* lnk = mods::arg<daAlink_c*>(args, 0);
+    bool unarmed = !daAlink_c::checkSwordGet() && !lnk->checkWolf();
+
+    // cut procs need the sword "in hand" or the hit capsule never moves
+    if (unarmed && in_cut_proc(lnk) && lnk->mEquipItem == dItemNo_NONE_e) {
+        lnk->mEquipItem = 0x103;
+        swinging = true;
+    } else if (swinging && !in_cut_proc(lnk)) {
+        if (lnk->mEquipItem == 0x103) lnk->mEquipItem = dItemNo_NONE_e;
+        swinging = false;
+        if (lnk->checkUpperAnime(dRes_ID_ALANM_BCK_BOOMTHROW_e) || lnk->checkUpperAnime(dRes_ID_ALANM_BCK_CUTT_e))
+            lnk->resetUpperAnime(daAlink_c::UPPER_2, 3.0f);
+    }
+
+    bool on = unarmed && cfgOn(vSwing, true);
+    bool jump = cfgOn(vJump, false);
+    force_flag(lnk, daAlink_c::FLG3_TRANING_CUT_LARGE_JUMP, on && jump && cfgOn(vChargedAll, false), &forcedJump);
+    force_flag(lnk, daAlink_c::FLG3_TRANING_CUT_LARGE_TURN, on && cfgOn(vSpin, false) && cfgOn(vSpinAll, false), &forcedTurn);
+    force_flag(lnk, daAlink_c::FLG3_TRANING_CUT_HEAD, on && cfgOn(vHead, false) && cfgOn(vHeadAll, false), &forcedHead);
+    force_flag(lnk, daAlink_c::FLG3_TRANING_CUT_BACK, on && cfgOn(vBackAll, false), &forcedBack);
+    force_flag(lnk, daAlink_c::FLG3_TRANING_CUT_DOWN, on && cfgOn(vEnding, false) && cfgOn(vEndingAll, false), &forcedDown);
+
+    if (!cfgOn(vShield, true) || lnk->checkNoResetFlg2(daAlink_c::FLG2_UNK_8000000)) return;
+
+    // checkGuardAccept without the shield part
+    if (lnk->checkModeFlg(0x80) && !lnk->checkFmChainGrabAnime() && !daAlink_c::checkNotBattleStage() &&
+        !lnk->checkGrabAnime() && !lnk->checkUpperReadyThrowAnime() && !lnk->checkDkCaught2Anime() &&
+        !lnk->checkKandelaarSwingAnime() && !lnk->checkCutDashAnime() && !lnk->checkCutDashChargeAnime() &&
+        (!lnk->checkEquipAnime() || wasGuarding) && !lnk->checkRideOn() && lnk->checkGuardActionChange())
+        lnk->onNoResetFlg2(daAlink_c::FLG2_UNK_8000000);
+}
+
+// even steps = hand swing arm, odd steps = right hook (end of the right spin cut arm, no spin). same lunge
+// for both
+static int start_jab(daAlink_c* lnk) {
+    int r = lnk->procCutNormalInit(4);
+    if ((comboStep & 1) == 0) {
+        lnk->setUpperAnimeBaseSpeed(dRes_ID_ALANM_BCK_BOOMTHROW_e, 1.0f, 3.0f);
+    } else {
+        const daAlinkHIO_cutTurn_c1* t = &lnk->mpHIO->mCut.mCutTurn.m;
+        float from = t->mRightAttackStartFrame + (t->mRightAttackEndFrame - t->mRightAttackStartFrame) / 4;
+        lnk->setUpperAnime(dRes_ID_ALANM_BCK_CUTT_e, daAlink_c::UPPER_2, 1.0f, from, t->mRightTurnAnm.mEndFrame, 3.0f);
+    }
+    return r;
+}
+
+static void item_action_post(ModContext*, void* args, void* retval, void*) {
+    if (!retval || *static_cast<int*>(retval) != 0) return;
+    daAlink_c* lnk = mods::arg<daAlink_c*>(args, 0);
+
+    if (lnk->checkEquipAnime() || lnk->checkWolf()) return;
+    if (lnk->checkKandelaarSwingAnime() || lnk->checkCopyRodThrowAnime()) return;
+    if (lnk->checkBoomerangThrowAnime()) return;
+
+    bool ground = lnk->mLinkAcch.ChkGroundHit() || lnk->checkMagneBootsOn();
+
+    // bash gate from the game, no shield check
+    bool bash = cfgOn(vBash, true) && ground && dComIfGp_getRStatus() == 0;
+    if (bash && !cfgOn(vSkill, false)) {
+        bash = dComIfGs_isEventBit(dSv_event_flag_c::F_0338);
+        if (!bash) bash = lnk->checkNoResetFlg3(daAlink_c::FLG3_TRANING_SHIELD_ATTACK);
+    }
+    if (bash && !lnk->checkGuardActionChange()) bash = false;
+    if (bash && lnk->checkUpperReadyThrowAnime()) bash = false;
+    if (bash && lnk->checkModeFlg(0x70C52)) bash = false;
+    if (bash && daAlink_c::checkNotBattleStage()) bash = false;
+
+    if (bash) {
+        lnk->setRStatus(BUTTON_STATUS_SHIELD_ATTACK);
+        if (lnk->spActionTrigger()) {
+            *static_cast<int*>(retval) = lnk->procGuardAttackInit();
+            return;
+        }
+    }
+
+    if (!cfgOn(vSwing, true) || !ground || daAlink_c::checkSwordGet()) return;
+    int swingCs = lnk->mDemo.getDemoType();
+    if (swingCs) return;
+    if (lnk->checkEventRun()) return;
+    bool onHorse = lnk->checkRideOn();
+    if (onHorse || lnk->checkModeFlg(0x70C52)) return;
+
+    // same places the game won't let you draw a sword (towns, rooms, canoe), asked through the game's own
+    // checks so mods that unlock those unlock this too
+    if (daAlink_c::checkNotBattleStage()) return;
+    if (lnk->checkCanoeRide()) return;
+    if (lnk->checkModeFlg(0x40000) && !lnk->checkEquipHeavyBoots()) return;
+    if (lnk->checkEndResetFlg1(daAlink_c::ERFLG1_SWORD_TRIGGER_NON)) return;
+
+    // carried stuff and a flying boomerang stay as they are
+    if (lnk->mEquipItem == 0x102 || lnk->mEquipItem == 0x10B) return;
+    if (lnk->mThrowBoomerangAcKeep.getActor()) return;
+
+    lnk->setBStatus(BUTTON_STATUS_ATTACK);
+    if (!lnk->swordTrigger()) return;
+
+    if (lnk->mEquipItem != dItemNo_NONE_e) lnk->deleteEquipItem(TRUE, FALSE);
+
+    // mid swing, so this is the next hit
+    comboStep = swinging ? comboStep + 1 : 0;
+    lnk->mEquipItem = 0x103;
+    swinging = true;
+    *static_cast<int*>(retval) = start_jab(lnk);
+}
+
+// unarmed lock-on A shows UNK_121, so swap the label and checkDoCutAction does the rest
+static void do_status_post(ModContext*, void* args, void*, void*) {
+    daAlink_c* lnk = mods::arg<daAlink_c*>(args, 0);
+    bool jump = cfgOn(vJump, false), ending = cfgOn(vEnding, false), head = cfgOn(vHead, false);
+    if (!cfgOn(vSwing, true) || (!jump && !ending && !head)) return;
+
+    if (lnk->checkWolf() || daAlink_c::checkSwordGet() || lnk->mEquipItem != dItemNo_NONE_e) return;
+    if (!lnk->checkAttentionLock() || dComIfGp_getDoStatus() != BUTTON_STATUS_UNK_121) return;
+    if (lnk->checkNotJumpSinkLimit() || lnk->checkMagneBootsOn() || lnk->checkIronBallWaitAnime()) return;
+    if (lnk->checkSmallUpperGuardAnime()) return;
+    if (lnk->checkInputOnR() && lnk->getDirectionFromShapeAngle() != daAlink_c::DIR_FORWARD) return;
+
+    if (ending && lnk->checkDownAttackState()) lnk->setDoStatusEmphasys(BUTTON_STATUS_FINISH);
+    else if (head && lnk->checkCutHeadState()) lnk->setDoStatusEmphasys(BUTTON_STATUS_HELM_SPLITTER);
+    else if (jump) lnk->setDoStatus(BUTTON_STATUS_UNK_134);
+}
+
+// spin off: hide the "sword" so checkNextAction can't start a spin charge or combo
+static HookAction next_pre(ModContext*, void* args, void*, void*) {
+    daAlink_c* lnk = mods::arg<daAlink_c*>(args, 0);
+    swordTucked = false;
+    if (swinging && lnk->mEquipItem == 0x103 && !(cfgOn(vSwing, true) && cfgOn(vSpin, false))) {
+        lnk->mEquipItem = dItemNo_NONE_e;
+        swordTucked = true;
+    }
+    return HOOK_CONTINUE;
+}
+
+static void next_post(ModContext*, void* args, void*, void*) {
+    daAlink_c* lnk = mods::arg<daAlink_c*>(args, 0);
+    if (swordTucked && lnk->mEquipItem == dItemNo_NONE_e && in_cut_proc(lnk)) lnk->mEquipItem = 0x103;
+    swordTucked = false;
+}
+
+// cc_at_check already took off the plain (ordon) damage, so redo it from hp0 with the multiplier.
+// pct: wooden .5 (default), ordon 1, master 2, light 4 (master x2 again from the glow)
+static HookAction cc_pre(ModContext*, void* args, void*, void*) {
+    fopAc_ac_c* en = mods::arg<fopAc_ac_c*>(args, 0);
+    hpValid = swinging && en;
+    if (hpValid) hp0 = en->health;
+    return HOOK_CONTINUE;
+}
+
+static void cc_post(ModContext*, void* args, void*, void*) {
+    if (!hpValid) return;
+    hpValid = false;
+    fopAc_ac_c* en = mods::arg<fopAc_ac_c*>(args, 0);
+    dCcU_AtInfo* info = mods::arg<dCcU_AtInfo*>(args, 1);
+    if (!en || !info || info->mAttackPower == 0 || info->mHitType != HIT_TYPE_LINK_NORMAL_ATTACK) return;
+
+    static const int pct[] = {50, 100, 200, 400};
+    int pick = cfgInt(vDamage, 0);
+    if (pick < 0) pick = 0;
+    if (pick > 3) pick = 3;
+
+    int dmg = info->mAttackPower * pct[pick] / 100;
+    if (dmg < 1) dmg = 1;
+    int hp = hp0 - dmg;
+    if (hp <= 0) {
+        hp = 0;
+        info->mHitStatus = 2;
+    } else if (info->mHitStatus == 2) {
+        info->mHitStatus = 1;
+    }
+    en->health = hp;
+}
+
+static HookAction fx_skip(ModContext*, void*, void*, void*) {
+    return swinging ? HOOK_SKIP_ORIGINAL : HOOK_CONTINUE;
+}
+
+static void no_blur_post(ModContext*, void*, void* retval, void*) {
+    if (swinging && retval) *static_cast<int*>(retval) = 1;
+}
+
+// the sword model's axis follows the hand, so during the hook and hand swing the capsule can point behind him.
+// rebuild it ourselves: a short line straight out from just in front of Link, at hand height
+static void sword_hit_post(ModContext*, void* args, void*, void*) {
+    daAlink_c* lnk = mods::arg<daAlink_c*>(args, 0);
+    if (!swinging) return;
+    cXyz ahead(cM_ssin(lnk->shape_angle.y), 0.0f, cM_scos(lnk->shape_angle.y));
+    cXyz from(lnk->current.pos.x + ahead.x * 20.0f, lnk->field_0x3498.y, lnk->current.pos.z + ahead.z * 20.0f);
+    cXyz to = from + ahead * 80.0f;
+    for (int i = 0; i < 3; i++) lnk->mAtCps[i].SetStartEnd(from, to);
+}
+
+// he should only ever slide forward during a stab, never back
+static void cut_normal_post(ModContext*, void* args, void*, void*) {
+    daAlink_c* lnk = mods::arg<daAlink_c*>(args, 0);
+    if (!swinging || lnk->mProcID != daAlink_c::PROC_CUT_NORMAL) return;
+    if (lnk->mNormalSpeed < 0.0f) lnk->mNormalSpeed = 0.0f;
+    lnk->current.angle.y = lnk->shape_angle.y;
+}
+
+// B mid swing normally picks a combo move here, we just chain our own jabs instead
+static HookAction cut_action_pre(ModContext*, void* args, void* retval, void*) {
+    daAlink_c* lnk = mods::arg<daAlink_c*>(args, 0);
+    if (!swinging || lnk->checkWolf()) return HOOK_CONTINUE;
+    lnk->resetCombo(TRUE);
+    comboStep++;
+    int r = start_jab(lnk);
+    if (retval) *static_cast<int*>(retval) = r;
+    return HOOK_SKIP_ORIGINAL;
+}
+
+// A asks these two on its own whatever the prompt says, so a learned ending blow or helm splitter
+// would still fire with its toggle off. answer no unless the toggle's on
+static bool unarmed_move_off(daAlink_c* lnk, ConfigVarHandle move) {
+    return !daAlink_c::checkSwordGet() && !lnk->checkWolf() && !(cfgOn(vSwing, true) && cfgOn(move, false));
+}
+
+static void down_state_post(ModContext*, void* args, void* retval, void*) {
+    if (retval && unarmed_move_off(mods::arg<daAlink_c*>(args, 0), vEnding)) *static_cast<int*>(retval) = 0;
+}
+
+static void head_state_post(ModContext*, void* args, void* retval, void*) {
+    if (retval && unarmed_move_off(mods::arg<daAlink_c*>(args, 0), vHead)) *static_cast<int*>(retval) = 0;
+}
+
+// ending blow = backflip played backwards for a front flip, and no sword-stuck anim on a miss
+static void down_init_post(ModContext*, void* args, void*, void*) {
+    daAlink_c* lnk = mods::arg<daAlink_c*>(args, 0);
+    flipping = false;
+    if (daAlink_c::checkSwordGet() || lnk->checkWolf() || lnk->mProcVar3.field_0x300e != 0) return;
+    const daAlinkHIO_anm_c* a = &lnk->mpHIO->mBackJump.m.mBackflipAnm;
+    lnk->setSingleAnime(daAlink_c::ANM_BACKFLIP, -a->mSpeed, a->mStartFrame, a->mEndFrame, a->mInterpolation);
+    flipping = true;
+}
+
+// hold the flip's first pose till landing instead of the sword fall pose
+static void down_air_post(ModContext*, void* args, void*, void*) {
+    daAlink_c* lnk = mods::arg<daAlink_c*>(args, 0);
+    if (!flipping || lnk->mProcID != daAlink_c::PROC_CUT_DOWN || lnk->mProcVar2.field_0x300c == 0) return;
+    const daAlinkHIO_anm_c* a = &lnk->mpHIO->mBackJump.m.mBackflipAnm;
+    lnk->setSingleAnime(daAlink_c::ANM_BACKFLIP, 0.0f, a->mStartFrame, a->mEndFrame, 3.0f);
+    flipping = false;
+}
+
+static void down_land_post(ModContext*, void* args, void*, void*) {
+    daAlink_c* lnk = mods::arg<daAlink_c*>(args, 0);
+    if (daAlink_c::checkSwordGet() || lnk->checkWolf() || lnk->mProcID != daAlink_c::PROC_CUT_DOWN_LAND) return;
+    if (lnk->mProcVar2.field_0x300c == 0) return;
+    lnk->onModeFlg(4);
+    lnk->checkNextAction(1);
+}
+
+static void unarmed_init() {
+    if (!pre_hook(SetShieldGuard, guard_pre) || !post_hook(SetShieldGuard, guard_post))
+        mods::log::warn("unarmed guard and swing won't work");
+    if (!post_hook(CheckItemAction, item_action_post)) mods::log::warn("no unarmed bash or swing on B");
+    if (!post_hook(DoStatus, do_status_post)) mods::log::warn("a-button prompt stays as is");
+    if (!pre_hook(NextAction, next_pre) || !post_hook(NextAction, next_post))
+        mods::log::warn("spin attack toggle may not hold");
+    if (!pre_hook(CcAtCheck, cc_pre) || !post_hook(CcAtCheck, cc_post))
+        mods::log::warn("swing damage stays at the base amount");
+
+    if (!pre_hook(CutAction, cut_action_pre)) mods::log::warn("combo hook failed");
+    if (!post_hook(SwordHit, sword_hit_post)) mods::log::warn("hit capsule hook failed");
+    if (!post_hook(CutNormal, cut_normal_post)) mods::log::warn("stab hook failed");
+
+    if (!post_hook(DownState, down_state_post) || !post_hook(HeadState, head_state_post))
+        mods::log::warn("A move gate hooks failed");
+    if (!post_hook(DownInit, down_init_post) || !post_hook(DownAir, down_air_post) ||
+        !post_hook(DownLand, down_land_post))
+        mods::log::warn("ending blow hooks failed");
+
+    int fxOk = post_hook(NoBlur, no_blur_post);
+    fxOk = fxOk && pre_hook(FxCharge, fx_skip) && pre_hook(FxUp, fx_skip);
+    fxOk = fxOk && pre_hook(FxSplash, fx_skip) && pre_hook(FxDrop, fx_skip);
+    if (!fxOk) mods::log::warn("blade effect hooks failed");
+}
+
+// ======================== Geo's Hyrulean Settings ========================
+
+// greyed-out rules for rows that depend on another toggle
 static bool leaf_off(ModContext*, void*) { return !cfgOn(vLeaf); }
+static bool bash_off(ModContext*, void*) { return !cfgOn(vBash, true); }
+static bool swing_off(ModContext*, void*) { return !cfgOn(vSwing, true); }
 
-static ModResult build_panel(ModContext*, UiElementHandle panel, void*, ModError*) {
-    auto* ui = svc_ui;
-    ui->pane_add_section(mod_ctx, panel, "Less Restrictive Maps");
+// an "always have" row also needs its move switched on
+static bool move_off(ModContext* ctx, void* move) {
+    return swing_off(ctx, nullptr) || !cfgOn(*static_cast<ConfigVarHandle*>(move), false);
+}
 
-    subtitle(panel, "Epona Locations");
-    UiControlDesc t = UI_CONTROL_DESC_INIT;
-    t.kind = UI_CONTROL_TOGGLE;
-    t.binding = UI_BINDING_CONFIG_VAR;
-    for (int i = 0; i < EPONA_AREAS; i++) {
-        t.label = eponaLabels[i];
-        t.config_var = eponaToggle[i];
-        ui->pane_add_control(mod_ctx, panel, &t, nullptr);
+static void add_toggle(UiElementHandle pane, const char* label, ConfigVarHandle var, UiPredicateFn locked = nullptr,
+                       void* lockedBy = nullptr) {
+    if (!var) return;  // didn't register, it keeps its default
+    UiControlDesc row = UI_CONTROL_DESC_INIT;
+    row.kind = UI_CONTROL_TOGGLE;
+    row.label = label;
+    row.binding = UI_BINDING_CONFIG_VAR;
+    row.config_var = var;
+    row.is_disabled = locked;
+    row.user_data = lockedBy;
+    svc_ui->pane_add_control(mod_ctx, pane, &row, nullptr);
+}
+
+static void add_dropdown(UiElementHandle pane, const char* label, ConfigVarHandle var, const char* const* names,
+                         int count, UiPredicateFn locked = nullptr) {
+    if (!var) return;
+    UiControlDesc row = UI_CONTROL_DESC_INIT;
+    row.kind = UI_CONTROL_DROPDOWN;
+    row.label = label;
+    row.binding = UI_BINDING_CONFIG_VAR;
+    row.config_var = var;
+    row.options = names;
+    row.option_count = count;
+    row.is_disabled = locked;
+    svc_ui->pane_add_control(mod_ctx, pane, &row, nullptr);
+}
+
+static ModResult quality_page(ModContext*, UiWindowHandle, UiElementHandle pane, UiElementHandle, void*, ModError*) {
+    svc_ui->pane_add_section(mod_ctx, pane, "Epona Locations");
+    for (int i = 0; i < EPONA_AREAS; i++) add_toggle(pane, eponaLabels[i], eponaToggle[i]);
+
+    svc_ui->pane_add_section(mod_ctx, pane, "Map Checks");
+    add_dropdown(pane, "Remove faron woods mist", mistOption, mistNames, 3);
+    add_dropdown(pane, "Revert to Chudley's", shopOption, shopNames, 4);
+    add_toggle(pane, "Jump to Lake Hylia from Bridge", bridgeJump);
+
+    svc_ui->pane_add_section(mod_ctx, pane, "Shop Changes");
+    add_toggle(pane, "Goron Outpost Changes", vGoron);
+    add_toggle(pane, "Chudleys/Malomart Changes", vChud);
+    return MOD_OK;
+}
+
+static const char* const damageNames[] = {"x0.5 Wooden Sword", "x1 Ordon Sword", "x2 Master Sword", "x4 Light Sword"};
+
+static ModResult combat_page(ModContext*, UiWindowHandle, UiElementHandle pane, UiElementHandle, void*, ModError*) {
+    svc_ui->pane_add_section(mod_ctx, pane, "Unarmed Combat");
+    add_toggle(pane, "Blocking while unarmed", vShield);
+    add_toggle(pane, "Shield bash while unarmed", vBash);
+    add_toggle(pane, "Bash without shield bash skill", vSkill, bash_off);
+
+    add_toggle(pane, "Swing while unarmed", vSwing);
+    add_dropdown(pane, "Swing damage", vDamage, damageNames, 4, swing_off);
+    add_toggle(pane, "Jump strike while unarmed", vJump, swing_off);
+    add_toggle(pane, "Always have charged jump strike", vChargedAll, move_off, &vJump);
+    add_toggle(pane, "Spin attack while unarmed", vSpin, swing_off);
+    add_toggle(pane, "Always have great spin", vSpinAll, move_off, &vSpin);
+    add_toggle(pane, "Final blow while unarmed", vEnding, swing_off);
+    add_toggle(pane, "Always have final blow", vEndingAll, move_off, &vEnding);
+    add_toggle(pane, "Helm splitter while unarmed", vHead, swing_off);
+    add_toggle(pane, "Always have helm splitter", vHeadAll, move_off, &vHead);
+    add_toggle(pane, "Always have back slice", vBackAll, swing_off);
+    return MOD_OK;
+}
+
+static ModResult items_page(ModContext*, UiWindowHandle, UiElementHandle pane, UiElementHandle, void*, ModError*) {
+    svc_ui->pane_add_section(mod_ctx, pane, "Ice Leaf");
+    add_toggle(pane, "Enable Ice Leaf", vLeaf);
+    add_toggle(pane, "Always Have Ice Sled", vAlways, leaf_off);
+    add_toggle(pane, "RT Speed Boost Cheat", vBoost, leaf_off);
+    return MOD_OK;
+}
+
+static UiWindowHandle settingsWindow;
+
+static void settings_closed(ModContext*, UiWindowHandle, void*) {
+    settingsWindow = 0;
+}
+
+// the top bar tab and the Mods page button both land here
+static void open_settings(ModContext*, void*) {
+    if (settingsWindow) return;
+
+    UiTabDesc pages[3] = {UI_TAB_DESC_INIT, UI_TAB_DESC_INIT, UI_TAB_DESC_INIT};
+    pages[0].title = "Quality of Life";
+    pages[0].build = quality_page;
+    pages[1].title = "Combat";
+    pages[1].build = combat_page;
+    pages[2].title = "Items";
+    pages[2].build = items_page;
+
+    UiWindowDesc win = UI_WINDOW_DESC_INIT;
+    win.tabs = pages;
+    win.tab_count = 3;
+    win.on_closed = settings_closed;
+    if (svc_ui->window_push(mod_ctx, &win, &settingsWindow) != MOD_OK) {
+        mods::log::warn("couldn't open the settings window");
+        settingsWindow = 0;
     }
+}
 
-    UiControlDesc dd = UI_CONTROL_DESC_INIT;
-    dd.kind = UI_CONTROL_DROPDOWN;
-    dd.binding = UI_BINDING_CONFIG_VAR;
-    subtitle(panel, "Map Checks");
+// all the Mods page gets now is the way in
+static ModResult mods_page(ModContext*, UiElementHandle panel, void*, ModError*) {
+    UiControlDesc open = UI_CONTROL_DESC_INIT;
+    open.kind = UI_CONTROL_BUTTON;
+    open.label = "Open Geo's Hyrulean Settings";
+    open.on_pressed = open_settings;
+    return svc_ui->pane_add_control(mod_ctx, panel, &open, nullptr);
+}
 
-    dd.label = "Remove faron woods mist";
-    dd.options = mistNames;
-    dd.option_count = 3;
-    dd.config_var = mistOption;
-    ui->pane_add_control(mod_ctx, panel, &dd, nullptr);
+static void settings_init() {
+    UiMenuTabDesc tab = UI_MENU_TAB_DESC_INIT;
+    tab.label = "Geo's Hyrulean Settings";
+    tab.on_selected = open_settings;
+    UiMenuTabHandle tabHandle = 0;
+    if (svc_ui->register_menu_tab(mod_ctx, &tab, &tabHandle) != MOD_OK)
+        mods::log::warn("no top bar tab, use the button on the Mods page");
 
-    // same thing, the shop one has an extra choice
-    dd.label = "Revert to Chudley's";
-    dd.options = shopNames;
-    dd.option_count = 4;
-    dd.config_var = shopOption;
-    ui->pane_add_control(mod_ctx, panel, &dd, nullptr);
+    UiModsPanelDesc panel = UI_MODS_PANEL_DESC_INIT;
+    panel.build = mods_page;
+    if (svc_ui->register_mods_panel(mod_ctx, &panel) != MOD_OK)
+        mods::log::warn("mods panel failed, settings keep their saved values");
+}
 
-    t.label = "Jump to Lake Hylia from Bridge";
-    t.config_var = bridgeJump;
-    ui->pane_add_control(mod_ctx, panel, &t, nullptr);
-
-    ui->pane_add_section(mod_ctx, panel, "Shop Expansion");
-    return shop_panel(panel);
+static bool add_bool_option(const char* key, bool def, ConfigVarHandle* out) {
+    ConfigVarDesc d = CONFIG_VAR_DESC_INIT;
+    d.name = key;
+    d.type = CONFIG_VAR_BOOL;
+    d.default_bool = def;
+    if (svc_config->register_var(mod_ctx, &d, out) == MOD_OK) return true;
+    *out = 0;
+    return false;
 }
 
 static bool add_int_option(const char* key, int64_t def, ConfigVarHandle* out) {
@@ -2365,12 +2726,29 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
 
     shop_init();
 
-    // one panel for both halves
-    UiModsPanelDesc panel = UI_MODS_PANEL_DESC_INIT;
-    panel.build = build_panel;
-    panel.update = panel_update;
-    res = svc_ui->register_mods_panel(mod_ctx, &panel);
-    if (res != MOD_OK) mods::log::warn("mods panel failed ({}), toggles keep their saved values", (int)res);
+    // --- Unarmed Combat ---
+    int missed = 0;
+    missed += !add_bool_option("shielding", true, &vShield);
+    missed += !add_bool_option("bashing", true, &vBash);
+    missed += !add_bool_option("swingUnarmed", true, &vSwing);
+    missed += !add_bool_option("ignoreSkill", false, &vSkill);
+    missed += !add_bool_option("jumpSlash", false, &vJump);
+    missed += !add_bool_option("chargedJumpAlways", false, &vChargedAll);
+    missed += !add_bool_option("spinAttack", false, &vSpin);
+    missed += !add_bool_option("spinAlways", false, &vSpinAll);
+    missed += !add_bool_option("endingBlow", false, &vEnding);
+    missed += !add_bool_option("endingBlowAlways", false, &vEndingAll);
+    missed += !add_bool_option("helmSplitter", false, &vHead);
+    missed += !add_bool_option("helmSplitterAlways", false, &vHeadAll);
+    missed += !add_bool_option("backSliceAlways", false, &vBackAll);
+    if (!add_int_option("damageSword", 0, &vDamage)) {
+        vDamage = 0;
+        missed++;
+    }
+    if (missed) mods::log::warn("{} unarmed settings didn't register, those use their defaults", missed);
+    unarmed_init();
+
+    settings_init();
 
     svc_log->info(mod_ctx, "Tools and Expansion loaded");
     return MOD_OK;
