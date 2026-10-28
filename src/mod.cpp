@@ -2520,12 +2520,13 @@ static void unarmed_init() {
 // ======================== update check ========================
 
 // GameBanana's own site loads the mod page from this, and the version you set there comes back
-// as "_sVersion". Files on the page carry one too, so the highest one found wins.
+// as the top-level "_sVersion".
 static const char* const kModPageData = "https://gamebanana.com/apiv11/Mod/731814/ProfilePage";
 
 enum CheckState { CHECK_NOT_YET, CHECK_WAITING, CHECK_GOT_IT, CHECK_FAILED };
 static CheckState checkState = CHECK_NOT_YET;
 static char latestVersion[32];
+static char whyFailed[96];  // shown under the versions when the check didn't work
 static bool showWhenDone;  // the button was pressed, so pop the window up once the answer is in
 
 static const char* my_version() {
@@ -2553,23 +2554,40 @@ static bool update_ready() {
     return checkState == CHECK_GOT_IT && compare_versions(latestVersion, my_version()) > 0;
 }
 
-// pulls the highest "_sVersion":"..." out of the reply; the body isn't null terminated
+// copies the string value that starts right after a key, skipping the ": " in between
+static bool value_after(const char* body, size_t size, size_t c) {
+    while (c < size && (body[c] == ' ' || body[c] == ':' || body[c] == '\t')) c++;
+    if (c >= size || body[c] != '"') return false;  // null or a number, not a version
+    size_t len = 0;
+    for (c++; c < size && body[c] != '"' && len < sizeof(latestVersion) - 1; c++)
+        latestVersion[len++] = body[c];
+    latestVersion[len] = 0;
+    return len > 0;
+}
+
+// the mod's own "_sVersion" sits at the top level of the reply, next to the view and like counts;
+// the files further in have their own, so only depth 1 counts. the body isn't null terminated
 static bool read_version(const char* body, size_t size) {
-    static const char key[] = "\"_sVersion\":\"";
+    static const char key[] = "\"_sVersion\"";
     const size_t keyLen = sizeof(key) - 1;
     latestVersion[0] = 0;
-    for (size_t at = 0; at + keyLen < size; at++) {
-        if (memcmp(body + at, key, keyLen) != 0) continue;
-        char found[32];
-        size_t len = 0;
-        for (size_t c = at + keyLen; c < size && body[c] != '"' && len < sizeof(found) - 1; c++)
-            found[len++] = body[c];
-        found[len] = 0;
-        if (len == 0) continue;
-        if (!latestVersion[0] || compare_versions(found, latestVersion) > 0)
-            memcpy(latestVersion, found, len + 1);
+    int depth = 0;
+    bool inText = false;
+    for (size_t at = 0; at < size; at++) {
+        char ch = body[at];
+        if (inText) {
+            if (ch == '\\') at++;  // escaped character, skip it
+            else if (ch == '"') inText = false;
+            continue;
+        }
+        if (ch == '{' || ch == '[') depth++;
+        if (ch == '}' || ch == ']') depth--;
+        if (ch != '"') continue;
+        bool topKey = depth == 1 && at + keyLen <= size && memcmp(body + at, key, keyLen) == 0;
+        if (topKey) return value_after(body, size, at + keyLen);
+        inText = true;
     }
-    return latestVersion[0] != 0;
+    return false;
 }
 
 static void show_versions() {
@@ -2579,12 +2597,14 @@ static void show_versions() {
 
     // laid out like the game's own update box: plain label, bold version, a "v" in front
     const char* mine = my_version();
-    const char* latest = checkState == CHECK_GOT_IT ? latestVersion : "couldn't reach GameBanana";
+    const char* latest = checkState == CHECK_GOT_IT ? latestVersion : "unknown";
     const char* mineV = isdigit((unsigned char)*mine) ? "v" : "";
     const char* latestV = isdigit((unsigned char)*latest) ? "v" : "";
-    char body[256];
-    snprintf(body, sizeof(body), "<p>YOUR VERSION: <b>%s%s</b></p><p>LATEST VERSION: <b>%s%s</b></p>", mineV,
-             mine, latestV, latest);
+    char body[384];
+    int used = snprintf(body, sizeof(body), "<p>YOUR VERSION: <b>%s%s</b></p><p>LATEST VERSION: <b>%s%s</b></p>",
+                        mineV, mine, latestV, latest);
+    if (checkState == CHECK_FAILED && used > 0 && used < (int)sizeof(body))
+        snprintf(body + used, sizeof(body) - used, "<p>%s</p>", whyFailed);
 
     UiDialogAction close = UI_DIALOG_ACTION_INIT;
     close.label = "Close";
@@ -2597,35 +2617,58 @@ static void show_versions() {
     svc_ui->dialog_push(mod_ctx, &box, &shown);
 }
 
-static void version_arrived(ModContext*, HttpRequestHandle, const HttpResult* reply, void*) {
-    bool ok = reply && reply->error == HTTP_ERROR_NONE && reply->status_code == 200 && reply->body;
-    ok = ok && read_version(static_cast<const char*>(reply->body), reply->body_size);
-    checkState = ok ? CHECK_GOT_IT : CHECK_FAILED;
-    if (!ok) mods::log::warn("update check: no version from GameBanana");
+static void check_finished(bool gotIt, const char* why) {
+    checkState = gotIt ? CHECK_GOT_IT : CHECK_FAILED;
+    if (!gotIt) {
+        snprintf(whyFailed, sizeof(whyFailed), "%s", why);
+        // it ends up in the pop-up's markup, so no tags sneaking in from an error message
+        for (char* ch = whyFailed; *ch; ch++)
+            if (*ch == '<' || *ch == '>' || *ch == '&') *ch = ' ';
+        mods::log::warn("update check failed: {}", why);
+    }
     if (showWhenDone) show_versions();
     showWhenDone = false;
 }
 
+static void version_arrived(ModContext*, HttpRequestHandle, const HttpResult* reply, void*) {
+    char why[96];
+    if (reply == nullptr) return check_finished(false, "no reply");
+    if (reply->error != HTTP_ERROR_NONE) {
+        const char* msg = reply->error_message && *reply->error_message ? reply->error_message : "network error";
+        snprintf(why, sizeof(why), "%s (error %d)", msg, (int)reply->error);
+        return check_finished(false, why);
+    }
+    if (reply->status_code != 200) {
+        snprintf(why, sizeof(why), "GameBanana answered HTTP %d", (int)reply->status_code);
+        return check_finished(false, why);
+    }
+    bool found = reply->body && read_version(static_cast<const char*>(reply->body), reply->body_size);
+    if (!found) {
+        snprintf(why, sizeof(why), "no version in the reply (%u bytes)", (unsigned)reply->body_size);
+        return check_finished(false, why);
+    }
+    check_finished(true, "");
+}
+
 static void check_for_updates() {
     if (checkState == CHECK_WAITING) return;
-    if (svc_http == nullptr) {
-        checkState = CHECK_FAILED;
-        if (showWhenDone) show_versions();
-        showWhenDone = false;
-        return;
-    }
+    if (svc_http == nullptr) return check_finished(false, "this Dusklight build has no web requests");
 
+    static const HttpHeader wantJson[] = {{"Accept", "application/json"}};
     HttpRequestDesc ask = HTTP_REQUEST_DESC_INIT;
     ask.url = kModPageData;
+    ask.headers = wantJson;
+    ask.header_count = 1;
     ask.total_timeout_ms = 15000;
+    ask.max_body_bytes = 8u << 20;  // the page data carries the whole description, give it room
     HttpRequestHandle pending = 0;
     checkState = CHECK_WAITING;
-    if (svc_http->request(mod_ctx, &ask, version_arrived, nullptr, &pending) == MOD_OK) return;
+    ModResult sent = svc_http->request(mod_ctx, &ask, version_arrived, nullptr, &pending);
+    if (sent == MOD_OK) return;
 
-    // no network on this platform or the request was refused outright
-    checkState = CHECK_FAILED;
-    if (showWhenDone) show_versions();
-    showWhenDone = false;
+    char why[96];
+    snprintf(why, sizeof(why), "request refused (%d), no network access here?", (int)sent);
+    check_finished(false, why);
 }
 
 static void check_button(ModContext*, void*) {
