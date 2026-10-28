@@ -1,4 +1,7 @@
 // std headers before any game header: aurora defines nullptr as NULL when msvc reports old __cplusplus
+#include <cctype>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -7,6 +10,8 @@
 #include "mods/svc/config.h"
 #include "mods/svc/flow.hpp"
 #include "mods/svc/hook.hpp"
+#include "mods/svc/host.h"
+#include "mods/svc/http.h"
 #include "mods/svc/item.h"
 #include "mods/svc/log.h"
 #include "mods/svc/log.hpp"
@@ -61,6 +66,9 @@ IMPORT_SERVICE(UiService, svc_ui);
 IMPORT_SERVICE(FlowService, svc_flow);
 IMPORT_SERVICE(MessageService, svc_message);
 IMPORT_SERVICE(ItemService, svc_item);
+IMPORT_SERVICE_VERSION(HostService, svc_host, 0);
+// optional: some platforms have no network, the update check just says it couldn't reach GameBanana
+IMPORT_OPTIONAL_SERVICE_VERSION(HttpService, svc_http, 0);
 
 // ======================== settings ========================
 
@@ -77,11 +85,6 @@ static const char* const mistNames[] = {"Off", "Semi-Default", "On"};
 static ConfigVarHandle mistOption;
 
 enum ShopMode : int { SHOP_OFF, SHOP_SEMI, SHOP_PARTIAL, SHOP_FULL };
-
-// combat
-enum FlourishMode : int { FLOURISH_ON, FLOURISH_WOODEN, FLOURISH_DEFAULT, FLOURISH_OFF };
-static const char* const flourishNames[] = {"On", "Wooden", "Default", "Off"};
-static ConfigVarHandle flourishOption;
 static const char* const shopNames[] = {"Off", "Semi-Default", "Partial-Default", "On"};
 static ConfigVarHandle shopOption;
 static ConfigVarHandle bridgeJump;
@@ -89,9 +92,17 @@ static ConfigVarHandle bridgeJump;
 // shop + ice leaf (0 if registering failed)
 static ConfigVarHandle vBoost, vAlways, vGoron, vChud, vLeaf;
 
+// combat
+enum FlourishMode : int { FLOURISH_ON, FLOURISH_WOODEN, FLOURISH_DEFAULT, FLOURISH_OFF };
+static const char* const flourishNames[] = {"On", "Wooden", "Default", "Off"};
+static ConfigVarHandle flourishOption;
+
 // unarmed combat (0 = registering failed, the default is used)
 static ConfigVarHandle vShield, vBash, vSkill, vSwing, vDamage;
 static ConfigVarHandle vJump, vChargedAll, vSpin, vSpinAll, vEnding, vEndingAll, vHead, vHeadAll, vBackAll;
+
+// Mods page
+static ConfigVarHandle vAutoCheck;
 
 // ======================== shared ========================
 
@@ -2506,6 +2517,122 @@ static void unarmed_init() {
     pre_hook(FxDrop, fx_skip);
 }
 
+// ======================== update check ========================
+
+// GameBanana's own site loads the mod page from this, and the version you set there comes back
+// as "_sVersion". Files on the page carry one too, so the highest one found wins.
+static const char* const kModPageData = "https://gamebanana.com/apiv11/Mod/731814/ProfilePage";
+
+enum CheckState { CHECK_NOT_YET, CHECK_WAITING, CHECK_GOT_IT, CHECK_FAILED };
+static CheckState checkState = CHECK_NOT_YET;
+static char latestVersion[32];
+static bool showWhenDone;  // the button was pressed, so pop the window up once the answer is in
+
+static const char* my_version() {
+    const char* v = svc_host->mod_version(mod_ctx);
+    return v && *v ? v : "unknown";
+}
+
+// "1.0.1" style versions, a leading v is fine; returns >0 when a is newer than b
+static int compare_versions(const char* a, const char* b) {
+    if (*a == 'v' || *a == 'V') a++;
+    if (*b == 'v' || *b == 'V') b++;
+    while (*a || *b) {
+        long left = strtol(a, const_cast<char**>(&a), 10);
+        long right = strtol(b, const_cast<char**>(&b), 10);
+        if (left != right) return left > right ? 1 : -1;
+        if (*a == '.') a++;
+        if (*b == '.') b++;
+        if (*a && !isdigit((unsigned char)*a)) break;
+        if (*b && !isdigit((unsigned char)*b)) break;
+    }
+    return 0;
+}
+
+static bool update_ready() {
+    return checkState == CHECK_GOT_IT && compare_versions(latestVersion, my_version()) > 0;
+}
+
+// pulls the highest "_sVersion":"..." out of the reply; the body isn't null terminated
+static bool read_version(const char* body, size_t size) {
+    static const char key[] = "\"_sVersion\":\"";
+    const size_t keyLen = sizeof(key) - 1;
+    latestVersion[0] = 0;
+    for (size_t at = 0; at + keyLen < size; at++) {
+        if (memcmp(body + at, key, keyLen) != 0) continue;
+        char found[32];
+        size_t len = 0;
+        for (size_t c = at + keyLen; c < size && body[c] != '"' && len < sizeof(found) - 1; c++)
+            found[len++] = body[c];
+        found[len] = 0;
+        if (len == 0) continue;
+        if (!latestVersion[0] || compare_versions(found, latestVersion) > 0)
+            memcpy(latestVersion, found, len + 1);
+    }
+    return latestVersion[0] != 0;
+}
+
+static void show_versions() {
+    bool newer = update_ready();
+    const char* heading = newer ? "UPDATE AVAILABLE" : "UP TO DATE";
+    if (checkState != CHECK_GOT_IT) heading = "COULDN'T CHECK";
+
+    // laid out like the game's own update box: plain label, bold version, a "v" in front
+    const char* mine = my_version();
+    const char* latest = checkState == CHECK_GOT_IT ? latestVersion : "couldn't reach GameBanana";
+    const char* mineV = isdigit((unsigned char)*mine) ? "v" : "";
+    const char* latestV = isdigit((unsigned char)*latest) ? "v" : "";
+    char body[256];
+    snprintf(body, sizeof(body), "<p>YOUR VERSION: <b>%s%s</b></p><p>LATEST VERSION: <b>%s%s</b></p>", mineV,
+             mine, latestV, latest);
+
+    UiDialogAction close = UI_DIALOG_ACTION_INIT;
+    close.label = "Close";
+    UiDialogDesc box = UI_DIALOG_DESC_INIT;
+    box.title = heading;
+    box.body_rml = body;
+    box.actions = &close;
+    box.action_count = 1;
+    UiDialogHandle shown = 0;
+    svc_ui->dialog_push(mod_ctx, &box, &shown);
+}
+
+static void version_arrived(ModContext*, HttpRequestHandle, const HttpResult* reply, void*) {
+    bool ok = reply && reply->error == HTTP_ERROR_NONE && reply->status_code == 200 && reply->body;
+    ok = ok && read_version(static_cast<const char*>(reply->body), reply->body_size);
+    checkState = ok ? CHECK_GOT_IT : CHECK_FAILED;
+    if (!ok) mods::log::warn("update check: no version from GameBanana");
+    if (showWhenDone) show_versions();
+    showWhenDone = false;
+}
+
+static void check_for_updates() {
+    if (checkState == CHECK_WAITING) return;
+    if (svc_http == nullptr) {
+        checkState = CHECK_FAILED;
+        if (showWhenDone) show_versions();
+        showWhenDone = false;
+        return;
+    }
+
+    HttpRequestDesc ask = HTTP_REQUEST_DESC_INIT;
+    ask.url = kModPageData;
+    ask.total_timeout_ms = 15000;
+    HttpRequestHandle pending = 0;
+    checkState = CHECK_WAITING;
+    if (svc_http->request(mod_ctx, &ask, version_arrived, nullptr, &pending) == MOD_OK) return;
+
+    // no network on this platform or the request was refused outright
+    checkState = CHECK_FAILED;
+    if (showWhenDone) show_versions();
+    showWhenDone = false;
+}
+
+static void check_button(ModContext*, void*) {
+    showWhenDone = true;
+    check_for_updates();
+}
+
 // ======================== Geo's Hyrulean Settings ========================
 
 // greyed-out rules for rows that depend on another toggle
@@ -2633,13 +2760,37 @@ static void open_settings(ModContext*, void*) {
     settingsWindow = 0;
 }
 
-// all the Mods page gets now is the way in
+static UiElementHandle updateNote;  // the yellow line, only lives while the Mods page is built
+
+// the Mods page: the way into the settings, plus the update check
 static ModResult mods_page(ModContext*, UiElementHandle panel, void*, ModError*) {
+    updateNote = 0;
+
     UiControlDesc open = UI_CONTROL_DESC_INIT;
     open.kind = UI_CONTROL_BUTTON;
     open.label = "Open Geo's Hyrulean Settings";
     open.on_pressed = open_settings;
-    return svc_ui->pane_add_control(mod_ctx, panel, &open, nullptr);
+    svc_ui->pane_add_control(mod_ctx, panel, &open, nullptr);
+
+    UiControlDesc check = UI_CONTROL_DESC_INIT;
+    check.kind = UI_CONTROL_BUTTON;
+    check.label = "Check for Updates";
+    check.on_pressed = check_button;
+    svc_ui->pane_add_control(mod_ctx, panel, &check, nullptr);
+
+    page = panel;
+    toggle("Auto Check for Updates", vAutoCheck);
+    svc_ui->pane_add_rml(mod_ctx, panel, "<span style=\"color: #ffd23f;\">Update available!</span>", &updateNote);
+    if (updateNote) svc_ui->elem_set_visible(mod_ctx, updateNote, false);
+    return MOD_OK;
+}
+
+// every frame the Mods page is open
+static ModResult mods_page_tick(ModContext*, void*, ModError*) {
+    bool autoOn = cfgOn(vAutoCheck);
+    if (autoOn && checkState == CHECK_NOT_YET) check_for_updates();  // switched on after startup
+    if (updateNote) svc_ui->elem_set_visible(mod_ctx, updateNote, autoOn && update_ready());
+    return MOD_OK;
 }
 
 static void settings_init() {
@@ -2652,6 +2803,7 @@ static void settings_init() {
 
     UiModsPanelDesc panel = UI_MODS_PANEL_DESC_INIT;
     panel.build = mods_page;
+    panel.update = mods_page_tick;
     if (svc_ui->register_mods_panel(mod_ctx, &panel) != MOD_OK)
         mods::log::warn("mods panel failed, settings keep their saved values");
 }
@@ -2796,6 +2948,10 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     if (!flourishOk) mods::log::warn("sword flourish stays at the game's normal behaviour");
 
     settings_init();
+
+    // --- update check ---
+    add_bool_option("autoUpdateCheck", true, &vAutoCheck);
+    if (cfgOn(vAutoCheck)) check_for_updates();
 
     svc_log->info(mod_ctx, "Tools and Expansion loaded");
     return MOD_OK;
