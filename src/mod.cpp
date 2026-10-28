@@ -77,6 +77,11 @@ static const char* const mistNames[] = {"Off", "Semi-Default", "On"};
 static ConfigVarHandle mistOption;
 
 enum ShopMode : int { SHOP_OFF, SHOP_SEMI, SHOP_PARTIAL, SHOP_FULL };
+
+// combat
+enum FlourishMode : int { FLOURISH_ON, FLOURISH_WOODEN, FLOURISH_DEFAULT, FLOURISH_OFF };
+static const char* const flourishNames[] = {"On", "Wooden", "Default", "Off"};
+static ConfigVarHandle flourishOption;
 static const char* const shopNames[] = {"Off", "Semi-Default", "Partial-Default", "On"};
 static ConfigVarHandle shopOption;
 static ConfigVarHandle bridgeJump;
@@ -615,15 +620,20 @@ static bool is_crate(s16 proc) {
            proc == fpcNm_Obj_BBox_e;
 }
 
-// `owner` is the room whose unloading takes the copy with it; `room` is what the actor itself gets
-static void spawn_copy(const stage_actor_data_class* rec, const fopAcM_prmScale_class* size, int room, int owner,
-                       u32 params, csXyz rot) {
+// `owner` is the room whose unloading takes the copy with it; `room` is what the actor itself gets.
+// SCOe records carry a size byte per axis, in tenths
+static void spawn_copy(const stage_actor_data_class* rec, bool sized, int room, int owner, u32 params, csXyz rot) {
     dStage_objectNameInf* info = dStage_searchName(rec->name);
     if (info == nullptr || bridgeBitCount == kMaxBridgeBits) return;
 
     cXyz pos = rec->base.position;
     cXyz scale(1.0f, 1.0f, 1.0f);
-    if (size) scale.set(size->x * 0.1f, size->y * 0.1f, size->z * 0.1f);
+    if (sized) {
+        const fopAcM_prmScale_class& tenths = ((const stage_tgsc_data_class*)rec)->scale;
+        scale.x = tenths.x / 10.0f;
+        scale.y = tenths.y / 10.0f;
+        scale.z = tenths.z / 10.0f;
+    }
     fpc_ProcID id = fopAcM_create(info->procname, params, &pos, room, &rot, &scale, info->argument);
     if (id == fpcM_ERROR_PROCESS_ID_e) return;
     bridgeBitRoom[bridgeBitCount] = (s8)owner;
@@ -648,20 +658,6 @@ static stage_scls_info_class* lake_exit(void* file, const stage_actor_data_class
     int which = params & 0xFF;
     if (scenes == nullptr || which >= exits) return nullptr;
     return strncmp(scenes[which].mStage, "F_SP115", 8) == 0 ? &scenes[which] : nullptr;
-}
-
-// The three crates at the near end of the bridge just block the walkway in normal Hyrule, so they stay
-// in twilight. They sit in a strip starting at this spot and running north along the deck.
-static const float kNearEndX = -93621.0f;
-static const float kNearEndZ = 43150.0f;
-
-static bool near_end_crate(const cXyz& at) {
-    // the deck heads almost straight up +Z here (Link's facing was 857, about 5 degrees)
-    float dx = at.x - kNearEndX;
-    float dz = at.z - kNearEndZ;
-    float along = dx * 0.0822f + dz * 0.9966f;
-    float across = dx * 0.9966f - dz * 0.0822f;
-    return along > -600.0f && along < 4000.0f && fabsf(across) < 1000.0f;
 }
 
 // Three of the twilight crates just block the walkway in normal Hyrule, so they stay in twilight:
@@ -699,8 +695,7 @@ static void copy_bridge_jump(void* file, int room, bool fromStage) {
             u32 params = rec->base.parameters | 0xFF000000;
             csXyz rot = rec->base.angle;
             rot.x = rot.z = 0x0FFF;
-            const fopAcM_prmScale_class* size = t == 0 ? &((const stage_tgsc_data_class*)rec)->scale : nullptr;
-            spawn_copy(rec, size, fromStage ? -1 : room, room, params, rot);
+            spawn_copy(rec, t == 0, fromStage ? -1 : room, room, params, rot);
             if (drops < 16) drop[drops++] = rec->base.position;
         }
     }
@@ -718,12 +713,8 @@ static void copy_bridge_jump(void* file, int room, bool fromStage) {
             cXyz at = rec->base.position;
             bool wanted = fromStage ? at.abs(kBridgeSpot) < 6000.0f : room == kBridgeRoom;
             for (int d = 0; d < drops && !wanted; d++) wanted = at.abs(drop[d]) < 3000.0f;
-            if (wanted && near_end_crate(at)) wanted = false;
-            if (blocking_crate(at)) wanted = false;
-            if (!wanted) continue;
-
-            const fopAcM_prmScale_class* size = t == 0 ? &((const stage_tgsc_data_class*)rec)->scale : nullptr;
-            spawn_copy(rec, size, room, room, rec->base.parameters, rec->base.angle);
+            if (!wanted || blocking_crate(at)) continue;
+            spawn_copy(rec, t == 0, room, room, rec->base.parameters, rec->base.angle);
         }
     }
 }
@@ -938,6 +929,10 @@ static void forgetIcon(void* buf) {
 
 static const u8 itemButton[2] = {daAlink_c::BTN_X, daAlink_c::BTN_Y};
 
+static bool tapped(daAlink_c* link, int btn) {
+    return link->itemTriggerCheck(itemButton[btn]) != FALSE;
+}
+
 // first button holding the leaf: tap it to get off, or hop on if newitem_pre said we can
 static void leaf_buttons(daAlink_c* link, bool want) {
     for (int btn = 0; btn < 2; btn++) {
@@ -946,10 +941,9 @@ static void leaf_buttons(daAlink_c* link, bool want) {
             if (want && !link->checkEventRun() && !link->checkRide()) spawn(link);
             return;
         }
-        if (link->itemTriggerCheck(itemButton[btn])) {
-            drop(link);
-            return;
-        }
+        if (!tapped(link, btn)) continue;
+        drop(link);
+        return;
     }
 }
 
@@ -1070,8 +1064,7 @@ static HookAction newitem_pre(ModContext*, void* args, void* retval, void*) {
     if (spinner != 4) return HOOK_SKIP_ORIGINAL;  // 4 = spinner ready
 
     // has to run even if we already want the leaf, it's what keeps the icon from dimming
-    BOOL pressedNow = link->itemTriggerCheck(itemButton[btn]);
-    if (pressedNow) wantLeaf = true;
+    wantLeaf = tapped(link, btn) || wantLeaf;
     return HOOK_SKIP_ORIGINAL;
 }
 
@@ -1338,6 +1331,7 @@ static bool oilOnPotion;
 static u16 jumpTo, noBottleShop, noBottleGoron;
 static bool potionPending, potionGiven;
 static int potionWait;
+static ItemGiveHandle potionWatch;
 
 // the two "need an empty bottle" lines and the node graph that plays them
 static flw::Graph bottleNodes;
@@ -1367,9 +1361,9 @@ static int slot_item(dShopSystem_c* shop, int slot) {
 
 static int shop_item(dShopSystem_c* shop) {
     int cursor = shop->mCursorPos;
-    bool onShelf = cursor > 0;  // 0 is the shopkeeper himself
-    onShelf = onShelf && cursor <= dShopSystem_c::ITEM_MAX_e;
-    return onShelf ? slot_item(shop, cursor - 1) : -1;
+    // 0 is the shopkeeper himself, past the last slot is off the shelf
+    if (cursor < 1 || cursor > dShopSystem_c::ITEM_MAX_e) return -1;
+    return slot_item(shop, cursor - 1);
 }
 
 static Who shop_who(dShopSystem_c* shop) {
@@ -1385,12 +1379,11 @@ static dShopSystem_c* live_shop() {
 // another mod (the randomizer, with shop items on) can claim the goron's check; then he's left alone
 static bool goron_ours() {
     if (!cfgOn(vGoron)) return false;
-    ItemCheckResolution goronCheck;
-    goronCheck.item = goronCheck.display_item = 0;
-    goronCheck.was_resolved = false;
-    if (svc_item->resolve_check_full(mod_ctx, kGoronCheck, dItemNo_ARROW_30_e, &goronCheck) != MOD_OK) return true;
+    ItemCheckResolution answer = {};
+    if (svc_item->resolve_check_full(mod_ctx, kGoronCheck, dItemNo_ARROW_30_e, &answer) != MOD_OK) return true;
     // claimed = swapped for a real item; NONE is just a sync mod marking the check as taken
-    return goronCheck.item == dItemNo_ARROW_30_e || goronCheck.item == dItemNo_NONE_e;
+    u32 stocked = answer.item;
+    return stocked == dItemNo_ARROW_30_e || stocked == dItemNo_NONE_e;
 }
 
 static Who who(fopAc_ac_c* speaker) {
@@ -1961,14 +1954,12 @@ static void search_post(ModContext*, void* args, void* found, void*) {
     // and the last potion seen is the first one
     int red = -1, firstPotion = -1;
     u32 arrowSlots = 0;
-    int slot = dShopSystem_c::ITEM_MAX_e;
-    do {
-        --slot;
-        int sold = slot_item(shop, slot);
-        if (is_arrow(sold)) arrowSlots |= 1u << slot;
-        if (is_pot(sold)) firstPotion = slot;
-        if (sold == dItemNo_RED_BOTTLE_e && red < 0) red = slot;
-    } while (slot > 0);
+    for (int back = dShopSystem_c::ITEM_MAX_e - 1; back >= 0; back--) {
+        int sold = slot_item(shop, back);
+        if (is_arrow(sold)) arrowSlots |= 1u << back;
+        if (is_pot(sold)) firstPotion = back;
+        if (sold == dItemNo_RED_BOTTLE_e && red < 0) red = back;
+    }
 
     int pot = red >= 0 ? red : firstPotion;
     oilOnPotion = pot >= 0;
@@ -2029,11 +2020,11 @@ static HookAction fill_pre(ModContext*, void* args, void* ret, void*) {
     return HOOK_SKIP_ORIGINAL;
 }
 
-// every item the game hands out comes through here; we only care while the goron's potion is owed
-static void watch_gifts(ModContext*, const ItemGiveInfo* handedOver, void*) {
-    if (!potionPending || !handedOver) return;
-    const char* check = handedOver->check_name;
-    bool ours = handedOver->item == dItemNo_BLUE_BOTTLE_e || (check && !strcmp(check, kGoronCheck));
+// sees every item handed out, but only listens while the goron owes a potion
+static void potion_arrived(ModContext*, const ItemGiveInfo* gave, void*) {
+    if (gave == nullptr || !potionPending) return;
+    const char* check = gave->check_name;
+    bool ours = gave->item == dItemNo_BLUE_BOTTLE_e || (check && !strcmp(check, kGoronCheck));
     potionGiven = potionGiven || ours;
 }
 
@@ -2112,8 +2103,7 @@ static void shop_init() {
         textHooks[textHookCount++] = flw::override_message_fn(kGrp, id, MESSAGE_LANGUAGE_ENGLISH, on_text);
     for (u16 id = 0; id < 2500; id++)
         textHooks[textHookCount++] = flw::override_message_fn(0, id, MESSAGE_LANGUAGE_ENGLISH, on_text);
-    static ItemGiveHandle giftWatch;  // tells the goron fallback when the potion landed
-    svc_item->observe_gives(mod_ctx, watch_gifts, nullptr, &giftWatch);
+    svc_item->observe_gives(mod_ctx, potion_arrived, nullptr, &potionWatch);
     // stops at the first one that fails, like before
     bool ok = pre_hook(ShopProc, shop_pre);
     if (ok) ok = post_hook(ShopProc, shop_post);
@@ -2154,6 +2144,53 @@ static void shop_shutdown() {
     activeShop = recentShop = nullptr;
 }
 
+// ======================== Sword Flourish ========================
+
+// the game flourishes on a kill timer and skips the wooden sword; we fib about both for one call
+DEFINE_HOOK(&daAlink_c::checkItemChangeFromButton, PutAwayButton);
+
+static s16 realFlourishTimer;
+static bool timerFaked, woodSwapped;
+
+static dSv_player_status_a_c& player_status() {
+    return g_dComIfG_gameInfo.info.getPlayer().getPlayerStatusA();
+}
+
+static HookAction flourish_pre(ModContext*, void* args, void*, void*) {
+    int mode = cfgInt(flourishOption, FLOURISH_DEFAULT);
+    if (mode == FLOURISH_DEFAULT) return HOOK_CONTINUE;
+    daAlink_c* lnk = mods::arg<daAlink_c*>(args, 0);
+
+    // Wooden: same timing as normal, the stick just passes for the Ordon Sword while it's checked.
+    // only when this call can actually be a put-away, so nothing else sees the swap
+    if (mode == FLOURISH_WOODEN) {
+        bool puttingAway = lnk->mEquipItem == 0x103 && dComIfGp_getDoStatus() == BUTTON_STATUS_PUT_AWAY;
+        if (puttingAway && daPy_py_c::checkWoodSwordEquip()) {
+            player_status().setSelectEquip(COLLECT_SWORD, dItemNo_SWORD_e);
+            woodSwapped = true;
+        }
+        return HOOK_CONTINUE;
+    }
+
+    realFlourishTimer = lnk->mSwordFlourishTimer;
+    // On only counts with a real sword out, not an unarmed swing borrowing the sword slot
+    lnk->mSwordFlourishTimer = mode == FLOURISH_ON && daAlink_c::checkSwordGet() ? 1 : 0;
+    timerFaked = true;
+    return HOOK_CONTINUE;
+}
+
+static void flourish_post(ModContext*, void* args, void*, void*) {
+    if (woodSwapped) {
+        player_status().setSelectEquip(COLLECT_SWORD, dItemNo_WOOD_STICK_e);
+        woodSwapped = false;
+    }
+    if (!timerFaked) return;
+    timerFaked = false;
+    daAlink_c* lnk = mods::arg<daAlink_c*>(args, 0);
+    // a flourish that did start can keep the timer it started with
+    if (lnk->mProcID != daAlink_c::PROC_SWORD_UNEQUIP_SP) lnk->mSwordFlourishTimer = realFlourishTimer;
+}
+
 // ======================== Unarmed Combat ========================
 
 DEFINE_HOOK(&daAlink_c::setShieldGuard, SetShieldGuard);
@@ -2163,7 +2200,6 @@ DEFINE_HOOK(&daAlink_c::checkNextAction, NextAction);
 DEFINE_HOOK(&cc_at_check, CcAtCheck);
 DEFINE_HOOK(&daAlink_c::checkCutAction, CutAction);
 DEFINE_HOOK(&daAlink_c::setSwordAtCollision, SwordHit);
-DEFINE_HOOK(&daAlink_c::procCutNormal, CutNormal);
 DEFINE_HOOK(&daAlink_c::procCutDownInit, DownInit);
 DEFINE_HOOK(&daAlink_c::procCutDown, DownAir);
 DEFINE_HOOK(&daAlink_c::procCutDownLand, DownLand);
@@ -2279,9 +2315,8 @@ static void item_action_post(ModContext*, void* args, void* retval, void*) {
     }
 
     if (!cfgOn(vSwing, true) || !ground || daAlink_c::checkSwordGet()) return;
-    int swingCs = lnk->mDemo.getDemoType();
-    if (swingCs) return;
-    if (lnk->checkEventRun()) return;
+    bool inCutscene = lnk->mDemo.getDemoType() != 0 || lnk->checkEventRun();
+    if (inCutscene) return;
     bool onHorse = lnk->checkRideOn();
     if (onHorse || lnk->checkModeFlg(0x70C52)) return;
 
@@ -2394,14 +2429,6 @@ static void sword_hit_post(ModContext*, void* args, void*, void*) {
     for (int i = 0; i < 3; i++) lnk->mAtCps[i].SetStartEnd(from, to);
 }
 
-// he should only ever slide forward during a stab, never back
-static void cut_normal_post(ModContext*, void* args, void*, void*) {
-    daAlink_c* lnk = mods::arg<daAlink_c*>(args, 0);
-    if (!swinging || lnk->mProcID != daAlink_c::PROC_CUT_NORMAL) return;
-    if (lnk->mNormalSpeed < 0.0f) lnk->mNormalSpeed = 0.0f;
-    lnk->current.angle.y = lnk->shape_angle.y;
-}
-
 // B mid swing normally picks a combo move here, we just chain our own jabs instead
 static HookAction cut_action_pre(ModContext*, void* args, void* retval, void*) {
     daAlink_c* lnk = mods::arg<daAlink_c*>(args, 0);
@@ -2455,29 +2482,28 @@ static void down_land_post(ModContext*, void* args, void*, void*) {
 }
 
 static void unarmed_init() {
-    if (!pre_hook(SetShieldGuard, guard_pre) || !post_hook(SetShieldGuard, guard_post))
-        mods::log::warn("unarmed guard and swing won't work");
-    if (!post_hook(CheckItemAction, item_action_post)) mods::log::warn("no unarmed bash or swing on B");
-    if (!post_hook(DoStatus, do_status_post)) mods::log::warn("a-button prompt stays as is");
-    if (!pre_hook(NextAction, next_pre) || !post_hook(NextAction, next_post))
-        mods::log::warn("spin attack toggle may not hold");
-    if (!pre_hook(CcAtCheck, cc_pre) || !post_hook(CcAtCheck, cc_post))
-        mods::log::warn("swing damage stays at the base amount");
+    // the guard hook carries the swing bookkeeping too, so it's the one worth shouting about
+    bool guardOk = pre_hook(SetShieldGuard, guard_pre) && post_hook(SetShieldGuard, guard_post);
+    if (!guardOk) mods::log::warn("unarmed guard and swing won't work");
 
-    if (!pre_hook(CutAction, cut_action_pre)) mods::log::warn("combo hook failed");
-    if (!post_hook(SwordHit, sword_hit_post)) mods::log::warn("hit capsule hook failed");
-    if (!post_hook(CutNormal, cut_normal_post)) mods::log::warn("stab hook failed");
+    int lost = 0;
+    lost += !post_hook(CheckItemAction, item_action_post);
+    lost += !post_hook(DoStatus, do_status_post);
+    lost += !pre_hook(NextAction, next_pre) + !post_hook(NextAction, next_post);
+    lost += !pre_hook(CcAtCheck, cc_pre) + !post_hook(CcAtCheck, cc_post);
+    lost += !pre_hook(CutAction, cut_action_pre);
+    lost += !post_hook(SwordHit, sword_hit_post);
+    lost += !post_hook(DownState, down_state_post) + !post_hook(HeadState, head_state_post);
+    lost += !post_hook(DownInit, down_init_post) + !post_hook(DownAir, down_air_post);
+    lost += !post_hook(DownLand, down_land_post);
+    if (lost) mods::log::warn("{} unarmed move hooks missing, some moves may act vanilla", lost);
 
-    if (!post_hook(DownState, down_state_post) || !post_hook(HeadState, head_state_post))
-        mods::log::warn("A move gate hooks failed");
-    if (!post_hook(DownInit, down_init_post) || !post_hook(DownAir, down_air_post) ||
-        !post_hook(DownLand, down_land_post))
-        mods::log::warn("ending blow hooks failed");
-
-    int fxOk = post_hook(NoBlur, no_blur_post);
-    fxOk = fxOk && pre_hook(FxCharge, fx_skip) && pre_hook(FxUp, fx_skip);
-    fxOk = fxOk && pre_hook(FxSplash, fx_skip) && pre_hook(FxDrop, fx_skip);
-    if (!fxOk) mods::log::warn("blade effect hooks failed");
+    // blade sparkle is cosmetic; hooked() already logs a miss, nothing else to do
+    post_hook(NoBlur, no_blur_post);
+    pre_hook(FxCharge, fx_skip);
+    pre_hook(FxUp, fx_skip);
+    pre_hook(FxSplash, fx_skip);
+    pre_hook(FxDrop, fx_skip);
 }
 
 // ======================== Geo's Hyrulean Settings ========================
@@ -2492,75 +2518,91 @@ static bool move_off(ModContext* ctx, void* move) {
     return swing_off(ctx, nullptr) || !cfgOn(*static_cast<ConfigVarHandle*>(move), false);
 }
 
-static void add_toggle(UiElementHandle pane, const char* label, ConfigVarHandle var, UiPredicateFn locked = nullptr,
-                       void* lockedBy = nullptr) {
-    if (!var) return;  // didn't register, it keeps its default
+// whichever page is being filled right now; the window rebuilds a page each time you open its tab
+static UiElementHandle page;
+
+static void heading(const char* title) { svc_ui->pane_add_section(mod_ctx, page, title); }
+static void note(const char* line) { svc_ui->pane_add_text(mod_ctx, page, line, nullptr); }
+
+static void add_row(UiControlDesc& row, const char* label, ConfigVarHandle var) {
+    if (!var) return;  // never registered, so it just keeps its default
+    row.label = label;
+    row.binding = UI_BINDING_CONFIG_VAR;
+    row.config_var = var;
+    svc_ui->pane_add_control(mod_ctx, page, &row, nullptr);
+}
+
+static void toggle(const char* label, ConfigVarHandle var, UiPredicateFn greyIf = nullptr, void* dependsOn = nullptr) {
     UiControlDesc row = UI_CONTROL_DESC_INIT;
     row.kind = UI_CONTROL_TOGGLE;
-    row.label = label;
-    row.binding = UI_BINDING_CONFIG_VAR;
-    row.config_var = var;
-    row.is_disabled = locked;
-    row.user_data = lockedBy;
-    svc_ui->pane_add_control(mod_ctx, pane, &row, nullptr);
+    row.is_disabled = greyIf;
+    row.user_data = dependsOn;
+    add_row(row, label, var);
 }
 
-static void add_dropdown(UiElementHandle pane, const char* label, ConfigVarHandle var, const char* const* names,
-                         int count, UiPredicateFn locked = nullptr) {
-    if (!var) return;
+static void choice(const char* label, ConfigVarHandle var, const char* const* names, int count) {
     UiControlDesc row = UI_CONTROL_DESC_INIT;
     row.kind = UI_CONTROL_DROPDOWN;
-    row.label = label;
-    row.binding = UI_BINDING_CONFIG_VAR;
-    row.config_var = var;
     row.options = names;
     row.option_count = count;
-    row.is_disabled = locked;
-    svc_ui->pane_add_control(mod_ctx, pane, &row, nullptr);
+    if (var == vDamage) row.is_disabled = swing_off;  // the only dropdown that hangs off a toggle
+    add_row(row, label, var);
 }
 
-static ModResult quality_page(ModContext*, UiWindowHandle, UiElementHandle pane, UiElementHandle, void*, ModError*) {
-    svc_ui->pane_add_section(mod_ctx, pane, "Epona Locations");
-    for (int i = 0; i < EPONA_AREAS; i++) add_toggle(pane, eponaLabels[i], eponaToggle[i]);
+static void quality_rows() {
+    heading("Epona Locations");
+    for (int area = 0; area < EPONA_AREAS; area++) toggle(eponaLabels[area], eponaToggle[area]);
 
-    svc_ui->pane_add_section(mod_ctx, pane, "Map Checks");
-    add_dropdown(pane, "Remove faron woods mist", mistOption, mistNames, 3);
-    add_dropdown(pane, "Revert to Chudley's", shopOption, shopNames, 4);
-    add_toggle(pane, "Jump to Lake Hylia from Bridge", bridgeJump);
+    heading("Map Checks");
+    choice("Remove faron woods mist", mistOption, mistNames, 3);
+    choice("Revert to Chudley's", shopOption, shopNames, 4);
+    toggle("Jump to Lake Hylia from Bridge", bridgeJump);
 
-    svc_ui->pane_add_section(mod_ctx, pane, "Shop Changes");
-    add_toggle(pane, "Goron Outpost Changes", vGoron);
-    add_toggle(pane, "Chudleys/Malomart Changes", vChud);
-    return MOD_OK;
+    heading("Shop Changes");
+    toggle("Goron Outpost Changes", vGoron);
+    toggle("Chudleys/Malomart Changes", vChud);
 }
 
 static const char* const damageNames[] = {"x0.5 Wooden Sword", "x1 Ordon Sword", "x2 Master Sword", "x4 Light Sword"};
 
-static ModResult combat_page(ModContext*, UiWindowHandle, UiElementHandle pane, UiElementHandle, void*, ModError*) {
-    svc_ui->pane_add_section(mod_ctx, pane, "Unarmed Combat");
-    add_toggle(pane, "Blocking while unarmed", vShield);
-    add_toggle(pane, "Shield bash while unarmed", vBash);
-    add_toggle(pane, "Bash without shield bash skill", vSkill, bash_off);
+static void combat_rows() {
+    heading("Sword Flourish");
+    choice("Flourish when sheathing", flourishOption, flourishNames, 4);
 
-    add_toggle(pane, "Swing while unarmed", vSwing);
-    add_dropdown(pane, "Swing damage", vDamage, damageNames, 4, swing_off);
-    add_toggle(pane, "Jump strike while unarmed", vJump, swing_off);
-    add_toggle(pane, "Always have charged jump strike", vChargedAll, move_off, &vJump);
-    add_toggle(pane, "Spin attack while unarmed", vSpin, swing_off);
-    add_toggle(pane, "Always have great spin", vSpinAll, move_off, &vSpin);
-    add_toggle(pane, "Final blow while unarmed", vEnding, swing_off);
-    add_toggle(pane, "Always have final blow", vEndingAll, move_off, &vEnding);
-    add_toggle(pane, "Helm splitter while unarmed", vHead, swing_off);
-    add_toggle(pane, "Always have helm splitter", vHeadAll, move_off, &vHead);
-    add_toggle(pane, "Always have back slice", vBackAll, swing_off);
-    return MOD_OK;
+    heading("Unarmed Combat");
+    note("Unarmed Shielding");
+    toggle("Blocking while unarmed", vShield);
+    toggle("Shield bash while unarmed", vBash);
+    toggle("Bash without shield bash skill", vSkill, bash_off);
+
+    note("Unarmed Swing");
+    toggle("Swing while unarmed", vSwing);
+    choice("Swing damage", vDamage, damageNames, 4);
+    toggle("Jump strike while unarmed", vJump, swing_off);
+    toggle("Always have charged jump strike", vChargedAll, move_off, &vJump);
+    toggle("Spin attack while unarmed", vSpin, swing_off);
+    toggle("Always have great spin", vSpinAll, move_off, &vSpin);
+    toggle("Final blow while unarmed", vEnding, swing_off);
+    toggle("Always have final blow", vEndingAll, move_off, &vEnding);
+    toggle("Helm splitter while unarmed", vHead, swing_off);
+    toggle("Always have helm splitter", vHeadAll, move_off, &vHead);
+    toggle("Always have back slice", vBackAll, swing_off);
 }
 
-static ModResult items_page(ModContext*, UiWindowHandle, UiElementHandle pane, UiElementHandle, void*, ModError*) {
-    svc_ui->pane_add_section(mod_ctx, pane, "Ice Leaf");
-    add_toggle(pane, "Enable Ice Leaf", vLeaf);
-    add_toggle(pane, "Always Have Ice Sled", vAlways, leaf_off);
-    add_toggle(pane, "RT Speed Boost Cheat", vBoost, leaf_off);
+static void item_rows() {
+    heading("Ice Leaf");
+    toggle("Enable Ice Leaf", vLeaf);
+    toggle("Always Have Ice Sled", vAlways, leaf_off);
+    toggle("RT Speed Boost Cheat", vBoost, leaf_off);
+}
+
+static const char* const tabTitles[3] = {"Quality of Life", "Combat", "Items"};
+static void (*const tabRows[3])() = {quality_rows, combat_rows, item_rows};
+
+// one builder for all three tabs, user_data is the tab number
+static ModResult fill_tab(ModContext*, UiWindowHandle, UiElementHandle pane, UiElementHandle, void* which, ModError*) {
+    page = pane;
+    tabRows[reinterpret_cast<intptr_t>(which)]();
     return MOD_OK;
 }
 
@@ -2570,26 +2612,25 @@ static void settings_closed(ModContext*, UiWindowHandle, void*) {
     settingsWindow = 0;
 }
 
-// the top bar tab and the Mods page button both land here
+// opened from the Geo's Hyrulean tab up top, or the button on the Mods page
 static void open_settings(ModContext*, void*) {
     if (settingsWindow) return;
 
-    UiTabDesc pages[3] = {UI_TAB_DESC_INIT, UI_TAB_DESC_INIT, UI_TAB_DESC_INIT};
-    pages[0].title = "Quality of Life";
-    pages[0].build = quality_page;
-    pages[1].title = "Combat";
-    pages[1].build = combat_page;
-    pages[2].title = "Items";
-    pages[2].build = items_page;
+    UiTabDesc tabs[3];
+    for (int t = 0; t < 3; t++) {
+        tabs[t] = UI_TAB_DESC_INIT;
+        tabs[t].title = tabTitles[t];
+        tabs[t].build = fill_tab;
+        tabs[t].user_data = reinterpret_cast<void*>(static_cast<intptr_t>(t));
+    }
 
     UiWindowDesc win = UI_WINDOW_DESC_INIT;
-    win.tabs = pages;
+    win.tabs = tabs;
     win.tab_count = 3;
     win.on_closed = settings_closed;
-    if (svc_ui->window_push(mod_ctx, &win, &settingsWindow) != MOD_OK) {
-        mods::log::warn("couldn't open the settings window");
-        settingsWindow = 0;
-    }
+    if (svc_ui->window_push(mod_ctx, &win, &settingsWindow) == MOD_OK) return;
+    mods::log::warn("settings window wouldn't open");
+    settingsWindow = 0;
 }
 
 // all the Mods page gets now is the way in
@@ -2603,11 +2644,11 @@ static ModResult mods_page(ModContext*, UiElementHandle panel, void*, ModError*)
 
 static void settings_init() {
     UiMenuTabDesc tab = UI_MENU_TAB_DESC_INIT;
-    tab.label = "Geo's Hyrulean Settings";
+    tab.label = "Geo's Hyrulean";
     tab.on_selected = open_settings;
-    UiMenuTabHandle tabHandle = 0;
-    if (svc_ui->register_menu_tab(mod_ctx, &tab, &tabHandle) != MOD_OK)
-        mods::log::warn("no top bar tab, use the button on the Mods page");
+    UiMenuTabHandle topTab = 0;
+    if (svc_ui->register_menu_tab(mod_ctx, &tab, &topTab) != MOD_OK)
+        mods::log::warn("Geo's Hyrulean tab didn't fit in the top bar; the Mods page button still works");
 
     UiModsPanelDesc panel = UI_MODS_PANEL_DESC_INIT;
     panel.build = mods_page;
@@ -2747,6 +2788,11 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     }
     if (missed) mods::log::warn("{} unarmed settings didn't register, those use their defaults", missed);
     unarmed_init();
+
+    // --- Sword Flourish ---
+    if (!add_int_option("swordFlourish", FLOURISH_DEFAULT, &flourishOption)) flourishOption = 0;
+    if (!pre_hook(PutAwayButton, flourish_pre) || !post_hook(PutAwayButton, flourish_post))
+        mods::log::warn("sword flourish stays at the game's normal behaviour");
 
     settings_init();
 
