@@ -47,10 +47,12 @@
 #include "d/d_meter2.h"
 #include "d/d_meter2_draw.h"
 #include "d/d_meter2_info.h"
+#include "d/d_meter_HIO.h"
 #include "d/d_msg_class.h"
 #include "d/d_msg_flow.h"
 #include "d/d_msg_object.h"
 #include "d/d_msg_string_base.h"
+#include "d/d_pane_class.h"
 #include "d/d_save.h"
 #include "d/d_shop_system.h"
 #include "d/d_stage.h"
@@ -2268,21 +2270,82 @@ static void redraw_buttons() {
     meter->mItemStatus[2] = dItemNo_NONE_e;
 }
 
+static bool bow_on_a_button() {
+    for (int b = 0; b < 2; b++)
+        if (dComIfGs_getSelectItemIndex(b) == SLOT_4 || dComIfGs_getMixItemIndex(b) == SLOT_4) return true;
+    return false;
+}
+
+// what R would do on the highlighted slot: 1 tie, -1 untie, 0 nothing of ours
+static int ring_r_action(u8 slot) {
+    int kind = bomb_kind(dComIfGs_getItem(slot, false));
+    // a bow on X or Y gets the bombs first, like in the normal game
+    if (kind < 0 || !cfgOn(galeBombToggle[kind]) || boomerang_button() < 0 || bow_on_a_button()) return 0;
+    return tied_bag() == slot ? -1 : 1;
+}
+
+// the bomb flies from its ring slot onto the boomerang's button (or back), using the ring's own
+// select-item animation; the ring's pending buttons are set to what's already saved so the
+// commit at the end of the flight changes nothing
+static void fly_bomb_icon(dMenu_Ring_c* ring, int button, u8 bombItem, bool ontoButton) {
+    for (int b = 0; b < 2; b++) {
+        ring->field_0x6b4[b] = dComIfGs_getSelectItemIndex(b);
+        ring->field_0x6b8[b] = dComIfGs_getMixItemIndex(b);
+    }
+    ring->field_0x518[button] = ring->mItemSlotPosX[ring->mCurrentSlot];
+    ring->field_0x528[button] = ring->mItemSlotPosY[ring->mCurrentSlot];
+    ring->field_0x538[button] = g_ringHIO.mSelectItemScale;
+    ring->setSelectItem(button, bombItem);
+    ring->field_0x6cd = ontoButton ? 0xFF : button;  // anything but 0xFF plays it in reverse
+    ring->field_0x674[button] = 1;
+}
+
+static bool promptOurs;  // we're the ones showing the combine line in the ring
+
+// the ring's "combine" line: shown the same way setMixMessage does it for the bow
+static void ring_prompt(dMenu_Ring_c* ring, int action) {
+    CPaneMgr* line = ring->mpTextParent[4];
+    if (line == nullptr) return;
+    if (action == 0) {
+        promptOurs = false;  // the game's own setMixMessage already decided this frame
+        return;
+    }
+    for (int i = 0; i < 5; i++) {
+        if (action > 0) {
+            ring->mpComboOffString[i]->show();
+            ring->mpBowArrowComboString[i]->hide();
+        } else {
+            ring->mpComboOffString[i]->hide();
+            ring->mpBowArrowComboString[i]->show();
+        }
+    }
+    if (!promptOurs) mDoAud_seStart(Z2SE_SY_ITEM_COMBINE_ICON, nullptr, 0, 0);
+    promptOurs = true;
+    ring->mPikariFlashingSpeed = 18.0f - g_ringHIO.mPikariAnimSpeed;
+    line->show();
+}
+
 static void ring_post(ModContext*, void* args, void*, void*) {
     auto* ring = mods::arg<dMenu_Ring_c*>(args, 0);
-    if (ring->mStatus != dMenu_Ring_c::STATUS_WAIT || ring->mPlayerIsWolf) return;
-    if (!mDoCPd_c::getTrigR(PAD_1) || ring->mpItemExplain->getStatus() != 0) return;
-
+    bool idle = ring->mStatus == dMenu_Ring_c::STATUS_WAIT && !ring->mPlayerIsWolf &&
+                ring->mpItemExplain->getStatus() == 0;
     u8 slot = ring->mItemSlots[ring->mCurrentSlot];
-    int kind = bomb_kind(dComIfGs_getItem(slot, false));
-    if (kind < 0 || !cfgOn(galeBombToggle[kind]) || boomerang_button() < 0) return;
-    // a bow on X or Y gets the bombs first, like in the normal game
-    for (int b = 0; b < 2; b++)
-        if (dComIfGs_getSelectItemIndex(b) == SLOT_4 || dComIfGs_getMixItemIndex(b) == SLOT_4) return;
+    int action = idle ? ring_r_action(slot) : 0;
+    ring_prompt(ring, action);
+    if (!idle) return;
 
-    bool untie = tied_bag() == slot;
-    tie_bag(untie ? -1 : slot);
-    mDoAud_seStart(untie ? Z2SE_SY_ITEM_COMBINE_OFF : Z2SE_SY_ITEM_COMBINE_ON, nullptr, 0, 0);
+    // putting the boomerang on X or Y by itself splits the bombs off, like re-setting the bow
+    bool setButton = mDoCPd_c::getTrigX(PAD_1) || mDoCPd_c::getTrigY(PAD_1);
+    if (setButton && tied_bag() >= 0 && dComIfGs_getItem(slot, false) == dItemNo_BOOMERANG_e) {
+        tie_bag(-1);
+        redraw_buttons();
+        return;
+    }
+
+    if (action == 0 || !mDoCPd_c::getTrigR(PAD_1)) return;
+    tie_bag(action > 0 ? slot : -1);
+    mDoAud_seStart(action > 0 ? Z2SE_SY_ITEM_COMBINE_ON : Z2SE_SY_ITEM_COMBINE_OFF, nullptr, 0, 0);
+    fly_bomb_icon(ring, boomerang_button(), dComIfGs_getItem(slot, false), action > 0);
     redraw_buttons();
 }
 
@@ -2300,8 +2363,14 @@ static HookAction button_icon_pre(ModContext*, void* args, void*, void*) {
     return HOOK_CONTINUE;
 }
 
-static void button_icon_post(ModContext*, void*, void*, void*) {
+// the bomb picture comes in full size; shrink it into the top-left corner like the bow's bomb
+static void button_icon_post(ModContext*, void* args, void*, void*) {
+    int button = iconButton;
     iconButton = -1;
+    if (button < 0 || button > 1) return;
+    auto* hud = mods::arg<dMeter2Draw_c*>(args, 0);
+    if (hud->mpItemXY[button] == nullptr) return;
+    hud->mpItemXY[button]->resize(hud->field_0x6c4[button] * 0.55f, hud->field_0x6d0[button] * 0.55f);
 }
 
 static HookAction combo_tex_pre(ModContext*, void* args, void*, void*) {
@@ -2364,10 +2433,32 @@ static HookAction button_count_pre(ModContext*, void* args, void*, void*) {
 
 static fpc_ProcID lastBoomerang = fpcM_ERROR_PROCESS_ID_e;
 
+// Bomblings ride as the Forest Temple kind (E_BI): the game already lets the boomerang carry those,
+// and its own bomblings blow up the moment they're pulled off the ground. Their art only ships with
+// a few stages, so it's loaded by hand while bomblings are tied on.
+static request_of_phase_process_class bomblingArt;
+static bool bomblingArtHeld;
+
+static bool bombling_art_ready() {
+    bomblingArtHeld = true;
+    return dComIfG_resLoad(&bomblingArt, "E_BI") == cPhs_COMPLEATE_e;
+}
+
+static void drop_bombling_art() {
+    if (!bomblingArtHeld) return;
+    // a load still in flight can't be cancelled, finish it first and drop it after
+    if (dComIfG_resLoad(&bomblingArt, "E_BI") != cPhs_COMPLEATE_e) return;
+    dComIfG_resDelete(&bomblingArt, "E_BI");
+    bomblingArtHeld = false;
+}
+
 static fopAc_ac_c* make_bomb(int kind, cXyz* at) {
     if (kind == 0) return dBomb_c::createNormalBombPlayer(at);
     if (kind == 1) return dBomb_c::createWaterBombPlayer(at);
-    return dBomb_c::createInsectBombPlayer(at);
+    if (!bombling_art_ready()) return nullptr;
+    // spawns already hanging off the boomerang, the param the temple's bomblings get
+    return (fopAc_ac_c*)fopAcM_fastCreate(fpcNm_NBOMB_e, dBomb_c::PRM_ENEMY_BOMB_BOOMERANG, at, -1, nullptr,
+                                          nullptr, -1, nullptr, nullptr);
 }
 
 static void hang_bomb(daAlink_c* link) {
@@ -2388,11 +2479,11 @@ static void hang_bomb(daAlink_c* link) {
     under.y -= 30.0f;
     fopAc_ac_c* bomb = make_bomb(kind, &under);
     if (bomb == nullptr) return;
+    dComIfGp_setItemBombNumCount(bag, -1);
+    if (kind == 2) return;  // the temple bombling set itself up to ride
 
     // count it like Link pulled it out himself, so its explosion frees the spot again
-    if (kind == 2) link->field_0x2fcf++;
-    else link->mActiveBombNum++;
-    dComIfGp_setItemBombNumCount(bag, -1);
+    link->mActiveBombNum++;
     static_cast<daNbomb_c*>(bomb)->procBoomerangMoveInit(nullptr);
 }
 
@@ -2403,14 +2494,14 @@ static void galebomb_exec_post(ModContext*, void* args, void*, void*) {
 // once a frame: untie when the bombs run out, the boomerang leaves both buttons or the kind is switched off
 static void galebomb_tick() {
     static int wasArmed = -2;
-    int tied = tied_bag();
-    if (tied >= 0 && armed_bag() < 0) {
-        bool boomerangGone = boomerang_button() < 0;
-        bool emptied = bomb_kind(dComIfGs_getItem(tied, false)) < 0;
-        bool switchedOff = !emptied && !cfgOn(galeBombToggle[bomb_kind(dComIfGs_getItem(tied, false))]);
-        if (boomerangGone || emptied || switchedOff) tie_bag(-1);
-    }
     int armed = armed_bag();
+    if (armed < 0 && tied_bag() >= 0) tie_bag(-1);  // armed_bag already says why: empty, off or no boomerang
+
+    // have the temple bombling art ready before the throw, not on it
+    bool bomblings = armed >= 0 && bomb_kind(dComIfGs_getItem(armed, false)) == 2;
+    if (bomblings) bombling_art_ready();
+    else drop_bombling_art();
+
     if (armed != wasArmed) redraw_buttons();
     wasArmed = armed;
 }
@@ -3246,6 +3337,7 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
     while (nIcons > 0) svc_texture->unregister(mod_ctx, iconTex[--nIcons]);
     if (iconRes.data) svc_resource->free(mod_ctx, &iconRes);
     shop_shutdown();
+    drop_bombling_art();
     return MOD_OK;
 }
 
