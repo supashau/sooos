@@ -43,6 +43,7 @@
 #include "d/d_item_data.h"
 #include "d/d_kantera_icon_meter.h"
 #include "d/d_kankyo.h"
+#include "d/d_cc_d.h"
 #include "d/d_map_path_dmap.h"
 #include "d/d_menu_fmap_map.h"
 #include "d/d_menu_item_explain.h"
@@ -113,6 +114,7 @@ static ConfigVarHandle flourishOption;
 // items: which bombs can ride the Gale Boomerang (normal, water, bomblings)
 static ConfigVarHandle galeBombToggle[3];
 static ConfigVarHandle vFireArrows;  // bow + lantern
+static ConfigVarHandle vCombos;  // Enable Combinations, over all of the above
 
 // unarmed combat (0 = registering failed, the default is used)
 static ConfigVarHandle vShield, vBash, vSkill, vSwing, vDamage;
@@ -2327,12 +2329,17 @@ static int boomerang_button() {
     return -1;
 }
 
+// "Enable Combinations" sits over every combo toggle
+static bool combos_on() { return cfgOn(vCombos); }
+static bool gale_on(int kind) { return kind >= 0 && combos_on() && cfgOn(galeBombToggle[kind]); }
+static bool fire_on() { return combos_on() && cfgOn(vFireArrows); }
+
 // the bag that's tied on, still holding bombs of a kind that's switched on; -1 if not
 static int armed_bag() {
     int slot = tied_bag();
     if (slot < SLOT_15 || slot > SLOT_17) return -1;
     int kind = bomb_kind(dComIfGs_getItem(slot, false));
-    if (kind < 0 || !cfgOn(galeBombToggle[kind])) return -1;
+    if (!gale_on(kind)) return -1;
     return boomerang_button() >= 0 ? slot : -1;
 }
 
@@ -2344,66 +2351,71 @@ static void redraw_buttons() {
     meter->mItemStatus[2] = dItemNo_NONE_e;
 }
 
-static bool bow_on_a_button() {
-    for (int b = 0; b < 2; b++)
-        if (dComIfGs_getSelectItemIndex(b) == SLOT_4 || dComIfGs_getMixItemIndex(b) == SLOT_4) return true;
-    return false;
+// --- Fire Arrows: the bow with the lantern, through the game's own combining ---
+// The ring's combining only knows the Hawkeye and the bombs. While it combines, the lantern's slot
+// briefly holds the Hawkeye instead, then gets the lantern back; the save ends up with the
+// lantern's slot on the button and the bow as its mix, and the button acts as the plain bow.
+// (Same trick baxlek's Fire Arrows mod uses.)
+
+DEFINE_HOOK(&dMenu_Ring_c::setMixItem, RingMixItem);
+DEFINE_HOOK(&dMenu_Ring_c::setActiveCursor, RingCursor);
+
+static int lanternPosing = -1;  // slot holding the Hawkeye in place of the lantern, -1 if none
+
+static HookAction lantern_poses(ModContext*, void* args, void*, void*) {
+    if (!fire_on() || lanternPosing >= 0) return HOOK_CONTINUE;
+    auto* ring = mods::arg<dMenu_Ring_c*>(args, 0);
+    u8 slot = ring->mItemSlots[ring->mCurrentSlot];
+    if (dComIfGs_getItem(slot, false) != dItemNo_KANTERA_e) return HOOK_CONTINUE;
+    dComIfGs_setItem(slot, dItemNo_HAWK_EYE_e);
+    lanternPosing = slot;
+    return HOOK_CONTINUE;
 }
 
-// --- Fire Arrows: the plain bow with the lantern tied on, also kept in the save ---
-
-static bool fire_tied() {
-    uint8_t on = 0;
-    size_t n = 1;
-    return svc_save->get_blob(mod_ctx, "fireArrows", &on, &n) == MOD_OK && n == 1 && on == 1;
+// after combining, the ring drew the flying icon as the Hawkeye; draw it again as the lantern
+static void lantern_back_after_mix(ModContext*, void* args, void*, void*) {
+    if (lanternPosing < 0) return;
+    dComIfGs_setItem(lanternPosing, dItemNo_KANTERA_e);
+    lanternPosing = -1;
+    mods::arg<dMenu_Ring_c*>(args, 0)->setJumpItem(false);
 }
 
-static void tie_fire(bool on) {
-    uint8_t stored = on ? 1 : 0;
-    svc_save->set_blob(mod_ctx, "fireArrows", &stored, 1);
-}
-
-static bool have_lantern() {
-    for (int slot = 0; slot < 24; slot++)
-        if (dComIfGs_getItem(slot, false) == dItemNo_KANTERA_e) return true;
-    return false;
-}
-
-// X or Y holding the bow by itself (no bomb arrows or Hawkeye on it)
-static int plain_bow_button() {
-    for (int b = 0; b < 2; b++)
-        if (dComIfGs_getSelectItemIndex(b) == SLOT_4 && dComIfGs_getMixItemIndex(b) == dItemNo_NONE_e) return b;
+// the button with fire arrows on it: the bow, with the lantern's slot as its partner
+static int fire_button() {
+    if (!fire_on()) return -1;
+    for (int b = 0; b < 2; b++) {
+        if (dComIfGp_getSelectItem(b) != dItemNo_BOW_e) continue;
+        if (dComIfGs_getItem(dComIfGs_getSelectItemIndex(b), false) == dItemNo_KANTERA_e) return b;
+    }
     return -1;
 }
 
-// the button with fire arrows on it, or -1
-static int fire_button() {
-    if (!fire_tied() || !cfgOn(vFireArrows) || !have_lantern()) return -1;
-    return plain_bow_button();
+// --- combining in the item ring ---
+// With combinations on, R alone no longer combines. Hold L or R (LT/RT) and press the button
+// (X or Y) whose item you want the highlighted item joined to, or split from. The ring's line
+// reads "Combine" over "(+ Select Button)", with "/ RT" after the trigger icon, and the words
+// pulse instead of the sparkle.
+
+static bool joins_the_bow(u8 item) {
+    return bomb_kind(item) >= 0 || item == dItemNo_HAWK_EYE_e || (item == dItemNo_KANTERA_e && fire_on());
 }
 
-// --- the item ring ---
+// what joining the highlighted slot to button b would do: 1 combine, -1 split, 0 nothing
+static int combo_change(u8 slot, int b) {
+    u8 item = dComIfGs_getItem(slot, false);
+    u8 onButton = dComIfGs_getSelectItemIndex(b);
+    u8 mix = dComIfGs_getMixItemIndex(b);
 
-// what R would do on the highlighted slot
-struct RingAction {
-    int change;  // 1 tie on, -1 split, 0 nothing of ours
-    int button;  // which of X/Y it lands on
-    bool fire;   // the lantern onto the bow, rather than bombs onto the boomerang
-};
-
-static RingAction ring_r_action(u8 slot) {
-    RingAction none = {0, -1, false};
-    if (dComIfGs_getItem(slot, false) == dItemNo_KANTERA_e) {
-        int bow = plain_bow_button();
-        if (!cfgOn(vFireArrows) || bow < 0) return none;
-        RingAction fire = {fire_tied() ? -1 : 1, bow, true};
-        return fire;
+    if (joins_the_bow(item)) {
+        if (mix == SLOT_4) return onButton == slot ? -1 : 1;  // already a bow combo: split or swap
+        if (onButton == SLOT_4) return 1;                    // the plain bow
     }
-    int kind = bomb_kind(dComIfGs_getItem(slot, false));
-    // a bow on X or Y gets the bombs first, like in the normal game
-    if (kind < 0 || !cfgOn(galeBombToggle[kind]) || boomerang_button() < 0 || bow_on_a_button()) return none;
-    RingAction gale = {tied_bag() == slot ? -1 : 1, boomerang_button(), false};
-    return gale;
+    if (gale_on(bomb_kind(item)) && boomerang_button() == b) return tied_bag() == slot ? -1 : 1;
+    return 0;
+}
+
+static bool any_combo(u8 slot) {
+    return combo_change(slot, 0) != 0 || combo_change(slot, 1) != 0;
 }
 
 // the item flies from its ring slot onto the button (or back), using the ring's own
@@ -2422,127 +2434,209 @@ static void fly_item_icon(dMenu_Ring_c* ring, int button, u8 item, bool ontoButt
     ring->field_0x674[button] = 1;
 }
 
-static bool promptOurs;  // we're the ones showing the combine line in the ring
-// the sparkle's speed field is really its running frame; the game zeroes it every frame it isn't
-// showing its own line, so ours is carried across from before the ring's update
-static f32 sparkleFrame;
+static void combine_onto(dMenu_Ring_c* ring, int b) {
+    u8 slot = ring->mItemSlots[ring->mCurrentSlot];
+    int change = combo_change(slot, b);
+    if (change == 0) {
+        mDoAud_seStart(Z2SE_SYS_ERROR, nullptr, 0, 0);
+        return;
+    }
+    u8 item = dComIfGs_getItem(slot, false);
 
-static HookAction ring_pre(ModContext*, void* args, void*, void*) {
-    sparkleFrame = mods::arg<dMenu_Ring_c*>(args, 0)->mPikariFlashingSpeed;
+    if (joins_the_bow(item) && boomerang_button() != b) {
+        // the game's own combining does the rest, sound and fly-in included
+        for (int i = 0; i < 4; i++) ring->setSelectItemForce(i);
+        ring->setMixItem();
+        return;
+    }
+    bool joining = change > 0;
+    tie_bag(joining ? slot : -1);
+    mDoAud_seStart(joining ? Z2SE_SY_ITEM_COMBINE_ON : Z2SE_SY_ITEM_COMBINE_OFF, nullptr, 0, 0);
+    fly_item_icon(ring, b, item, joining);
+    redraw_buttons();
+}
+
+static bool ring_idle(dMenu_Ring_c* ring) {
+    return ring->mStatus == dMenu_Ring_c::STATUS_WAIT && !ring->mPlayerIsWolf &&
+           ring->mpItemExplain->getStatus() == 0;
+}
+
+// runs before the ring reads X/Y/R for this frame
+static HookAction ring_buttons_pre(ModContext*, void* args, void*, void*) {
+    auto* ring = mods::arg<dMenu_Ring_c*>(args, 0);
+    if (!combos_on() || !ring_idle(ring)) return HOOK_CONTINUE;
+
+    bool trigger = mDoCPd_c::getHoldL(PAD_1) || mDoCPd_c::getHoldR(PAD_1);
+    bool x = mDoCPd_c::getTrigX(PAD_1) != 0;
+    bool y = mDoCPd_c::getTrigY(PAD_1) != 0;
+    if (trigger && (x || y)) {
+        combine_onto(ring, x ? 0 : 1);
+        return HOOK_SKIP_ORIGINAL;  // no setting the item on that button as well
+    }
+    // a trigger on its own does nothing now
+    if (mDoCPd_c::getTrigR(PAD_1) || mDoCPd_c::getTrigL(PAD_1)) return HOOK_SKIP_ORIGINAL;
     return HOOK_CONTINUE;
 }
 
-// the ring's "combine" line: shown the same way setMixMessage does it for the bow
-static void ring_prompt(dMenu_Ring_c* ring, int change) {
+// --- the ring's combine line ---
+
+static dMenu_Ring_c* dressedRing;  // the ring whose line we have already rewritten
+
+// a freshly opened ring has the game's own words again, even if it lands at the same address
+DEFINE_HOOK(&dMenu_Ring_c::_create, RingOpen);
+static void ring_opened(ModContext*, void*, void*, void*) {
+    dressedRing = nullptr;
+}
+static J2DTextBox* triggerText[5];  // "/ RT", made from the line's unused language copy
+static int pulse;
+
+static J2DPane* ring_pane(dMenu_Ring_c* ring, u64 tag) {
+    return ring->mpScreen->search(tag);
+}
+
+// moves a pane by a distance measured on screen, whatever scale its parents give it
+static void nudge(J2DPane* pane, f32 screenX, f32 screenY) {
+    Vec a = pane->getGlbVtx(0);
+    Vec b = pane->getGlbVtx(3);
+    f32 w = pane->getWidth(), h = pane->getHeight();
+    f32 sx = w != 0.0f ? (b.x - a.x) / w : 1.0f;
+    f32 sy = h != 0.0f ? (b.y - a.y) / h : 1.0f;
+    if (sx == 0.0f) sx = 1.0f;
+    if (sy == 0.0f) sy = 1.0f;
+    pane->translate(pane->getTranslateX() + screenX / sx, pane->getTranslateY() + screenY / sy);
+}
+
+// Layout, on two rows to the right of "Combine":
+//   Combine   [LT] / RT
+//             (+ Select Button)
+// "Combine" stays where the game put its line, which is level with the middle of the trigger icon;
+// the icon and "/ RT" move up half a row and "(+ Select Button)" sits half a row below, lined up
+// with the icon's left edge, so "Combine" ends up halfway between the two rows.
+static void dress_ring_line(dMenu_Ring_c* ring) {
+    if (dressedRing == ring) return;
+    dressedRing = ring;
+
+    for (int i = 0; i < 5; i++) {
+        ring->mpComboOffString[i]->setString("Combine");
+        ring->mpBowArrowComboString[i]->setString("(+ Select Button)");
+    }
+
+    J2DPane* icon = ring_pane(ring, MULTI_CHAR('gr_btn'));
+    J2DTextBox* word = ring->mpComboOffString[0];
+    f32 row = word->getGlbVtx(3).y - word->getGlbVtx(0).y;  // one line of the ring's text
+    Vec wordTop = word->getGlbVtx(0);
+
+    // where the icon is now, before it moves
+    f32 iconLeft = wordTop.x, iconRight = wordTop.x, iconMiddle = wordTop.y + row * 0.5f;
+    if (icon) {
+        iconLeft = icon->getGlbVtx(0).x;
+        iconRight = icon->getGlbVtx(3).x;
+        iconMiddle = (icon->getGlbVtx(0).y + icon->getGlbVtx(3).y) * 0.5f;
+    }
+    f32 upperMiddle = iconMiddle - row * 0.5f;
+    f32 lowerMiddle = iconMiddle + row * 0.5f;
+
+    // "/ RT" after the trigger icon, using whichever language copy of the line the ring hid
+    static const u64 jpLine[5] = {MULTI_CHAR('gr_t_on'), MULTI_CHAR('g_tof_s5'), MULTI_CHAR('g_tof_s6'),
+                                  MULTI_CHAR('g_tof_s7'), MULTI_CHAR('g_tof_s8')};
+    static const u64 enLine[5] = {MULTI_CHAR('fr_t_on'), MULTI_CHAR('f_tof_s5'), MULTI_CHAR('f_tof_s6'),
+                                  MULTI_CHAR('f_tof_s7'), MULTI_CHAR('f_tof_s8')};
+    bool englishShown = ring_pane(ring, enLine[0]) == ring->mpComboOffString[0];
+    const u64* spare = englishShown ? jpLine : enLine;
+
+    for (int i = 0; i < 5; i++) {
+        J2DTextBox* model = ring->mpComboOffString[i];
+        // each layer keeps its little offset from the top one (they're the text's shadow)
+        f32 shadowX = model->getGlbVtx(0).x - wordTop.x;
+        f32 shadowY = model->getGlbVtx(0).y - wordTop.y;
+        J2DTextBox::TFontSize size;
+        model->getFontSize(size);
+
+        triggerText[i] = static_cast<J2DTextBox*>(ring_pane(ring, spare[i]));
+        if (triggerText[i]) {
+            J2DTextBox* rt = triggerText[i];
+            rt->setFont(mDoExt_getMesgFont());
+            rt->setFontSize(size);
+            rt->setBlackWhite(model->getBlack(), model->getWhite());
+            rt->resize(model->getWidth(), model->getHeight());
+            rt->setString("/ RT");
+            Vec at = rt->getGlbVtx(0);
+            nudge(rt, iconRight + 6.0f + shadowX - at.x, upperMiddle - row * 0.5f + shadowY - at.y);
+            rt->show();
+        }
+
+        J2DTextBox* under = ring->mpBowArrowComboString[i];
+        under->setFontSize(size.mSizeX * 0.7f, size.mSizeY * 0.7f);
+        under->resize(model->getWidth() * 1.6f, model->getHeight());
+        Vec at = under->getGlbVtx(0);
+        nudge(under, iconLeft + shadowX - at.x, lowerMiddle - row * 0.5f + shadowY - at.y);
+    }
+
+    if (icon) nudge(icon, 0.0f, upperMiddle - iconMiddle);
+}
+
+static void ring_line(dMenu_Ring_c* ring, bool show) {
     CPaneMgr* line = ring->mpTextParent[4];
     if (line == nullptr) return;
-    if (change == 0) {
-        promptOurs = false;  // the game's own setMixMessage already decided this frame
+    ring->mPikariFlashingSpeed = 0.0f;  // no sparkle; the word pulses instead
+    if (!show) {
+        line->hide();
         return;
     }
+    dress_ring_line(ring);
+    pulse++;
+    f32 glow = 0.55f + 0.45f * cM_scos((s16)(pulse * 0x500));
     for (int i = 0; i < 5; i++) {
-        if (change > 0) {
-            ring->mpComboOffString[i]->show();
-            ring->mpBowArrowComboString[i]->hide();
-        } else {
-            ring->mpComboOffString[i]->hide();
-            ring->mpBowArrowComboString[i]->show();
-        }
+        ring->mpComboOffString[i]->show();
+        ring->mpComboOffString[i]->setAlpha((u8)(255.0f * glow));
+        ring->mpBowArrowComboString[i]->show();
+        if (triggerText[i]) triggerText[i]->show();
     }
-    if (!promptOurs) {
-        mDoAud_seStart(Z2SE_SY_ITEM_COMBINE_ICON, nullptr, 0, 0);
-        sparkleFrame = 18.0f - g_ringHIO.mPikariAnimSpeed;  // where the game starts it
-    }
-    promptOurs = true;
-    ring->mPikariFlashingSpeed = sparkleFrame;
     line->show();
 }
 
 static void ring_post(ModContext*, void* args, void*, void*) {
     auto* ring = mods::arg<dMenu_Ring_c*>(args, 0);
-    bool idle = ring->mStatus == dMenu_Ring_c::STATUS_WAIT && !ring->mPlayerIsWolf &&
-                ring->mpItemExplain->getStatus() == 0;
+    if (!combos_on()) return;  // the game's own ring, untouched
+    bool idle = ring_idle(ring);
     u8 slot = ring->mItemSlots[ring->mCurrentSlot];
-    RingAction act = {0, -1, false};
-    if (idle) act = ring_r_action(slot);
-    ring_prompt(ring, act.change);
+    ring_line(ring, idle && any_combo(slot));
     if (!idle) return;
 
-    // putting the boomerang or bow on X or Y by itself splits it, like re-setting the bow does
-    if (mDoCPd_c::getTrigX(PAD_1) || mDoCPd_c::getTrigY(PAD_1)) {
-        u8 picked = dComIfGs_getItem(slot, false);
-        bool split = false;
-        if (picked == dItemNo_BOOMERANG_e && tied_bag() >= 0) {
-            tie_bag(-1);
-            split = true;
-        }
-        if (slot == SLOT_4 && fire_tied()) {
-            tie_fire(false);
-            split = true;
-        }
-        if (split) redraw_buttons();
-        return;
+    // putting the boomerang on X or Y by itself splits the bombs off, like re-setting the bow does
+    bool setButton = mDoCPd_c::getTrigX(PAD_1) || mDoCPd_c::getTrigY(PAD_1);
+    bool trigger = mDoCPd_c::getHoldL(PAD_1) || mDoCPd_c::getHoldR(PAD_1);
+    if (setButton && !trigger && tied_bag() >= 0 && dComIfGs_getItem(slot, false) == dItemNo_BOOMERANG_e) {
+        tie_bag(-1);
+        redraw_buttons();
     }
-
-    if (act.change == 0 || !mDoCPd_c::getTrigR(PAD_1)) return;
-    bool joining = act.change > 0;
-    if (act.fire) tie_fire(joining);
-    else tie_bag(joining ? slot : -1);
-    mDoAud_seStart(joining ? Z2SE_SY_ITEM_COMBINE_ON : Z2SE_SY_ITEM_COMBINE_OFF, nullptr, 0, 0);
-    fly_item_icon(ring, act.button, dComIfGs_getItem(slot, false), joining);
-    redraw_buttons();
 }
 
-// --- the button icons ---
-// Boomerang: the bow-combo layout (bomb picture, then the boomerang where the bow would be).
-// Bow: the bow stays the main picture and the lantern goes in the small picture on top of it.
+// --- the boomerang button icon: the bow-combo layout, with the boomerang where the bow would be ---
 
-static int iconButton = -1;  // boomerang button being redrawn with its bomb
-static int fireIconButton = -1;  // bow button being redrawn with the lantern
+static int iconButton = -1;
 static void* boomerangTex;
 static J2DPicture* boomerangPic;
-static void* lanternTex;
-static J2DPicture* lanternPic;
-static bool paintingSecond;
-
-static bool shows_bow(u8 item) {
-    return item == dItemNo_BOW_e || item == dItemNo_LIGHT_ARROW_e;
-}
+static bool paintingBoomerang;
 
 static HookAction button_icon_pre(ModContext*, void* args, void*, void*) {
     int button = mods::arg<int>(args, 1);
     u8 shown = mods::arg<u8>(args, 2);
     iconButton = shown == dItemNo_BOOMERANG_e && armed_bag() >= 0 ? button : -1;
-    fireIconButton = shows_bow(shown) && fire_button() == button ? button : -1;
     return HOOK_CONTINUE;
 }
 
-static void button_icon_post(ModContext*, void* args, void*, void*) {
-    int fireOn = fireIconButton;
-    iconButton = fireIconButton = -1;
-    if (fireOn < 0 || fireOn > 1) return;
-
-    // the lantern rides small in the top-left corner of the bow
-    auto* hud = mods::arg<dMeter2Draw_c*>(args, 0);
-    J2DPicture* top = hud->mpItemXYPane[fireOn];
-    if (top == nullptr) return;
-    top->show();
-    top->resize(hud->field_0x6c4[fireOn] * 0.5f, hud->field_0x6d0[fireOn] * 0.5f);
+static void button_icon_post(ModContext*, void*, void*, void*) {
+    iconButton = -1;
 }
 
 static HookAction combo_tex_pre(ModContext*, void* args, void*, void*) {
-    boomerangTex = lanternTex = nullptr;
-    if (paintingSecond) return HOOK_CONTINUE;
+    boomerangTex = nullptr;
+    if (iconButton < 0 || paintingBoomerang) return HOOK_CONTINUE;
     u8& item = mods::arg_ref<u8>(args, 1);
     void* second = mods::arg<void*>(args, 4);
-    if (second == nullptr) return HOOK_CONTINUE;
+    if (item != dItemNo_BOOMERANG_e || second == nullptr) return HOOK_CONTINUE;
 
-    if (fireIconButton >= 0 && item == dItemNo_BOW_e) {
-        lanternTex = second;
-        lanternPic = mods::arg<J2DPicture*>(args, 5);
-        return HOOK_CONTINUE;
-    }
-    if (iconButton < 0 || item != dItemNo_BOOMERANG_e) return HOOK_CONTINUE;
     // the bomb arrow icon is the bomb, with the bow drawn in the second picture
     item = dItemNo_BOMB_ARROW_e;
     boomerangTex = second;
@@ -2550,17 +2644,14 @@ static HookAction combo_tex_pre(ModContext*, void* args, void*, void*) {
     return HOOK_CONTINUE;
 }
 
-// paints the second picture once the first is in; the read comes back through the same hook
-static void paint_second(u8 item, void* tex, J2DPicture* pic) {
-    paintingSecond = true;
-    dMeter2Info_readItemTexture(item, tex, pic, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, -1);
-    paintingSecond = false;
-}
-
 static void combo_tex_post(ModContext*, void*, void*, void*) {
-    if (boomerangTex) paint_second(dItemNo_BOOMERANG_e, boomerangTex, boomerangPic);
-    if (lanternTex) paint_second(dItemNo_KANTERA_e, lanternTex, lanternPic);
-    boomerangTex = lanternTex = nullptr;
+    if (boomerangTex == nullptr) return;
+    void* tex = boomerangTex;
+    boomerangTex = nullptr;
+    paintingBoomerang = true;  // this read comes back through the same hook
+    dMeter2Info_readItemTexture(dItemNo_BOOMERANG_e, tex, boomerangPic, nullptr, nullptr, nullptr, nullptr,
+                                nullptr, nullptr, -1);
+    paintingBoomerang = false;
 }
 
 // --- the bomb count, in the same spot the bow shows its arrows ---
@@ -2595,103 +2686,169 @@ static HookAction button_count_pre(ModContext*, void* args, void*, void*) {
     return HOOK_CONTINUE;
 }
 
-// --- the lantern's oil gauge on the fire-arrow bow, up top so it clears the arrow count ---
+// --- the lantern gauge (its little lantern icon and oil bar) on the fire-arrow bow ---
+// The HUD only shows it for the lantern itself; for the bow it's switched on in its usual spot.
 
 DEFINE_HOOK(&dMeter2Draw_c::drawKanteraMeter, ButtonOilGauge);
 
-static int gaugeButton = -1;
-
 static HookAction oil_gauge_pre(ModContext*, void* args, void*, void*) {
     u8 button = mods::arg<u8>(args, 1);
-    gaugeButton = -1;
+    f32& alpha = mods::arg_ref<f32>(args, 2);
+    if (alpha != 0.0f || button > 1 || fire_button() != button) return HOOK_CONTINUE;
     dMeter2_c* meter = dMeter2Info_getMeterClass();
-    if (button > 1 || meter == nullptr || !shows_bow(meter->mItemStatus[button * 2])) return HOOK_CONTINUE;
-    if (fire_button() != button) return HOOK_CONTINUE;
-
-    gaugeButton = button;
-    bool visible = meter->field_0x128 == 0 && dMeter2Info_getMiniGameItemSetFlag() != 1;
-    mods::arg_ref<f32>(args, 2) = visible ? 1.0f : 0.0f;
+    if (meter && meter->field_0x128 == 0 && dMeter2Info_getMiniGameItemSetFlag() != 1) alpha = 1.0f;
     return HOOK_CONTINUE;
 }
 
-static void oil_gauge_post(ModContext*, void* args, void*, void*) {
-    int button = gaugeButton;
-    gaugeButton = -1;
-    if (button < 0) return;
-    auto* hud = mods::arg<dMeter2Draw_c*>(args, 0);
-    J2DPane* bow = hud->mpItemXY[button]->getPanePtr();
-    f32 top = bow->getGlbVtx(0).y;
-    f32 bottom = bow->getGlbVtx(3).y;
-    // the game just pinned it to the bottom edge; lift it by the icon's height, less a little so
-    // it sits just inside the top. Going by the icon's own size keeps it right at any HUD scale
-    CPaneMgr* gauge = hud->mpKanteraMeter[button]->mpParent;
-    f32 lift = (bottom - top) * 0.88f;
-    gauge->translate(gauge->getTranslateX(), gauge->getTranslateY() - lift);
-}
-
 // --- the fire arrows themselves ---
-// An arrow leaving the bow with fire tied on burns 1/20 of a full lantern and gets the lantern
-// swing's fire on its hit (lights torches and candles, burns webs and grass), plus the flame the
-// Bulblins' fire arrows carry. Without enough oil it's just an arrow.
+// An arrow on the fire-arrow bow burns as soon as it's nocked, if there's enough oil for a shot.
+// Leaving the bow it takes 1/20 of a full lantern. While it burns it drags its own patch of
+// lantern fire along its path (the lantern swing's hit: lights torches and candles, burns webs and
+// grass) and lights up what's around it. The flame is the lantern's own, which every area loads.
 
 DEFINE_HOOK(&daArrow_c::execute, ArrowUpdate);
 
+// the lantern swing's fire: no damage of its own, the arrow still does that
+static const dCcD_SrcCps kArrowFireSrc = {
+    {
+        {0x0, {{AT_TYPE_LANTERN_SWING, 0x0, 0x0}, {0x0, 0x0}, 0x0}},
+        {dCcD_SE_NONE, 0x0, 0x0, dCcD_MTRL_FIRE, 0x0},
+        {dCcD_SE_NONE, 0x0, 0x0, 0x0, 0x0},
+        {0x0},
+    },
+    {
+        {{0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f}, 30.0f},
+    },
+};
+
 static const int kArrowMemory = 16;
+
+struct BurningArrow {
+    fpc_ProcID id;
+    u32 flame[2];
+    dCcD_Stts hitOwner;
+    dCcD_Cps hit;
+    cXyz lastTip;
+    bool hitReady;
+    LIGHT_INFLUENCE glow;
+    bool glowing;
+};
+
+static BurningArrow burning[kArrowMemory];
+static int burningNext;
 static fpc_ProcID judgedArrows[kArrowMemory];  // arrows already checked when they were shot
 static int judgedNext;
-static fpc_ProcID burningArrows[kArrowMemory];
-static u32 arrowFlame[kArrowMemory];
-static int burningNext;
 
-static bool remembered(const fpc_ProcID* list, fpc_ProcID id) {
-    for (int i = 0; i < kArrowMemory; i++)
-        if (list[i] == id) return true;
-    return false;
+static u16 fire_arrow_cost() {
+    return dComIfGs_getMaxOil() / 20;
 }
 
-static int burning_index(fpc_ProcID id) {
+static bool can_fire() {
+    u16 cost = fire_arrow_cost();
+    return fire_button() >= 0 && cost > 0 && dComIfGs_getOil() >= cost;
+}
+
+static void put_out(BurningArrow& fire) {
+    if (fire.glowing) dKy_plight_cut(&fire.glow);
+    fire.glowing = false;
+    fire.hitReady = false;
+    fire.id = fpcM_ERROR_PROCESS_ID_e;
+}
+
+static int find_burning(fpc_ProcID id) {
     for (int i = 0; i < kArrowMemory; i++)
-        if (burningArrows[i] == id) return i;
+        if (burning[i].id == id) return i;
     return -1;
 }
 
-// the first frame a normal arrow flies: light it if the bow's tied to the lantern and there's oil
-static void judge_arrow(daArrow_c* arrow, fpc_ProcID id) {
-    judgedArrows[judgedNext] = id;
-    judgedNext = (judgedNext + 1) % kArrowMemory;
-    if (arrow->mArrowType != 0 || fire_button() < 0) return;
-
-    u16 cost = dComIfGs_getMaxOil() / 20;
-    u16 oil = dComIfGs_getOil();
-    if (oil < cost || cost == 0) return;
-    dComIfGs_setOil(oil - cost);
-
-    burningArrows[burningNext] = id;
-    arrowFlame[burningNext] = 0;
+static int light_arrow(daArrow_c* arrow, const cXyz& tip) {
+    int at = burningNext;
     burningNext = (burningNext + 1) % kArrowMemory;
+    BurningArrow& fire = burning[at];
+    put_out(fire);  // the oldest one makes room
+    fire.id = fopAcM_GetID(arrow);
+    fire.flame[0] = fire.flame[1] = 0;
+    fire.lastTip = tip;
+    fire.hitOwner.Init(0xFF, 0xFF, arrow);
+    fire.hit.Set(kArrowFireSrc);
+    fire.hit.SetStts(&fire.hitOwner);
+    fire.hitReady = true;
+
+    // a warm orange glow, about as strong as the lantern's
+    fire.glow.mPosition = tip;
+    fire.glow.mColor.r = 255;
+    fire.glow.mColor.g = 140;
+    fire.glow.mColor.b = 60;
+    fire.glow.mPow = 400.0f;
+    fire.glow.mFluctuation = 0.0f;
+    dKy_plight_set(&fire.glow);
+    fire.glowing = true;
+    return at;
+}
+
+static bool was_judged(fpc_ProcID id) {
+    for (int i = 0; i < kArrowMemory; i++)
+        if (judgedArrows[i] == id) return true;
+    return false;
 }
 
 static void arrow_post(ModContext*, void* args, void*, void*) {
     auto* arrow = mods::arg<daArrow_c*>(args, 0);
+    if (arrow->mArrowType != 0) return;  // bomb, light and slingshot shots stay as they are
     fpc_ProcID id = fopAcM_GetID(arrow);
+    bool nocked = arrow->mProcFunc == &daArrow_c::procWait;
     bool flying = arrow->mProcFunc == &daArrow_c::procMove;
-    if (flying && !remembered(judgedArrows, id)) judge_arrow(arrow, id);
 
-    int fire = burning_index(id);
-    if (fire < 0) return;
-    if (flying) {
-        // re-applied every frame, the arrow rebuilds its hit shape as it goes
-        arrow->field_0x688.SetAtMtrl(dCcD_MTRL_FIRE);
-        arrow->field_0x688.SetAtType(AT_TYPE_ARROW | AT_TYPE_LANTERN_SWING);
-    }
-
-    // flame on the tip, kept burning where it sticks
-    cXyz tip(0.0f, 0.0f, 20.0f);
-    cXyz flame;
+    // the burning tip, a little ahead of the arrow's middle
+    cXyz ahead(0.0f, 0.0f, 20.0f);
+    cXyz tip;
     mDoMtx_stack_c::transS(arrow->current.pos);
     mDoMtx_stack_c::ZXYrotM(arrow->shape_angle);
-    mDoMtx_stack_c::multVec(&tip, &flame);
-    arrowFlame[fire] = dComIfGp_particle_set(arrowFlame[fire], 0x8113, &flame, &arrow->shape_angle, nullptr);
+    mDoMtx_stack_c::multVec(&ahead, &tip);
+
+    int fire = find_burning(id);
+    // nocked: burns while there's oil for a shot, goes out if there isn't
+    if (nocked) {
+        if (fire < 0 && can_fire()) fire = light_arrow(arrow, tip);
+        if (fire >= 0 && !can_fire()) {
+            put_out(burning[fire]);
+            fire = -1;
+        }
+    }
+    // the shot: pays for the flame (or lights one it didn't have yet), once
+    if (flying && !was_judged(id)) {
+        judgedArrows[judgedNext] = id;
+        judgedNext = (judgedNext + 1) % kArrowMemory;
+        if (fire < 0 && can_fire()) fire = light_arrow(arrow, tip);
+        if (fire >= 0) dComIfGp_setItemOilCount(-fire_arrow_cost());
+    }
+    if (fire < 0) return;
+    BurningArrow& f = burning[fire];
+
+    // the fire hit follows the arrow from where the tip was last frame, and stays on it once stuck
+    if (!nocked && f.hitReady) {
+        static_cast<cM3dGCps*>(&f.hit)->Set(f.lastTip, tip, 30.0f);
+        f.hit.CalcAtVec();
+        dComIfG_Ccsp()->Set(&f.hit);
+    }
+    f.lastTip = tip;
+    f.glow.mPosition = tip;
+
+    static const u16 kLanternFlame[2] = {0x3AF, 0x3AD};
+    for (int i = 0; i < 2; i++)
+        f.flame[i] = dComIfGp_particle_set(f.flame[i], kLanternFlame[i], &tip, &arrow->shape_angle, nullptr);
+}
+
+// once a frame: arrows that are gone take their light with them
+static void fire_arrow_tick() {
+    for (int i = 0; i < kArrowMemory; i++) {
+        if (burning[i].id == fpcM_ERROR_PROCESS_ID_e || burning[i].id == 0) continue;
+        if (fopAcM_SearchByID(burning[i].id) == nullptr) put_out(burning[i]);
+    }
+}
+
+static void fire_arrow_shutdown() {
+    for (int i = 0; i < kArrowMemory; i++) put_out(burning[i]);
 }
 
 // --- the throw ---
@@ -2759,22 +2916,16 @@ static void galebomb_exec_post(ModContext*, void* args, void*, void*) {
 // once a frame: untie when the bombs run out, the boomerang leaves both buttons or the kind is switched off
 static void galebomb_tick() {
     static int wasArmed = -2;
-    static int wasFire = -2;
     int armed = armed_bag();
     if (armed < 0 && tied_bag() >= 0) tie_bag(-1);  // armed_bag already says why: empty, off or no boomerang
-
-    // fire arrows split the same way: the plain bow left X/Y, no lantern, or switched off
-    int fire = fire_button();
-    if (fire < 0 && fire_tied()) tie_fire(false);
 
     // have the temple bombling art ready before the throw, not on it
     bool bomblings = armed >= 0 && bomb_kind(dComIfGs_getItem(armed, false)) == 2;
     if (bomblings) bombling_art_ready();
     else drop_bombling_art();
 
-    if (armed != wasArmed || fire != wasFire) redraw_buttons();
+    if (armed != wasArmed) redraw_buttons();
     wasArmed = armed;
-    wasFire = fire;
 }
 
 // ======================== Unarmed Combat ========================
@@ -3259,6 +3410,7 @@ static void check_button(ModContext*, void*) {
 
 // greyed-out rules for rows that depend on another toggle
 static bool leaf_off(ModContext*, void*) { return !cfgOn(vLeaf); }
+static bool combos_off(ModContext*, void*) { return !combos_on(); }
 static bool bash_off(ModContext*, void*) { return !cfgOn(vBash, true); }
 static bool swing_off(ModContext*, void*) { return !cfgOn(vSwing, true); }
 
@@ -3348,12 +3500,13 @@ static void item_rows() {
     toggle("RT Speed Boost Cheat", vBoost, leaf_off);
 
     heading("Item Combinations");
+    toggle("Enable Combinations", vCombos);
     note("Gale-Bomb Combo");
-    toggle("Gale Boomerang + Bombs", galeBombToggle[0]);
-    toggle("Gale Boomerang + Water Bombs", galeBombToggle[1]);
-    toggle("Gale Boomerang + Bomblings", galeBombToggle[2]);
+    toggle("Gale Boomerang + Bombs", galeBombToggle[0], combos_off);
+    toggle("Gale Boomerang + Water Bombs", galeBombToggle[1], combos_off);
+    toggle("Gale Boomerang + Bomblings", galeBombToggle[2], combos_off);
     note("Fire Arrows");
-    toggle("Bow + Lantern", vFireArrows);
+    toggle("Bow + Lantern", vFireArrows, combos_off);
 }
 
 static const char* const tabTitles[3] = {"Quality of Life", "Combat", "Items"};
@@ -3584,22 +3737,28 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     bool flourishOk = pre_hook(Exec, flourish_exec_pre) && post_hook(Exec, flourish_exec_post);
     if (!flourishOk) mods::log::warn("sword flourish stays at the game's normal behaviour");
 
-    // --- Gale-Bomb Combo ---
+    // --- Item Combinations ---
+    add_bool_option("itemCombinations", true, &vCombos);
     add_bool_option("galeBombs", true, &galeBombToggle[0]);
     add_bool_option("galeWaterBombs", true, &galeBombToggle[1]);
     add_bool_option("galeBomblings", true, &galeBombToggle[2]);
-    if (!pre_hook(RingMove, ring_pre) || !post_hook(RingMove, ring_post))
-        mods::log::warn("can't tie bombs to the boomerang in the item ring");
+    add_bool_option("fireArrows", true, &vFireArrows);
+
+    // the item ring: who combines with what, and the line that says so
+    bool ringOk = post_hook(RingMove, ring_post) && pre_hook(RingCursor, ring_buttons_pre);
+    ringOk = ringOk && pre_hook(RingMixItem, lantern_poses) && post_hook(RingMixItem, lantern_back_after_mix);
+    ringOk = ringOk && post_hook(RingOpen, ring_opened);
+    if (!ringOk) mods::log::warn("item ring combining stays as the game has it");
+
+    // Gale-Bomb
     bool iconOk = pre_hook(ButtonIcon, button_icon_pre) && post_hook(ButtonIcon, button_icon_post);
     iconOk = iconOk && pre_hook(ReadTex, combo_tex_pre) && post_hook(ReadTex, combo_tex_post);
     if (!iconOk) mods::log::warn("the boomerang button won't show the little bomb");
     if (!post_hook(Exec, galebomb_exec_post)) mods::log::warn("thrown boomerangs won't carry bombs");
     if (!pre_hook(ButtonCount, button_count_pre)) mods::log::warn("no bomb count on the boomerang button");
 
-    // --- Fire Arrows ---
-    add_bool_option("fireArrows", true, &vFireArrows);
-    if (!pre_hook(ButtonOilGauge, oil_gauge_pre) || !post_hook(ButtonOilGauge, oil_gauge_post))
-        mods::log::warn("no oil gauge on the fire-arrow bow");
+    // Fire Arrows
+    if (!pre_hook(ButtonOilGauge, oil_gauge_pre)) mods::log::warn("no oil gauge on the fire-arrow bow");
     if (!post_hook(ArrowUpdate, arrow_post)) mods::log::warn("arrows won't catch fire");
 
     settings_init();
@@ -3618,6 +3777,7 @@ MOD_EXPORT ModResult mod_update(ModError*) {
     bridge_tick();
     shop_update();
     galebomb_tick();
+    fire_arrow_tick();
     return MOD_OK;
 }
 
@@ -3629,6 +3789,7 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
     if (iconRes.data) svc_resource->free(mod_ctx, &iconRes);
     shop_shutdown();
     drop_bombling_art();
+    fire_arrow_shutdown();
     return MOD_OK;
 }
 
