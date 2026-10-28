@@ -2599,8 +2599,6 @@ static HookAction button_count_pre(ModContext*, void* args, void*, void*) {
 
 DEFINE_HOOK(&dMeter2Draw_c::drawKanteraMeter, ButtonOilGauge);
 
-f32 dGetUserHudScale();  // the game's own HUD scale setting, the gauge is placed with it
-
 static int gaugeButton = -1;
 
 static HookAction oil_gauge_pre(ModContext*, void* args, void*, void*) {
@@ -2622,12 +2620,13 @@ static void oil_gauge_post(ModContext*, void* args, void*, void*) {
     if (button < 0) return;
     auto* hud = mods::arg<dMeter2Draw_c*>(args, 0);
     J2DPane* bow = hud->mpItemXY[button]->getPanePtr();
-    Vec topLeft = bow->getGlbVtx(0);
-    Vec bottomRight = bow->getGlbVtx(3);
-    f32 hudScale = dGetUserHudScale();
-    // same x the game uses, moved from the bottom edge to just inside the top
-    f32 x = (topLeft.x + bottomRight.x) * 0.5f + 9.0f * hudScale;
-    hud->mpKanteraMeter[button]->setPos(x, topLeft.y + 6.0f * hudScale);
+    f32 top = bow->getGlbVtx(0).y;
+    f32 bottom = bow->getGlbVtx(3).y;
+    // the game just pinned it to the bottom edge; lift it by the icon's height, less a little so
+    // it sits just inside the top. Going by the icon's own size keeps it right at any HUD scale
+    CPaneMgr* gauge = hud->mpKanteraMeter[button]->mpParent;
+    f32 lift = (bottom - top) * 0.88f;
+    gauge->translate(gauge->getTranslateX(), gauge->getTranslateY() - lift);
 }
 
 // --- the fire arrows themselves ---
