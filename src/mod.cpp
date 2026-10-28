@@ -2358,7 +2358,7 @@ static void redraw_buttons() {
 // (Same trick baxlek's Fire Arrows mod uses.)
 
 DEFINE_HOOK(&dMenu_Ring_c::setMixItem, RingMixItem);
-DEFINE_HOOK(&dMenu_Ring_c::setActiveCursor, RingCursor);
+
 
 static int lanternPosing = -1;  // slot holding the Hawkeye in place of the lantern, -1 if none
 
@@ -2461,82 +2461,53 @@ static bool ring_idle(dMenu_Ring_c* ring) {
            ring->mpItemExplain->getStatus() == 0;
 }
 
-// runs before the ring reads X/Y/R for this frame
-static HookAction ring_buttons_pre(ModContext*, void* args, void*, void*) {
-    auto* ring = mods::arg<dMenu_Ring_c*>(args, 0);
-    if (!combos_on() || !ring_idle(ring)) return HOOK_CONTINUE;
+// The ring reads X/Y/R inside its own update (setActiveCursor runs inline there), so the presses
+// we handle are taken out of this frame's pad state before it looks, and put back after.
+static const u32 kComboButtons = PAD_BUTTON_X | PAD_BUTTON_Y | PAD_TRIGGER_L | PAD_TRIGGER_R;
+static u32 heldBackPresses;
 
-    bool trigger = mDoCPd_c::getHoldL(PAD_1) || mDoCPd_c::getHoldR(PAD_1);
-    bool x = mDoCPd_c::getTrigX(PAD_1) != 0;
-    bool y = mDoCPd_c::getTrigY(PAD_1) != 0;
-    if (trigger && (x || y)) {
-        combine_onto(ring, x ? 0 : 1);
-        return HOOK_SKIP_ORIGINAL;  // no setting the item on that button as well
-    }
-    // a trigger on its own does nothing now
-    if (mDoCPd_c::getTrigR(PAD_1) || mDoCPd_c::getTrigL(PAD_1)) return HOOK_SKIP_ORIGINAL;
-    return HOOK_CONTINUE;
+static void hold_back_presses(u32 which) {
+    interface_of_controller_pad& pad = mDoCPd_c::getCpadInfo(PAD_1);
+    heldBackPresses = pad.mPressedButtonFlags & which;
+    pad.mPressedButtonFlags &= ~which;
+}
+
+static void give_back_presses() {
+    mDoCPd_c::getCpadInfo(PAD_1).mPressedButtonFlags |= heldBackPresses;
+    heldBackPresses = 0;
 }
 
 // --- the ring's combine line ---
+//           [LT] / RT
+// Combine
+//           (+ Select Button)
+// "Combine" stays where the game puts its line, level with the middle of the trigger icon. The
+// icon and "/ RT" go up half a row and "(+ Select Button)" half a row down, lined up with the
+// icon's left edge. Positions are measured off the panes that are already on screen ("Combine"
+// and the icon), once the line has been drawn, and the other text is placed from those.
 
-static dMenu_Ring_c* dressedRing;  // the ring whose line we have already rewritten
+static dMenu_Ring_c* dressedRing;  // the ring whose line has its new words
+static dMenu_Ring_c* laidOutRing;  // ...and whose line has been moved into place
+static int lineShownFrames;
+static J2DTextBox* triggerText[5];  // "/ RT", made from the line's unused language copy
+static JUtility::TColor wordWhite[5], wordBlack[5];
+static int pulse;
 
 // a freshly opened ring has the game's own words again, even if it lands at the same address
 DEFINE_HOOK(&dMenu_Ring_c::_create, RingOpen);
 static void ring_opened(ModContext*, void*, void*, void*) {
-    dressedRing = nullptr;
+    dressedRing = laidOutRing = nullptr;
+    lineShownFrames = 0;
 }
-static J2DTextBox* triggerText[5];  // "/ RT", made from the line's unused language copy
-static int pulse;
 
 static J2DPane* ring_pane(dMenu_Ring_c* ring, u64 tag) {
     return ring->mpScreen->search(tag);
 }
 
-// moves a pane by a distance measured on screen, whatever scale its parents give it
-static void nudge(J2DPane* pane, f32 screenX, f32 screenY) {
-    Vec a = pane->getGlbVtx(0);
-    Vec b = pane->getGlbVtx(3);
-    f32 w = pane->getWidth(), h = pane->getHeight();
-    f32 sx = w != 0.0f ? (b.x - a.x) / w : 1.0f;
-    f32 sy = h != 0.0f ? (b.y - a.y) / h : 1.0f;
-    if (sx == 0.0f) sx = 1.0f;
-    if (sy == 0.0f) sy = 1.0f;
-    pane->translate(pane->getTranslateX() + screenX / sx, pane->getTranslateY() + screenY / sy);
-}
-
-// Layout, on two rows to the right of "Combine":
-//   Combine   [LT] / RT
-//             (+ Select Button)
-// "Combine" stays where the game put its line, which is level with the middle of the trigger icon;
-// the icon and "/ RT" move up half a row and "(+ Select Button)" sits half a row below, lined up
-// with the icon's left edge, so "Combine" ends up halfway between the two rows.
-static void dress_ring_line(dMenu_Ring_c* ring) {
+static void dress_ring_words(dMenu_Ring_c* ring) {
     if (dressedRing == ring) return;
     dressedRing = ring;
 
-    for (int i = 0; i < 5; i++) {
-        ring->mpComboOffString[i]->setString("Combine");
-        ring->mpBowArrowComboString[i]->setString("(+ Select Button)");
-    }
-
-    J2DPane* icon = ring_pane(ring, MULTI_CHAR('gr_btn'));
-    J2DTextBox* word = ring->mpComboOffString[0];
-    f32 row = word->getGlbVtx(3).y - word->getGlbVtx(0).y;  // one line of the ring's text
-    Vec wordTop = word->getGlbVtx(0);
-
-    // where the icon is now, before it moves
-    f32 iconLeft = wordTop.x, iconRight = wordTop.x, iconMiddle = wordTop.y + row * 0.5f;
-    if (icon) {
-        iconLeft = icon->getGlbVtx(0).x;
-        iconRight = icon->getGlbVtx(3).x;
-        iconMiddle = (icon->getGlbVtx(0).y + icon->getGlbVtx(3).y) * 0.5f;
-    }
-    f32 upperMiddle = iconMiddle - row * 0.5f;
-    f32 lowerMiddle = iconMiddle + row * 0.5f;
-
-    // "/ RT" after the trigger icon, using whichever language copy of the line the ring hid
     static const u64 jpLine[5] = {MULTI_CHAR('gr_t_on'), MULTI_CHAR('g_tof_s5'), MULTI_CHAR('g_tof_s6'),
                                   MULTI_CHAR('g_tof_s7'), MULTI_CHAR('g_tof_s8')};
     static const u64 enLine[5] = {MULTI_CHAR('fr_t_on'), MULTI_CHAR('f_tof_s5'), MULTI_CHAR('f_tof_s6'),
@@ -2545,34 +2516,65 @@ static void dress_ring_line(dMenu_Ring_c* ring) {
     const u64* spare = englishShown ? jpLine : enLine;
 
     for (int i = 0; i < 5; i++) {
-        J2DTextBox* model = ring->mpComboOffString[i];
-        // each layer keeps its little offset from the top one (they're the text's shadow)
-        f32 shadowX = model->getGlbVtx(0).x - wordTop.x;
-        f32 shadowY = model->getGlbVtx(0).y - wordTop.y;
+        J2DTextBox* word = ring->mpComboOffString[i];
+        J2DTextBox* under = ring->mpBowArrowComboString[i];
+        word->setString("Combine");
+        under->setString("(+ Select Button)");
+        wordWhite[i] = word->getWhite();
+        wordBlack[i] = word->getBlack();
+
         J2DTextBox::TFontSize size;
-        model->getFontSize(size);
+        word->getFontSize(size);
+        under->setFontSize(size.mSizeX * 0.7f, size.mSizeY * 0.7f);
+        under->resize(word->getWidth() * 1.6f, word->getHeight());
 
         triggerText[i] = static_cast<J2DTextBox*>(ring_pane(ring, spare[i]));
-        if (triggerText[i]) {
-            J2DTextBox* rt = triggerText[i];
-            rt->setFont(mDoExt_getMesgFont());
-            rt->setFontSize(size);
-            rt->setBlackWhite(model->getBlack(), model->getWhite());
-            rt->resize(model->getWidth(), model->getHeight());
-            rt->setString("/ RT");
-            Vec at = rt->getGlbVtx(0);
-            nudge(rt, iconRight + 6.0f + shadowX - at.x, upperMiddle - row * 0.5f + shadowY - at.y);
-            rt->show();
-        }
-
-        J2DTextBox* under = ring->mpBowArrowComboString[i];
-        under->setFontSize(size.mSizeX * 0.7f, size.mSizeY * 0.7f);
-        under->resize(model->getWidth() * 1.6f, model->getHeight());
-        Vec at = under->getGlbVtx(0);
-        nudge(under, iconLeft + shadowX - at.x, lowerMiddle - row * 0.5f + shadowY - at.y);
+        if (triggerText[i] == nullptr) continue;
+        triggerText[i]->setFont(mDoExt_getMesgFont());
+        triggerText[i]->setFontSize(size);
+        triggerText[i]->setBlackWhite(wordBlack[i], wordWhite[i]);
+        triggerText[i]->resize(word->getWidth(), word->getHeight());
+        triggerText[i]->setString("/ RT");
     }
+}
 
-    if (icon) nudge(icon, 0.0f, upperMiddle - iconMiddle);
+// puts `pane` at a spot given relative to `anchor`'s top-left, in `anchor`'s own units
+static void place_beside(J2DPane* pane, J2DPane* anchor, f32 dx, f32 dy) {
+    pane->translate(anchor->getTranslateX() + dx, anchor->getTranslateY() + dy);
+}
+
+static void lay_out_ring_line(dMenu_Ring_c* ring) {
+    if (laidOutRing == ring) return;
+    J2DPane* icon = ring_pane(ring, MULTI_CHAR('gr_btn'));
+    J2DTextBox* word = ring->mpComboOffString[0];
+    if (icon == nullptr) return;
+
+    // screen size of one of the word's own units, so screen distances can be turned back
+    Vec wTop = word->getGlbVtx(0);
+    Vec wBottom = word->getGlbVtx(3);
+    f32 unitX = word->getWidth() > 0.0f ? (wBottom.x - wTop.x) / word->getWidth() : 0.0f;
+    f32 unitY = word->getHeight() > 0.0f ? (wBottom.y - wTop.y) / word->getHeight() : 0.0f;
+    if (unitX <= 0.0f || unitY <= 0.0f) return;  // not drawn yet, try again next frame
+    laidOutRing = ring;
+
+    Vec iTop = icon->getGlbVtx(0);
+    Vec iBottom = icon->getGlbVtx(3);
+    f32 row = wBottom.y - wTop.y;
+    f32 iconMiddle = (iTop.y + iBottom.y) * 0.5f;
+
+    // in the word's units, from the word's top-left
+    f32 rtX = (iBottom.x + 6.0f - wTop.x) / unitX;
+    f32 rtY = (iconMiddle - row - wTop.y) / unitY;            // half a row above the middle
+    f32 underX = (iTop.x - wTop.x) / unitX;
+    f32 underY = (iconMiddle - wTop.y) / unitY;               // half a row below it
+
+    for (int i = 0; i < 5; i++) {
+        J2DTextBox* layer = ring->mpComboOffString[i];  // each shadow layer keeps its own offset
+        if (triggerText[i]) place_beside(triggerText[i], layer, rtX, rtY);
+        place_beside(ring->mpBowArrowComboString[i], layer, underX, underY);
+    }
+    f32 iconUnitY = icon->getHeight() > 0.0f ? (iBottom.y - iTop.y) / icon->getHeight() : unitY;
+    icon->translate(icon->getTranslateX(), icon->getTranslateY() - (row * 0.5f) / iconUnitY);
 }
 
 static void ring_line(dMenu_Ring_c* ring, bool show) {
@@ -2581,21 +2583,52 @@ static void ring_line(dMenu_Ring_c* ring, bool show) {
     ring->mPikariFlashingSpeed = 0.0f;  // no sparkle; the word pulses instead
     if (!show) {
         line->hide();
+        lineShownFrames = 0;
         return;
     }
-    dress_ring_line(ring);
+    dress_ring_words(ring);
+    if (++lineShownFrames > 2) lay_out_ring_line(ring);  // measured after it's been drawn
+
+    // the pulse goes through the text's colours; the menu sets the panes' own alpha every draw
     pulse++;
-    f32 glow = 0.55f + 0.45f * cM_scos((s16)(pulse * 0x500));
+    f32 glow = 0.45f + 0.55f * (0.5f + 0.5f * cM_scos((s16)(pulse * 0x480)));
     for (int i = 0; i < 5; i++) {
+        JUtility::TColor white = wordWhite[i];
+        JUtility::TColor black = wordBlack[i];
+        white.a = (u8)(wordWhite[i].a * glow);
+        black.a = (u8)(wordBlack[i].a * glow);
+        ring->mpComboOffString[i]->setBlackWhite(black, white);
         ring->mpComboOffString[i]->show();
-        ring->mpComboOffString[i]->setAlpha((u8)(255.0f * glow));
         ring->mpBowArrowComboString[i]->show();
         if (triggerText[i]) triggerText[i]->show();
     }
     line->show();
 }
 
+// before the ring's update: LT/RT + X/Y combines, a trigger alone does nothing
+static HookAction ring_pre(ModContext*, void* args, void*, void*) {
+    auto* ring = mods::arg<dMenu_Ring_c*>(args, 0);
+    heldBackPresses = 0;
+    if (!combos_on() || !ring_idle(ring)) return HOOK_CONTINUE;
+
+    bool trigger = mDoCPd_c::getHoldL(PAD_1) || mDoCPd_c::getHoldR(PAD_1);
+    bool x = mDoCPd_c::getTrigX(PAD_1) != 0;
+    bool y = mDoCPd_c::getTrigY(PAD_1) != 0;
+    if (trigger && (x || y)) {
+        int b = x ? 0 : 1;
+        u8 slot = ring->mItemSlots[ring->mCurrentSlot];
+        mods::log::info("combine: slot {} item {} onto button {} -> {}", slot, dComIfGs_getItem(slot, false), b,
+                        combo_change(slot, b));
+        combine_onto(ring, b);
+        hold_back_presses(kComboButtons);  // so the ring doesn't also put the item on that button
+        return HOOK_CONTINUE;
+    }
+    if (mDoCPd_c::getTrigL(PAD_1) || mDoCPd_c::getTrigR(PAD_1)) hold_back_presses(PAD_TRIGGER_L | PAD_TRIGGER_R);
+    return HOOK_CONTINUE;
+}
+
 static void ring_post(ModContext*, void* args, void*, void*) {
+    give_back_presses();
     auto* ring = mods::arg<dMenu_Ring_c*>(args, 0);
     if (!combos_on()) return;  // the game's own ring, untouched
     bool idle = ring_idle(ring);
@@ -2914,17 +2947,34 @@ static void galebomb_exec_post(ModContext*, void* args, void*, void*) {
 }
 
 // once a frame: untie when the bombs run out, the boomerang leaves both buttons or the kind is switched off
+// a new HUD (after a warp, a load or a stage change) starts blank: our bomb and count need
+// writing onto it again for a few frames while it settles
+DEFINE_HOOK(&dMeter2_c::_create, HudCreate);
+static int hudFreshFrames;
+
+static void hud_created(ModContext*, void*, void*, void*) {
+    hudFreshFrames = 5;
+}
+
 static void galebomb_tick() {
     static int wasArmed = -2;
     int armed = armed_bag();
-    if (armed < 0 && tied_bag() >= 0) tie_bag(-1);  // armed_bag already says why: empty, off or no boomerang
+    // only untie with Link actually in play; mid-load the buttons can read empty for a moment
+    bool inPlay = daAlink_getAlinkActorClass() != nullptr;
+    if (inPlay && armed < 0 && tied_bag() >= 0) tie_bag(-1);  // armed_bag says why: empty, off or no boomerang
 
     // have the temple bombling art ready before the throw, not on it
     bool bomblings = armed >= 0 && bomb_kind(dComIfGs_getItem(armed, false)) == 2;
     if (bomblings) bombling_art_ready();
     else drop_bombling_art();
 
-    if (armed != wasArmed) redraw_buttons();
+    if (hudFreshFrames > 0) {
+        hudFreshFrames--;
+        countShown[0] = countShown[1] = -1;
+        redraw_buttons();
+    } else if (armed != wasArmed) {
+        redraw_buttons();
+    }
     wasArmed = armed;
 }
 
@@ -3745,7 +3795,7 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     add_bool_option("fireArrows", true, &vFireArrows);
 
     // the item ring: who combines with what, and the line that says so
-    bool ringOk = post_hook(RingMove, ring_post) && pre_hook(RingCursor, ring_buttons_pre);
+    bool ringOk = pre_hook(RingMove, ring_pre) && post_hook(RingMove, ring_post);
     ringOk = ringOk && pre_hook(RingMixItem, lantern_poses) && post_hook(RingMixItem, lantern_back_after_mix);
     ringOk = ringOk && post_hook(RingOpen, ring_opened);
     if (!ringOk) mods::log::warn("item ring combining stays as the game has it");
@@ -3756,6 +3806,7 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     if (!iconOk) mods::log::warn("the boomerang button won't show the little bomb");
     if (!post_hook(Exec, galebomb_exec_post)) mods::log::warn("thrown boomerangs won't carry bombs");
     if (!pre_hook(ButtonCount, button_count_pre)) mods::log::warn("no bomb count on the boomerang button");
+    if (!post_hook(HudCreate, hud_created)) mods::log::warn("combo icons may need a menu open after warping");
 
     // Fire Arrows
     if (!pre_hook(ButtonOilGauge, oil_gauge_pre)) mods::log::warn("no oil gauge on the fire-arrow bow");
