@@ -2301,6 +2301,14 @@ static void fly_bomb_icon(dMenu_Ring_c* ring, int button, u8 bombItem, bool onto
 }
 
 static bool promptOurs;  // we're the ones showing the combine line in the ring
+// the sparkle's speed field is really its running frame; the game zeroes it every frame it isn't
+// showing its own line, so ours is carried across from before the ring's update
+static f32 sparkleFrame;
+
+static HookAction ring_pre(ModContext*, void* args, void*, void*) {
+    sparkleFrame = mods::arg<dMenu_Ring_c*>(args, 0)->mPikariFlashingSpeed;
+    return HOOK_CONTINUE;
+}
 
 // the ring's "combine" line: shown the same way setMixMessage does it for the bow
 static void ring_prompt(dMenu_Ring_c* ring, int action) {
@@ -2319,9 +2327,12 @@ static void ring_prompt(dMenu_Ring_c* ring, int action) {
             ring->mpBowArrowComboString[i]->show();
         }
     }
-    if (!promptOurs) mDoAud_seStart(Z2SE_SY_ITEM_COMBINE_ICON, nullptr, 0, 0);
+    if (!promptOurs) {
+        mDoAud_seStart(Z2SE_SY_ITEM_COMBINE_ICON, nullptr, 0, 0);
+        sparkleFrame = 18.0f - g_ringHIO.mPikariAnimSpeed;  // where the game starts it
+    }
     promptOurs = true;
-    ring->mPikariFlashingSpeed = 18.0f - g_ringHIO.mPikariAnimSpeed;
+    ring->mPikariFlashingSpeed = sparkleFrame;
     line->show();
 }
 
@@ -2364,37 +2375,43 @@ static HookAction button_icon_pre(ModContext*, void* args, void*, void*) {
 }
 
 // the bomb picture comes in full size; shrink it into the top-left corner like the bow's bomb
+// The button's own picture stays the boomerang at full size. The bomb goes in the small picture
+// the HUD keeps on top of it (the one the bow combo uses), which starts out the same size, so it's
+// shrunk into the top-left corner once the button has finished redrawing.
 static void button_icon_post(ModContext*, void* args, void*, void*) {
     int button = iconButton;
     iconButton = -1;
     if (button < 0 || button > 1) return;
     auto* hud = mods::arg<dMeter2Draw_c*>(args, 0);
-    if (hud->mpItemXY[button] == nullptr) return;
-    hud->mpItemXY[button]->resize(hud->field_0x6c4[button] * 0.55f, hud->field_0x6d0[button] * 0.55f);
+    J2DPicture* topPic = hud->mpItemXYPane[button];
+    if (topPic == nullptr) return;
+    topPic->resize(hud->field_0x6c4[button] * 0.55f, hud->field_0x6d0[button] * 0.55f);
 }
 
 static HookAction combo_tex_pre(ModContext*, void* args, void*, void*) {
     boomerangTex = nullptr;
     if (iconButton < 0 || paintingBoomerang) return HOOK_CONTINUE;
-    u8& item = mods::arg_ref<u8>(args, 1);
+    u8 item = mods::arg<u8>(args, 1);
     void* second = mods::arg<void*>(args, 4);
     if (item != dItemNo_BOOMERANG_e || second == nullptr) return HOOK_CONTINUE;
-
-    // the bomb arrow icon is the small bomb, with the bow drawn in the second picture
-    item = dItemNo_BOMB_ARROW_e;
-    boomerangTex = second;
+    boomerangTex = second;  // where the bomb will go once the boomerang is in
     boomerangPic = mods::arg<J2DPicture*>(args, 5);
     return HOOK_CONTINUE;
 }
 
-static void combo_tex_post(ModContext*, void*, void*, void*) {
+static void combo_tex_post(ModContext*, void*, void* drawn, void*) {
     if (boomerangTex == nullptr) return;
     void* tex = boomerangTex;
     boomerangTex = nullptr;
+    int slot = armed_bag();
+    if (slot < 0) return;
+
     paintingBoomerang = true;  // this read comes back through the same hook
-    dMeter2Info_readItemTexture(dItemNo_BOOMERANG_e, tex, boomerangPic, nullptr, nullptr, nullptr, nullptr,
-                                nullptr, nullptr, -1);
+    int got = dMeter2Info_readItemTexture(dComIfGs_getItem(slot, false), tex, boomerangPic, nullptr, nullptr,
+                                          nullptr, nullptr, nullptr, nullptr, -1);
     paintingBoomerang = false;
+    // two pictures now, so the HUD shows the top one instead of hiding it
+    if (got > 0 && drawn) *static_cast<int*>(drawn) = 2;
 }
 
 // --- the bomb count, in the same spot the bow shows its arrows ---
@@ -3304,7 +3321,8 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     add_bool_option("galeBombs", true, &galeBombToggle[0]);
     add_bool_option("galeWaterBombs", true, &galeBombToggle[1]);
     add_bool_option("galeBomblings", true, &galeBombToggle[2]);
-    if (!post_hook(RingMove, ring_post)) mods::log::warn("can't tie bombs to the boomerang in the item ring");
+    if (!pre_hook(RingMove, ring_pre) || !post_hook(RingMove, ring_post))
+        mods::log::warn("can't tie bombs to the boomerang in the item ring");
     bool iconOk = pre_hook(ButtonIcon, button_icon_pre) && post_hook(ButtonIcon, button_icon_post);
     iconOk = iconOk && pre_hook(ReadTex, combo_tex_pre) && post_hook(ReadTex, combo_tex_post);
     if (!iconOk) mods::log::warn("the boomerang button won't show the little bomb");
