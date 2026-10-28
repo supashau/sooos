@@ -28,17 +28,24 @@
 #include "d/actor/d_a_alink.h"
 #include "d/actor/d_a_bg.h"
 #include "d/actor/d_a_bg_obj.h"
+#include "d/actor/d_a_boomerang.h"
 #include "d/actor/d_a_horse.h"
 #include "d/actor/d_a_kytag08.h"
+#include "d/actor/d_a_nbomb.h"
 #include "d/actor/d_a_obj_iceleaf.h"
 #include "d/actor/d_a_tag_shop_item.h"
 #include "d/d_a_shop_item_static.h"
+#include "d/d_bomb.h"
 #include "d/d_cc_uty.h"
 #include "d/d_com_inf_game.h"
 #include "d/d_item_data.h"
 #include "d/d_kankyo.h"
 #include "d/d_map_path_dmap.h"
 #include "d/d_menu_fmap_map.h"
+#include "d/d_menu_item_explain.h"
+#include "d/d_menu_ring.h"
+#include "d/d_meter2.h"
+#include "d/d_meter2_draw.h"
 #include "d/d_meter2_info.h"
 #include "d/d_msg_class.h"
 #include "d/d_msg_flow.h"
@@ -96,6 +103,9 @@ static ConfigVarHandle vBoost, vAlways, vGoron, vChud, vLeaf;
 enum FlourishMode : int { FLOURISH_ON, FLOURISH_WOODEN, FLOURISH_DEFAULT, FLOURISH_OFF };
 static const char* const flourishNames[] = {"On", "Wooden", "Default", "Off"};
 static ConfigVarHandle flourishOption;
+
+// items: which bombs can ride the Gale Boomerang (normal, water, bomblings)
+static ConfigVarHandle galeBombToggle[3];
 
 // unarmed combat (0 = registering failed, the default is used)
 static ConfigVarHandle vShield, vBash, vSkill, vSwing, vDamage;
@@ -2202,6 +2212,209 @@ static void flourish_exec_post(ModContext*, void* args, void*, void*) {
     flourish_after(mods::arg<daAlink_c*>(args, 0));
 }
 
+// ======================== Gale-Bomb Combo ========================
+
+// R on a bomb bag in the item ring, with the Gale Boomerang on X or Y, ties those bombs to the
+// boomerang (the bow's combo stays the game's own). Each throw then hangs one lit bomb off the
+// boomerang, the same way it carries a bomb it's flown into, so it goes off on the first thing it
+// touches. Which bag is tied on lives in the save, not in the game's own mix slot.
+
+DEFINE_HOOK(&dMenu_Ring_c::_move, RingMove);
+DEFINE_HOOK(&dMeter2Draw_c::drawButtonXY, ButtonIcon);
+
+static const u8 kBombItems[3] = {dItemNo_NORMAL_BOMB_e, dItemNo_WATER_BOMB_e, dItemNo_POKE_BOMB_e};
+
+static int bomb_kind(u8 item) {
+    for (int k = 0; k < 3; k++)
+        if (kBombItems[k] == item) return k;
+    return -1;
+}
+
+// 0 in the save = nothing tied on, otherwise the bag's slot + 1
+static int tied_bag() {
+    uint8_t stored = 0;
+    size_t n = 1;
+    if (svc_save->get_blob(mod_ctx, "galeBombSlot", &stored, &n) != MOD_OK || n != 1) return -1;
+    return stored == 0 ? -1 : stored - 1;
+}
+
+static void tie_bag(int slot) {
+    uint8_t stored = slot < 0 ? 0 : (uint8_t)(slot + 1);
+    svc_save->set_blob(mod_ctx, "galeBombSlot", &stored, 1);
+}
+
+static int boomerang_button() {
+    for (int b = 0; b < 2; b++) {
+        u8 slot = dComIfGs_getSelectItemIndex(b);
+        if (slot < 24 && dComIfGs_getItem(slot, false) == dItemNo_BOOMERANG_e) return b;
+    }
+    return -1;
+}
+
+// the bag that's tied on, still holding bombs of a kind that's switched on; -1 if not
+static int armed_bag() {
+    int slot = tied_bag();
+    if (slot < SLOT_15 || slot > SLOT_17) return -1;
+    int kind = bomb_kind(dComIfGs_getItem(slot, false));
+    if (kind < 0 || !cfgOn(galeBombToggle[kind])) return -1;
+    return boomerang_button() >= 0 ? slot : -1;
+}
+
+// make the HUD redraw both buttons next frame, so the little bomb appears or goes
+static void redraw_buttons() {
+    dMeter2_c* meter = dMeter2Info_getMeterClass();
+    if (meter == nullptr) return;
+    meter->mItemStatus[0] = dItemNo_NONE_e;
+    meter->mItemStatus[2] = dItemNo_NONE_e;
+}
+
+static void ring_post(ModContext*, void* args, void*, void*) {
+    auto* ring = mods::arg<dMenu_Ring_c*>(args, 0);
+    if (ring->mStatus != dMenu_Ring_c::STATUS_WAIT || ring->mPlayerIsWolf) return;
+    if (!mDoCPd_c::getTrigR(PAD_1) || ring->mpItemExplain->getStatus() != 0) return;
+
+    u8 slot = ring->mItemSlots[ring->mCurrentSlot];
+    int kind = bomb_kind(dComIfGs_getItem(slot, false));
+    if (kind < 0 || !cfgOn(galeBombToggle[kind]) || boomerang_button() < 0) return;
+    // a bow on X or Y gets the bombs first, like in the normal game
+    for (int b = 0; b < 2; b++)
+        if (dComIfGs_getSelectItemIndex(b) == SLOT_4 || dComIfGs_getMixItemIndex(b) == SLOT_4) return;
+
+    bool untie = tied_bag() == slot;
+    tie_bag(untie ? -1 : slot);
+    mDoAud_seStart(untie ? Z2SE_SY_ITEM_COMBINE_OFF : Z2SE_SY_ITEM_COMBINE_ON, nullptr, 0, 0);
+    redraw_buttons();
+}
+
+// --- the button icon: bow-combo layout, with the boomerang where the bow would be ---
+
+static int iconButton = -1;
+static void* boomerangTex;
+static J2DPicture* boomerangPic;
+static bool paintingBoomerang;
+
+static HookAction button_icon_pre(ModContext*, void* args, void*, void*) {
+    int button = mods::arg<int>(args, 1);
+    u8 shown = mods::arg<u8>(args, 2);
+    iconButton = shown == dItemNo_BOOMERANG_e && armed_bag() >= 0 ? button : -1;
+    return HOOK_CONTINUE;
+}
+
+static void button_icon_post(ModContext*, void*, void*, void*) {
+    iconButton = -1;
+}
+
+static HookAction combo_tex_pre(ModContext*, void* args, void*, void*) {
+    boomerangTex = nullptr;
+    if (iconButton < 0 || paintingBoomerang) return HOOK_CONTINUE;
+    u8& item = mods::arg_ref<u8>(args, 1);
+    void* second = mods::arg<void*>(args, 4);
+    if (item != dItemNo_BOOMERANG_e || second == nullptr) return HOOK_CONTINUE;
+
+    // the bomb arrow icon is the small bomb, with the bow drawn in the second picture
+    item = dItemNo_BOMB_ARROW_e;
+    boomerangTex = second;
+    boomerangPic = mods::arg<J2DPicture*>(args, 5);
+    return HOOK_CONTINUE;
+}
+
+static void combo_tex_post(ModContext*, void*, void*, void*) {
+    if (boomerangTex == nullptr) return;
+    void* tex = boomerangTex;
+    boomerangTex = nullptr;
+    paintingBoomerang = true;  // this read comes back through the same hook
+    dMeter2Info_readItemTexture(dItemNo_BOOMERANG_e, tex, boomerangPic, nullptr, nullptr, nullptr, nullptr,
+                                nullptr, nullptr, -1);
+    paintingBoomerang = false;
+}
+
+// --- the bomb count, in the same spot the bow shows its arrows ---
+
+DEFINE_HOOK(&dMeter2Draw_c::drawItemNum, ButtonCount);
+
+static int countShown[2] = {-1, -1};  // what we last wrote on each button, -1 = not ours
+
+// the HUD hides the count for the boomerang, so show it while bombs are tied on and keep it current
+static HookAction button_count_pre(ModContext*, void* args, void*, void*) {
+    auto* hud = mods::arg<dMeter2Draw_c*>(args, 0);
+    u8 button = mods::arg<u8>(args, 1);
+    if (button > 1) return HOOK_CONTINUE;
+
+    dMeter2_c* meter = dMeter2Info_getMeterClass();
+    int slot = armed_bag();
+    bool ours = meter && slot >= 0 && meter->mItemStatus[button * 2] == dItemNo_BOOMERANG_e;
+    if (!ours) {
+        countShown[button] = -1;
+        return HOOK_CONTINUE;
+    }
+
+    int bag = slot - SLOT_15;
+    int left = dComIfGs_getBombNum(bag);
+    if (left != countShown[button]) {
+        hud->setItemNum(button, left, dComIfGs_getBombMax(dComIfGs_getItem(slot, false)));
+        countShown[button] = left;
+    }
+    // same rule the game uses for arrows: visible unless the HUD is tucked away or in a minigame
+    bool visible = meter->field_0x128 == 0 && dMeter2Info_getMiniGameItemSetFlag() != 1;
+    mods::arg_ref<f32>(args, 2) = visible ? 1.0f : 0.0f;
+    return HOOK_CONTINUE;
+}
+
+// --- the throw ---
+
+static fpc_ProcID lastBoomerang = fpcM_ERROR_PROCESS_ID_e;
+
+static fopAc_ac_c* make_bomb(int kind, cXyz* at) {
+    if (kind == 0) return dBomb_c::createNormalBombPlayer(at);
+    if (kind == 1) return dBomb_c::createWaterBombPlayer(at);
+    return dBomb_c::createInsectBombPlayer(at);
+}
+
+static void hang_bomb(daAlink_c* link) {
+    daBoomerang_c* boom = daPy_py_c::getThrowBoomerangActor();
+    fpc_ProcID flying = boom ? fopAcM_GetID(boom) : fpcM_ERROR_PROCESS_ID_e;
+    if (flying == lastBoomerang) return;
+    lastBoomerang = flying;  // one bomb per throw, checked the frame it leaves his hand
+    if (boom == nullptr) return;
+
+    int slot = armed_bag();
+    if (slot < 0) return;
+    int bag = slot - SLOT_15;
+    int kind = bomb_kind(dComIfGs_getItem(slot, false));
+    if (dComIfGs_getBombNum(bag) + dComIfGp_getItemBombNumCount(bag) <= 0) return;
+    if (kind != 2 && link->mActiveBombNum >= 3) return;  // same cap as pulling one out
+
+    cXyz under = boom->current.pos;
+    under.y -= 30.0f;
+    fopAc_ac_c* bomb = make_bomb(kind, &under);
+    if (bomb == nullptr) return;
+
+    // count it like Link pulled it out himself, so its explosion frees the spot again
+    if (kind == 2) link->field_0x2fcf++;
+    else link->mActiveBombNum++;
+    dComIfGp_setItemBombNumCount(bag, -1);
+    static_cast<daNbomb_c*>(bomb)->procBoomerangMoveInit(nullptr);
+}
+
+static void galebomb_exec_post(ModContext*, void* args, void*, void*) {
+    hang_bomb(mods::arg<daAlink_c*>(args, 0));
+}
+
+// once a frame: untie when the bombs run out, the boomerang leaves both buttons or the kind is switched off
+static void galebomb_tick() {
+    static int wasArmed = -2;
+    int tied = tied_bag();
+    if (tied >= 0 && armed_bag() < 0) {
+        bool boomerangGone = boomerang_button() < 0;
+        bool emptied = bomb_kind(dComIfGs_getItem(tied, false)) < 0;
+        bool switchedOff = !emptied && !cfgOn(galeBombToggle[bomb_kind(dComIfGs_getItem(tied, false))]);
+        if (boomerangGone || emptied || switchedOff) tie_bag(-1);
+    }
+    int armed = armed_bag();
+    if (armed != wasArmed) redraw_buttons();
+    wasArmed = armed;
+}
+
 // ======================== Unarmed Combat ========================
 
 DEFINE_HOOK(&daAlink_c::setShieldGuard, SetShieldGuard);
@@ -2764,6 +2977,12 @@ static void item_rows() {
     toggle("Enable Ice Leaf", vLeaf);
     toggle("Always Have Ice Sled", vAlways, leaf_off);
     toggle("RT Speed Boost Cheat", vBoost, leaf_off);
+
+    heading("Item Combinations");
+    note("Gale-Bomb Combo");
+    toggle("Gale Boomerang + Bombs", galeBombToggle[0]);
+    toggle("Gale Boomerang + Water Bombs", galeBombToggle[1]);
+    toggle("Gale Boomerang + Bomblings", galeBombToggle[2]);
 }
 
 static const char* const tabTitles[3] = {"Quality of Life", "Combat", "Items"};
@@ -2990,6 +3209,17 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     bool flourishOk = pre_hook(Exec, flourish_exec_pre) && post_hook(Exec, flourish_exec_post);
     if (!flourishOk) mods::log::warn("sword flourish stays at the game's normal behaviour");
 
+    // --- Gale-Bomb Combo ---
+    add_bool_option("galeBombs", true, &galeBombToggle[0]);
+    add_bool_option("galeWaterBombs", true, &galeBombToggle[1]);
+    add_bool_option("galeBomblings", true, &galeBombToggle[2]);
+    if (!post_hook(RingMove, ring_post)) mods::log::warn("can't tie bombs to the boomerang in the item ring");
+    bool iconOk = pre_hook(ButtonIcon, button_icon_pre) && post_hook(ButtonIcon, button_icon_post);
+    iconOk = iconOk && pre_hook(ReadTex, combo_tex_pre) && post_hook(ReadTex, combo_tex_post);
+    if (!iconOk) mods::log::warn("the boomerang button won't show the little bomb");
+    if (!post_hook(Exec, galebomb_exec_post)) mods::log::warn("thrown boomerangs won't carry bombs");
+    if (!pre_hook(ButtonCount, button_count_pre)) mods::log::warn("no bomb count on the boomerang button");
+
     settings_init();
 
     // --- update check ---
@@ -3005,6 +3235,7 @@ MOD_EXPORT ModResult mod_update(ModError*) {
     faron_lighting_tick();
     bridge_tick();
     shop_update();
+    galebomb_tick();
     return MOD_OK;
 }
 
