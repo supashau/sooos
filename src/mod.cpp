@@ -110,6 +110,7 @@ static const char* const flourishNames[] = {"On", "Wooden", "Default", "Off"};
 static ConfigVarHandle flourishOption;
 static ConfigVarHandle vLanternBurn;  // Deal Burn with Lantern
 static ConfigVarHandle vManualShield; // Manual Shielding
+static ConfigVarHandle vCrouchBlock;  // Crouch Block (which pose, 0 = off)
 static ConfigVarHandle vHandPose;  // Mortal Draw Hand Anim
 static ConfigVarHandle vFireDamage;     // Deal Burn Damage (fire arrows)
 
@@ -3272,11 +3273,8 @@ static bool unarmed_bash_ready(daAlink_c* lnk, bool bashOnB = false) {
     return !lnk->checkModeFlg(0x70C52) && !daAlink_c::checkNotBattleStage();
 }
 
-// Mods with manual shielding have Link shield while both triggers are held all the way in (L to
-// target, R to shield), and shield bash with B. With the "hold" style of targeting, R alone
-// shields while a target is locked. That's the input those mods shield on, so that's what's
-// looked for here, together with Link actually targeting; normal shielding (targeting with L, R
-// pressed to bash) never has both triggers held in.
+// The Manual Shielding input: both triggers held all the way in (L to target, R to shield), or,
+// with the "hold" style of targeting, R alone while a target is locked.
 static bool manual_shield_held(daAlink_c* lnk) {
     if (!mDoCPd_c::getHoldLockR(PAD_1)) return false;
     if (mDoCPd_c::getHoldLockL(PAD_1)) return true;
@@ -3287,13 +3285,6 @@ static bool manual_shield_held(daAlink_c* lnk) {
 static bool manual_shielding(daAlink_c* lnk) {
     if (lnk->checkWolf() || !lnk->checkGuardActionChange() || !manual_shield_held(lnk)) return false;
     return !daAlink_c::checkShieldGet() || lnk->checkNoResetFlg2(daAlink_c::FLG2_UNK_8000000);
-}
-
-// With no shield, in that style, B is the (unarmed) shield bash whatever weapon is out: it shows
-// the game's own Shield Attack on B and starts the bash before Link's update can turn the press
-// into a sword swing.
-static bool unarmed_manual_bash(daAlink_c* lnk) {
-    return !daAlink_c::checkShieldGet() && manual_shielding(lnk) && unarmed_bash_ready(lnk, true);
 }
 
 // --- Manual Shielding (Combat > Misc) ---
@@ -3314,9 +3305,10 @@ static bool shield_bash_ready_on_b(daAlink_c* lnk) {
            !lnk->checkModeFlg(0x70C52) && !daAlink_c::checkNotBattleStage();
 }
 
+// B starts the bash (shield or not, whatever weapon is out): the game's own Shield Attack shows on
+// B, and the bash starts before Link's update can turn the press into a sword swing
 static bool bash_on_b(daAlink_c* lnk) {
-    if (our_manual_shielding()) return manual_shielding(lnk) && shield_bash_ready_on_b(lnk);
-    return unarmed_manual_bash(lnk);  // someone else's manual shielding, no shield
+    return our_manual_shielding() && manual_shielding(lnk) && shield_bash_ready_on_b(lnk);
 }
 
 static bool in_guard_proc(daAlink_c* lnk) {
@@ -3336,6 +3328,19 @@ static void manual_guard(daAlink_c* lnk) {
 // (and any the game plays in a cutscene)
 DEFINE_HOOK(&daAlink_c::procGuardAttackInit, GuardAttackInit);
 static bool bashFromB;
+
+// The game's "Easy Quick Spin" setting spins on any B attack while R is held, and R is held the
+// whole time Link shields here, so B (a bash in the wait between bashes, or one the bash didn't
+// take) would come out as a quick spin. While shielding this way no spin is started.
+DEFINE_HOOK(&daAlink_c::procCutTurnInit, CutTurnInit);
+
+static HookAction no_spin_while_shielding(ModContext*, void* args, void* ret, void*) {
+    auto* lnk = mods::arg<daAlink_c*>(args, 0);
+    if (!our_manual_shielding() || lnk->checkWolf() || !manual_shield_held(lnk)) return HOOK_CONTINUE;
+    if (!lnk->checkGuardActionChange()) return HOOK_CONTINUE;
+    if (ret) *static_cast<int*>(ret) = 0;
+    return HOOK_SKIP_ORIGINAL;
+}
 
 static HookAction guard_attack_pre(ModContext*, void* args, void* ret, void*) {
     auto* lnk = mods::arg<daAlink_c*>(args, 0);
@@ -3358,6 +3363,91 @@ static HookAction manual_bash_pre(ModContext*, void* args, void*, void*) {
     lnk->procGuardAttackInit();
     bashFromB = false;
     return HOOK_CONTINUE;
+}
+
+// --- Crouch Block (Combat > Misc, under Manual Shielding) ---
+// Standing still while shielding with L and R drops Link into a low pose. Which pose is still being
+// picked, so each option plays a different one of Link's own animations to try out in game.
+static const u16 kCrouchPoses[] = {
+    dRes_ID_ALANM_BCK_CROUCHDEFS_e,   // Test 1
+    dRes_ID_ALANM_BCK_CROUCHDEFSS_e,  // Test 2
+    dRes_ID_ALANM_BCK_CROUCH_e,       // Test 3
+    dRes_ID_ALANM_BCK_CROUCHS_e,      // Test 4
+    dRes_ID_ALANM_BCK_DEMO_KAMAE_e,   // Test 5
+    dRes_ID_ALANM_BCK_LANDDAMA_e,     // Test 6
+    dRes_ID_ALANM_BCK_LANDDAMAST_e,   // Test 7
+    dRes_ID_ALANM_BCK_IBDEF_e,        // Test 8
+    dRes_ID_ALANM_BCK_PICKUP_e,       // Test 9
+};
+static const int kCrouchPoseCount = sizeof(kCrouchPoses) / sizeof(kCrouchPoses[0]);
+static const char* const crouchNames[] = {"Off",    "Test 1", "Test 2", "Test 3", "Test 4",
+                                          "Test 5", "Test 6", "Test 7", "Test 8", "Test 9"};
+
+DEFINE_HOOK(&daAlink_c::procCrouch, Crouch);
+static bool crouchBlocking;  // the crouch Link is in is ours, not one the game started
+
+static int crouch_pose() {
+    int pose = cfgInt(vCrouchBlock, 0);
+    return (pose >= 1 && pose <= kCrouchPoseCount) ? pose : 0;
+}
+
+static bool can_stand_and_crouch(daAlink_c* lnk) {
+    switch (lnk->mProcID) {
+    case daAlink_c::PROC_WAIT:
+    case daAlink_c::PROC_MOVE:
+    case daAlink_c::PROC_ATN_MOVE:
+    case daAlink_c::PROC_ATN_ACTOR_WAIT:
+    case daAlink_c::PROC_ATN_ACTOR_MOVE:
+        break;
+    default:
+        return false;
+    }
+    return !lnk->checkInputOnR() && lnk->mLinkAcch.ChkGroundHit() && !lnk->checkEventRun() &&
+           lnk->mEquipItem != dItemNo_IRONBALL_e;
+}
+
+// turns to keep facing whatever L has locked onto, like the standing guard does
+static void face_target(daAlink_c* lnk) {
+    fopAc_ac_c* target = lnk->mAttention ? lnk->mAttention->LockonTarget(0) : nullptr;
+    if (!target) return;
+    s16 toward = cM_atan2s(target->current.pos.x - lnk->current.pos.x, target->current.pos.z - lnk->current.pos.z);
+    cLib_addCalcAngleS(&lnk->shape_angle.y, toward, 4, 0x1000, 0x100);
+    lnk->current.angle.y = lnk->shape_angle.y;
+}
+
+// runs after the guard is settled for the frame, before Link's current action does
+static void crouch_block(daAlink_c* lnk) {
+    if (crouchBlocking && lnk->mProcID != daAlink_c::PROC_CROUCH) crouchBlocking = false;
+    int pose = crouch_pose();
+    if (crouchBlocking || !pose || !our_manual_shielding() || lnk->checkWolf()) return;
+    if (!manual_shield_held(lnk) || !lnk->checkNoResetFlg2(daAlink_c::FLG2_UNK_8000000)) return;
+    if (!can_stand_and_crouch(lnk) || !lnk->procCrouchInit()) return;
+
+    // the game's crouch sets the body up; the pose itself goes on top, legs and upper body alike
+    u16 bck = kCrouchPoses[pose - 1];
+    lnk->setUnderAnime(bck, daAlink_c::UNDER_0, 1.0f, 0.0f, -1, 5.0f);
+    lnk->setUpperAnime(bck, daAlink_c::UPPER_0, 1.0f, 0.0f, -1, -1.0f);
+    lnk->onModeFlg(0x80);  // the game's crouch isn't a guarding stance; ours is
+    crouchBlocking = true;
+}
+
+// stays down while L and R are held and the stick is left alone; anything else stands him back up
+static HookAction crouch_pre(ModContext*, void* args, void* ret, void*) {
+    auto* lnk = mods::arg<daAlink_c*>(args, 0);
+    if (!crouchBlocking) return HOOK_CONTINUE;
+
+    bool stay = crouch_pose() && our_manual_shielding() && manual_shield_held(lnk) && !lnk->checkInputOnR() &&
+                !mDoCPd_c::getTrigA(PAD_1) && lnk->mLinkAcch.ChkGroundHit() && !lnk->checkEventRun();
+    if (stay) {
+        cLib_chaseF(&lnk->mNormalSpeed, 0.0f, lnk->mpHIO->mMove.m.mDeceleration);
+        lnk->onModeFlg(0x80);
+        face_target(lnk);
+    } else {
+        crouchBlocking = false;
+        if (!lnk->checkNextAction(0)) lnk->procWaitInit();
+    }
+    if (ret) *static_cast<int*>(ret) = 1;
+    return HOOK_SKIP_ORIGINAL;
 }
 
 static HookAction guard_pre(ModContext*, void* args, void*, void*) {
@@ -3401,6 +3491,7 @@ static void guard_post(ModContext*, void* args, void*, void*) {
         lnk->onNoResetFlg2(daAlink_c::FLG2_UNK_8000000);
 
     manual_guard(lnk);
+    crouch_block(lnk);
     if (bash_on_b(lnk)) lnk->setBStatus(BUTTON_STATUS_SHIELD_ATTACK);
 }
 
@@ -3437,8 +3528,8 @@ static void item_action_post(ModContext*, void* args, void* retval, void*) {
     }
 
     if (!cfgOn(vSwing, true) || !ground || daAlink_c::checkSwordGet()) return;
-    // shielding the manual way: B belongs to the shield bash (whoever shows it), not our swing
-    if (manual_shielding(lnk)) return;
+    // Manual Shielding: while shielding, B belongs to the shield bash, not our swing
+    if (our_manual_shielding() && manual_shielding(lnk)) return;
     bool inCutscene = lnk->mDemo.getDemoType() != 0 || lnk->checkEventRun();
     if (inCutscene) return;
     bool onHorse = lnk->checkRideOn();
@@ -3618,6 +3709,8 @@ static void unarmed_init() {
     lost += !post_hook(CheckItemAction, item_action_post);
     lost += !pre_hook(Exec, manual_bash_pre);
     lost += !pre_hook(GuardAttackInit, guard_attack_pre);
+    lost += !pre_hook(CutTurnInit, no_spin_while_shielding);
+    lost += !pre_hook(Crouch, crouch_pre);
     lost += !post_hook(DoStatus, do_status_post);
     lost += !pre_hook(NextAction, next_pre) + !post_hook(NextAction, next_post);
     lost += !pre_hook(CcAtCheck, cc_pre) + !post_hook(CcAtCheck, cc_post);
@@ -3803,6 +3896,7 @@ static bool combos_off(ModContext*, void*) { return !combos_on(); }
 static bool fire_arrows_off(ModContext*, void*) { return !fire_on(); }
 static bool bash_off(ModContext*, void*) { return !cfgOn(vBash, true); }
 static bool swing_off(ModContext*, void*) { return !cfgOn(vSwing, true); }
+static bool manual_shield_off(ModContext*, void*) { return !cfgOn(vManualShield, false); }
 
 // an "always have" row also needs its move switched on
 static bool move_off(ModContext* ctx, void* move) {
@@ -3831,12 +3925,13 @@ static void toggle(const char* label, ConfigVarHandle var, UiPredicateFn greyIf 
     add_row(row, label, var);
 }
 
-static void choice(const char* label, ConfigVarHandle var, const char* const* names, int count) {
+static void choice(const char* label, ConfigVarHandle var, const char* const* names, int count,
+                   UiPredicateFn greyIf = nullptr) {
     UiControlDesc row = UI_CONTROL_DESC_INIT;
     row.kind = UI_CONTROL_DROPDOWN;
     row.options = names;
     row.option_count = count;
-    if (var == vDamage) row.is_disabled = swing_off;  // the only dropdown that hangs off a toggle
+    row.is_disabled = greyIf;
     add_row(row, label, var);
 }
 
@@ -3865,7 +3960,7 @@ static void combat_rows() {
 
     note("Unarmed Swing");
     toggle("Swing while unarmed", vSwing);
-    choice("Swing damage", vDamage, damageNames, 4);
+    choice("Swing damage", vDamage, damageNames, 4, swing_off);
     toggle("Jump strike while unarmed", vJump, swing_off);
     toggle("Always have charged jump strike", vChargedAll, move_off, &vJump);
     toggle("Spin attack while unarmed", vSpin, swing_off);
@@ -3880,6 +3975,7 @@ static void combat_rows() {
     choice("Sword Flourish", flourishOption, flourishNames, 4);
     toggle("Mortal Draw Hand Anim", vHandPose);
     toggle("Manual Shielding", vManualShield);
+    choice("Crouch Block", vCrouchBlock, crouchNames, kCrouchPoseCount + 1, manual_shield_off);
     toggle("Deal Burn with Lantern", vLanternBurn);
 }
 
@@ -4124,6 +4220,7 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     if (!add_int_option("swordFlourish", FLOURISH_DEFAULT, &flourishOption)) flourishOption = 0;
     add_bool_option("lanternBurn", true, &vLanternBurn);
     add_bool_option("manualShielding", false, &vManualShield);
+    if (!add_int_option("crouchBlock", 0, &vCrouchBlock)) vCrouchBlock = 0;
     add_bool_option("mortalDrawHandAnim", true, &vHandPose);
     if (!post_hook(SetMatrix, hand_pose_post)) mods::log::warn("Mortal Draw Hand Anim stays on");
     // rides along on Link's update, next to the Ice Leaf's own hooks there
