@@ -2434,9 +2434,12 @@ static void ring_post(ModContext*, void* args, void*, void*) {
 // --- the boomerang button icon: the bow-combo layout, with the boomerang where the bow would be ---
 
 // The bomb arrow icon is two pictures: the bomb in front, the bow behind it. Both of our combos
-// borrow that layout and repaint one picture:
+// draw the button as a bomb arrow, so the HUD uses the bomb arrow's own size, position and tilt
+// for it, and then repaint one picture:
 //   Gale-Bomb:   the bomb stays, the boomerang is painted over the bow
 //   Fire Arrows: the bow stays, the lantern is painted over the bomb
+// (Drawn as the bow or the boomerang instead, the front picture took that item's bigger, offset
+// and tilted placement, which stretched the lantern and knocked the bomb sideways.)
 static int galeIconButton = -1;  // button drawing the boomerang with bombs tied on, -1 if none
 static int fireIconButton = -1;  // button drawing the fire-arrow bow, -1 if none
 static u8 repaintItem;           // what goes over the borrowed picture after the read, 0 = nothing
@@ -2449,6 +2452,7 @@ static HookAction button_icon_pre(ModContext*, void* args, void*, void*) {
     u8 shown = mods::arg<u8>(args, 2);
     galeIconButton = shown == dItemNo_BOOMERANG_e && armed_bag() >= 0 ? button : -1;
     fireIconButton = shown == dItemNo_BOW_e && fire_button() == button ? button : -1;
+    if (galeIconButton >= 0 || fireIconButton >= 0) mods::arg_ref<u8>(args, 2) = dItemNo_BOMB_ARROW_e;
     return HOOK_CONTINUE;
 }
 
@@ -2459,23 +2463,22 @@ static void button_icon_post(ModContext*, void*, void*, void*) {
 static HookAction combo_tex_pre(ModContext*, void* args, void*, void*) {
     repaintItem = 0;
     if (repainting) return HOOK_CONTINUE;  // our own repaint comes back through here
-    u8& item = mods::arg_ref<u8>(args, 1);
+    u8 item = mods::arg<u8>(args, 1);
     void* front = mods::arg<void*>(args, 2);
     void* back = mods::arg<void*>(args, 4);
     if (front == nullptr || back == nullptr) return HOOK_CONTINUE;
 
-    if (galeIconButton >= 0 && item == dItemNo_BOOMERANG_e) {
+    if (item != dItemNo_BOMB_ARROW_e) return HOOK_CONTINUE;
+
+    if (galeIconButton >= 0) {
         repaintItem = dItemNo_BOOMERANG_e;
         repaintTex = back;
         repaintPic = mods::arg<J2DPicture*>(args, 5);
-    } else if (fireIconButton >= 0 && item == dItemNo_BOW_e) {
+    } else if (fireIconButton >= 0) {
         repaintItem = dItemNo_KANTERA_e;  // shows the unlit lantern when the oil's run out
         repaintTex = front;
         repaintPic = mods::arg<J2DPicture*>(args, 3);
-    } else {
-        return HOOK_CONTINUE;
     }
-    item = dItemNo_BOMB_ARROW_e;
     return HOOK_CONTINUE;
 }
 
