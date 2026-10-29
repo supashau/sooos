@@ -1194,10 +1194,11 @@ static HookAction tex_pre(ModContext*, void* args, void*, void*) {
     return HOOK_CONTINUE;
 }
 
-static void tex_post(ModContext*, void*, void*, void*) {
-    void* texBuf = iconBuf;
-    iconBuf = nullptr;
-    if (!texBuf || !iconRes.data || iconRes.size != (size_t)iconSz * iconSz * 4) return;
+// Shows a picture of ours wherever the game draws the texture just loaded into texBuf (the
+// texture service swaps the pixels when it's drawn). The swap is forgotten the next time
+// something else is loaded into that buffer.
+static void paint_icon(void* texBuf, const ResourceBuffer& picture, int size) {
+    if (!texBuf || !picture.data || picture.size != (size_t)size * size * 4) return;
 
     // where the pixels start; might still be big endian
     uint32_t pixels = ((const ResTIMG*)texBuf)->imageOffset;
@@ -1216,17 +1217,23 @@ static void tex_post(ModContext*, void*, void*, void*) {
     key.kind = TEXTURE_KEY_POINTER;
     key.pointer = (uint8_t*)texBuf + pixels;
 
-    TextureData leafPic = TEXTURE_DATA_INIT;
-    leafPic.data = iconRes.data;
-    leafPic.size = iconRes.size;
-    leafPic.width = iconSz;
-    leafPic.height = iconSz;
-    leafPic.gx_format = GX_TF_RGBA8_PC;
+    TextureData ours = TEXTURE_DATA_INIT;
+    ours.data = picture.data;
+    ours.size = picture.size;
+    ours.width = size;
+    ours.height = size;
+    ours.gx_format = GX_TF_RGBA8_PC;
 
     TextureReplacementHandle swapped = 0;
-    if (svc_texture->register_data(mod_ctx, &key, &leafPic, &swapped) != MOD_OK) return;
+    if (svc_texture->register_data(mod_ctx, &key, &ours, &swapped) != MOD_OK) return;
     iconOwner[nIcons] = texBuf;
     iconTex[nIcons++] = swapped;
+}
+
+static void tex_post(ModContext*, void*, void*, void*) {
+    void* texBuf = iconBuf;
+    iconBuf = nullptr;
+    paint_icon(texBuf, iconRes, iconSz);
 }
 
 // ======================== Castle Town shops ========================
@@ -2434,18 +2441,19 @@ static void ring_post(ModContext*, void* args, void*, void*) {
 
 // --- the boomerang button icon: the bow-combo layout, with the boomerang where the bow would be ---
 
-// The bomb arrow icon is two pictures: the main one in front (the bomb), and a small one in its
-// own little frame behind it (normally a small bow). Our combos fill those two pictures themselves
-// while the HUD reads the button's picture:
-//   Gale-Bomb:   the bomb in front, the boomerang in the small frame
-//   Fire Arrows: the lantern in front, the game's small bow in the small frame
-// Each picture's buffer is loaded exactly once. Loading one item into a buffer and then painting
-// another over it (what this used to do) leaves the first picture showing with the second one's
-// size, because the screen keeps the first upload for that buffer: that was the bow stretched to
-// the lantern's shape, and the leftovers in the other button.
+// Each combination has a picture of its own: res/galebomb_icon.rgba (a bomb on the Gale Boomerang,
+// used for all three kinds of bomb) and res/firearrow_icon.rgba (the lantern on the bow). Both are
+// square, 128 x 128. The button loads its usual single picture (the boomerang or the bow) and ours
+// is shown in its place, then the picture is placed like an ordinary square item icon rather than
+// with the boomerang's tilt or the bow's long diagonal offset.
+static constexpr int comboIconSize = 128;
+static ResourceBuffer galeBombIcon = RESOURCE_BUFFER_INIT;
+static ResourceBuffer fireArrowIcon = RESOURCE_BUFFER_INIT;
+
 static int galeIconButton = -1;  // button drawing the boomerang with bombs tied on, -1 if none
 static int fireIconButton = -1;  // button drawing the fire-arrow bow, -1 if none
-alignas(32) static u8 unusedFront[0xC00];  // takes the bomb arrow's front picture when we only want its bow
+static void* comboIconTex;       // the picture just loaded for that button, to paint ours over
+static const ResourceBuffer* comboIcon;
 
 static HookAction button_icon_pre(ModContext*, void* args, void*, void*) {
     int button = mods::arg<int>(args, 1);
@@ -2463,8 +2471,10 @@ static void place_front_picture(dMeter2Draw_c* hud, int button, u8 sizedAs, u8 p
 
     f32 size = dItem_data::getTexScale(sizedAs) / 100.0f;
     if (g_drawHIO.mItemScaleAdjustON) size = g_drawHIO.mItemScalePercent / 100.0f;
-    f32 wide = size * (tex->width * pane->getInitSizeX() / 48.0f);
-    f32 tall = size * (tex->height * pane->getInitSizeY() / 48.0f);
+    // our pictures are square, whatever shape the borrowed texture was
+    f32 side = tex->width > tex->height ? tex->width : tex->height;
+    f32 wide = size * (side * pane->getInitSizeX() / 48.0f);
+    f32 tall = size * (side * pane->getInitSizeY() / 48.0f);
     hud->field_0x6c4[button] = wide;
     hud->field_0x6d0[button] = tall;
     hud->field_0x6ac[button] = (pane->getInitSizeX() - wide) * 0.5f;
@@ -2480,23 +2490,6 @@ static void place_front_picture(dMeter2Draw_c* hud, int button, u8 sizedAs, u8 p
     pane->paneTrans(spot.pos_x + hud->field_0x6ac[button], spot.pos_y + hud->field_0x6b8[button]);
 }
 
-// The small frame is resized by the HUD to the front picture's exact box, which is right for the
-// bomb arrow (a round bomb over a small bow drawn at the same size) but squeezes the bow into the
-// lantern's tall, narrow shape. So it gets the bow's own shape back, a bit wider than the lantern,
-// centred on it.
-static void widen_small_bow(dMeter2Draw_c* hud, int button) {
-    J2DPicture* bow = hud->mpItemXYPane[button];
-    ResTIMG* tex = hud->mpItemXYTex[button][hud->field_0x76c[button]][1];
-    if (bow == nullptr || tex == nullptr || tex->width == 0) return;
-    f32 lanternWide = hud->field_0x6c4[button];
-    f32 lanternTall = hud->field_0x6d0[button];
-    f32 wide = lanternWide * 1.4f;
-    f32 tall = wide * tex->height / tex->width;
-    f32 left = (lanternWide - wide) * 0.5f;
-    f32 top = (lanternTall - tall) * 0.5f;
-    bow->place(JGeometry::TBox2<f32>(left, top, left + wide, top + tall));
-}
-
 // whether each button is currently drawn as its combination; until it is, it keeps being redrawn
 static bool comboShown[2];
 
@@ -2504,11 +2497,10 @@ static void button_icon_post(ModContext*, void* args, void*, void*) {
     auto* hud = mods::arg<dMeter2Draw_c*>(args, 0);
     int button = mods::arg<int>(args, 1);
     bool itemsShown = mods::arg<bool>(args, 4);
-    if (fireIconButton >= 0 && itemsShown) {
-        place_front_picture(hud, fireIconButton, dItemNo_KANTERA_e, dItemNo_BOMB_ARROW_e);
-        widen_small_bow(hud, fireIconButton);
-    }
-    if (itemsShown && button >= 0 && button < 2) comboShown[button] = galeIconButton >= 0 || fireIconButton >= 0;
+    int combo = galeIconButton >= 0 ? galeIconButton : fireIconButton;
+    // placed like an ordinary item (the bomb arrow is one with no tilt or offset of its own)
+    if (combo >= 0 && itemsShown) place_front_picture(hud, combo, dItemNo_BOMB_ARROW_e, dItemNo_BOMB_ARROW_e);
+    if (itemsShown && button >= 0 && button < 2) comboShown[button] = combo >= 0;
     galeIconButton = fireIconButton = -1;
 }
 
@@ -2532,34 +2524,23 @@ static void keep_combos_drawn() {
     }
 }
 
-// one item's picture into one buffer, nothing else
-static void load_picture(u8 item, void* tex, J2DPicture* pic) {
-    dMeter2Info_readItemTexture(item, tex, pic, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, -1);
-}
-
-static HookAction combo_tex_pre(ModContext*, void* args, void* ret, void*) {
+// the button's single picture loads as usual; remember where, so ours can go over it
+static HookAction combo_tex_pre(ModContext*, void* args, void*, void*) {
+    comboIconTex = nullptr;
     u8 item = mods::arg<u8>(args, 1);
     void* front = mods::arg<void*>(args, 2);
-    void* back = mods::arg<void*>(args, 4);
-    auto* frontPic = mods::arg<J2DPicture*>(args, 3);
-    auto* backPic = mods::arg<J2DPicture*>(args, 5);
-    if (front == nullptr || back == nullptr || backPic == nullptr) return HOOK_CONTINUE;
-
     bool gale = galeIconButton >= 0 && item == dItemNo_BOOMERANG_e;
     bool fire = fireIconButton >= 0 && item == dItemNo_BOW_e;
-    if (!gale && !fire) return HOOK_CONTINUE;
+    if (front == nullptr || (!gale && !fire)) return HOOK_CONTINUE;
+    comboIconTex = front;
+    comboIcon = gale ? &galeBombIcon : &fireArrowIcon;
+    return HOOK_CONTINUE;
+}
 
-    if (gale) {
-        load_picture(dItemNo_BOMB_ARROW_e, front, frontPic);  // its main picture is the bomb
-        load_picture(dItemNo_BOOMERANG_e, back, backPic);
-    } else {
-        load_picture(dItemNo_KANTERA_e, front, frontPic);  // the unlit lantern when the oil's out
-        // the small bow: the bomb arrow's second picture, with its first going somewhere harmless
-        dMeter2Info_readItemTexture(dItemNo_BOMB_ARROW_e, unusedFront, nullptr, back, backPic, nullptr,
-                                    nullptr, nullptr, nullptr, -1);
-    }
-    *static_cast<int*>(ret) = 2;  // two pictures: the HUD shows the small frame
-    return HOOK_SKIP_ORIGINAL;
+static void combo_tex_post(ModContext*, void*, void*, void*) {
+    void* tex = comboIconTex;
+    comboIconTex = nullptr;
+    if (tex != nullptr) paint_icon(tex, *comboIcon, comboIconSize);
 }
 
 // --- the bomb count, in the same spot the bow shows its arrows ---
@@ -2769,6 +2750,21 @@ static const dCcD_SrcCps kScorchSrc = {
     },
 };
 
+// For another player the fire hit is the lantern's own kind, with the scorch's power: players
+// burned from that kind of hit, and stopped burning when it was switched to the sword kind the
+// enemies' scorch now uses.
+static const dCcD_SrcCps kPlayerFireSrc = {
+    {
+        {0x0, {{AT_TYPE_LANTERN_SWING, 0x2, 0x1B}, {0x0, 0x0}, 0x0}},
+        {dCcD_SE_NONE, 0x0, 0x0, dCcD_MTRL_FIRE, 0x0},
+        {dCcD_SE_NONE, 0x0, 0x0, 0x0, 0x0},
+        {0x0},
+    },
+    {
+        {{0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f}, 60.0f},
+    },
+};
+
 // the stand-in Crests of Courage uses for another player, if it's loaded
 static bool is_other_player(fopAc_ac_c* actor) {
     dStage_objectNameInf* rival = dStage_searchName("cpRival");
@@ -2811,6 +2807,14 @@ static bool in_water(fopAc_ac_c* actor) {
     return fopAcM_wt_c::waterCheck(&feet) && fopAcM_wt_c::getWaterY() > feet.y + 10.0f;
 }
 
+// the top of an actor's body: its eyes, or Link's height above its feet if it never set them
+// (Crests of Courage's stand-ins for other players, for one)
+static cXyz body_top(fopAc_ac_c* actor) {
+    cXyz up = actor->eyePos - actor->current.pos;
+    if (up.abs2() < 1.0f || up.abs2() > 600.0f * 600.0f) up.set(0.0f, 140.0f, 0.0f);
+    return actor->current.pos + up;
+}
+
 static bool burn_player(fopAc_ac_c* player, daAlink_c* link) {
     fpc_ProcID id = fopAcM_GetID(player);
     PlayerFireHit* spot = nullptr;
@@ -2823,7 +2827,7 @@ static bool burn_player(fopAc_ac_c* player, daAlink_c* link) {
     spot->waitLeft = kPlayerFireGap;
     spot->due = true;
     spot->owner.Init(0xFF, 0xFF, link);
-    spot->hit.Set(kScorchSrc);  // the same fire hit an enemy's scorch is
+    spot->hit.Set(kPlayerFireSrc);
     spot->hit.SetStts(&spot->owner);
     return true;
 }
@@ -2885,7 +2889,7 @@ static void burn_enemies() {
         }
 
         // halfway between its feet and its eyes is roughly its middle
-        cXyz middle = (actor->current.pos + actor->eyePos) * 0.5f;
+        cXyz middle = (actor->current.pos + body_top(actor)) * 0.5f;
         for (int k = 0; k < 2; k++) {
             enemy.flame[k] = dComIfGp_particle_set(enemy.flame[k], kLanternFlame[k], &middle, &actor->shape_angle, nullptr);
             JPABaseEmitter* flame = dComIfGp_particle_getEmitter(enemy.flame[k]);
@@ -2894,17 +2898,17 @@ static void burn_enemies() {
         }
 
         if (enemy.framesLeft != kScorchAt[0] && enemy.framesLeft != kScorchAt[1]) continue;
-        static_cast<cM3dGCps*>(&enemy.scorch)->Set(actor->current.pos, actor->eyePos, 60.0f);
+        static_cast<cM3dGCps*>(&enemy.scorch)->Set(actor->current.pos, body_top(actor), 60.0f);
         enemy.scorch.CalcAtVec();
         enemy.scorch.ResetAtHit();
         dComIfG_Ccsp()->Set(&enemy.scorch);
     }
 }
 
-// how close a point is to the line from an actor's feet to its eyes (its body, roughly)
+// how close a point is to the line from an actor's feet to the top of its body
 static f32 distance_to_body(const cXyz& at, fopAc_ac_c* actor) {
     cXyz feet = actor->current.pos;
-    cXyz up = actor->eyePos - feet;
+    cXyz up = body_top(actor) - feet;
     f32 tall = up.abs2();
     f32 along = tall > 1.0f ? (at - feet).inprod(up) / tall : 0.0f;
     if (along < 0.0f) along = 0.0f;
@@ -3992,6 +3996,12 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     add_bool_option("galeBomblings", true, &galeBombToggle[2]);
     add_bool_option("fireArrows", true, &vFireArrows);
 
+    // each combination's own picture on its button
+    if (svc_resource->load(mod_ctx, "galebomb_icon.rgba", &galeBombIcon) != MOD_OK)
+        mods::log::warn("galebomb_icon.rgba missing, the Gale-Bomb button shows the plain boomerang");
+    if (svc_resource->load(mod_ctx, "firearrow_icon.rgba", &fireArrowIcon) != MOD_OK)
+        mods::log::warn("firearrow_icon.rgba missing, the Fire Arrows button shows the plain bow");
+
     // the item ring: who combines with what, and the line that says so
     bool ringOk = pre_hook(RingMove, ring_pre) && post_hook(RingMove, ring_post);
     if (!ringOk) mods::log::warn("can't tie bombs to the boomerang in the item ring");
@@ -4005,7 +4015,7 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
 
     // Gale-Bomb
     bool iconOk = pre_hook(ButtonIcon, button_icon_pre) && post_hook(ButtonIcon, button_icon_post);
-    iconOk = iconOk && pre_hook(ReadTex, combo_tex_pre);
+    iconOk = iconOk && pre_hook(ReadTex, combo_tex_pre) && post_hook(ReadTex, combo_tex_post);
     if (!iconOk) mods::log::warn("the boomerang button won't show the little bomb");
     if (!post_hook(Exec, galebomb_exec_post)) mods::log::warn("thrown boomerangs won't carry bombs");
     if (!pre_hook(ButtonCount, button_count_pre)) mods::log::warn("no bomb count on the boomerang button");
