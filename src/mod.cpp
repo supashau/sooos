@@ -2425,44 +2425,60 @@ static void ring_post(ModContext*, void* args, void*, void*) {
 
 // --- the boomerang button icon: the bow-combo layout, with the boomerang where the bow would be ---
 
-static int iconButton = -1;
-static void* boomerangTex;
-static J2DPicture* boomerangPic;
-static bool paintingBoomerang;
+// The bomb arrow icon is two pictures: the bomb in front, the bow behind it. Both of our combos
+// borrow that layout and repaint one picture:
+//   Gale-Bomb:   the bomb stays, the boomerang is painted over the bow
+//   Fire Arrows: the bow stays, the lantern is painted over the bomb
+static int galeIconButton = -1;  // button drawing the boomerang with bombs tied on, -1 if none
+static int fireIconButton = -1;  // button drawing the fire-arrow bow, -1 if none
+static u8 repaintItem;           // what goes over the borrowed picture after the read, 0 = nothing
+static void* repaintTex;
+static J2DPicture* repaintPic;
+static bool repainting;
 
 static HookAction button_icon_pre(ModContext*, void* args, void*, void*) {
     int button = mods::arg<int>(args, 1);
     u8 shown = mods::arg<u8>(args, 2);
-    iconButton = shown == dItemNo_BOOMERANG_e && armed_bag() >= 0 ? button : -1;
+    galeIconButton = shown == dItemNo_BOOMERANG_e && armed_bag() >= 0 ? button : -1;
+    fireIconButton = shown == dItemNo_BOW_e && fire_button() == button ? button : -1;
     return HOOK_CONTINUE;
 }
 
 static void button_icon_post(ModContext*, void*, void*, void*) {
-    iconButton = -1;
+    galeIconButton = fireIconButton = -1;
 }
 
 static HookAction combo_tex_pre(ModContext*, void* args, void*, void*) {
-    boomerangTex = nullptr;
-    if (iconButton < 0 || paintingBoomerang) return HOOK_CONTINUE;
+    repaintItem = 0;
+    if (repainting) return HOOK_CONTINUE;  // our own repaint comes back through here
     u8& item = mods::arg_ref<u8>(args, 1);
-    void* second = mods::arg<void*>(args, 4);
-    if (item != dItemNo_BOOMERANG_e || second == nullptr) return HOOK_CONTINUE;
+    void* front = mods::arg<void*>(args, 2);
+    void* back = mods::arg<void*>(args, 4);
+    if (front == nullptr || back == nullptr) return HOOK_CONTINUE;
 
-    // the bomb arrow icon is the bomb, with the bow drawn in the second picture
+    if (galeIconButton >= 0 && item == dItemNo_BOOMERANG_e) {
+        repaintItem = dItemNo_BOOMERANG_e;
+        repaintTex = back;
+        repaintPic = mods::arg<J2DPicture*>(args, 5);
+    } else if (fireIconButton >= 0 && item == dItemNo_BOW_e) {
+        repaintItem = dItemNo_KANTERA_e;  // shows the unlit lantern when the oil's run out
+        repaintTex = front;
+        repaintPic = mods::arg<J2DPicture*>(args, 3);
+    } else {
+        return HOOK_CONTINUE;
+    }
     item = dItemNo_BOMB_ARROW_e;
-    boomerangTex = second;
-    boomerangPic = mods::arg<J2DPicture*>(args, 5);
     return HOOK_CONTINUE;
 }
 
 static void combo_tex_post(ModContext*, void*, void*, void*) {
-    if (boomerangTex == nullptr) return;
-    void* tex = boomerangTex;
-    boomerangTex = nullptr;
-    paintingBoomerang = true;  // this read comes back through the same hook
-    dMeter2Info_readItemTexture(dItemNo_BOOMERANG_e, tex, boomerangPic, nullptr, nullptr, nullptr, nullptr,
-                                nullptr, nullptr, -1);
-    paintingBoomerang = false;
+    if (repaintItem == 0) return;
+    u8 item = repaintItem;
+    repaintItem = 0;
+    repainting = true;
+    dMeter2Info_readItemTexture(item, repaintTex, repaintPic, nullptr, nullptr, nullptr, nullptr, nullptr,
+                                nullptr, -1);
+    repainting = false;
 }
 
 // --- the bomb count, in the same spot the bow shows its arrows ---
@@ -2471,11 +2487,19 @@ DEFINE_HOOK(&dMeter2Draw_c::drawItemNum, ButtonCount);
 
 static int countShown[2] = {-1, -1};  // what we last wrote on each button, -1 = not ours
 
-// the HUD hides the count for the boomerang, so show it while bombs are tied on and keep it current
+// the HUD hides the count for the boomerang, so show it while bombs are tied on and keep it current;
+// the fire-arrow bow goes the other way and hides its arrow count
 static HookAction button_count_pre(ModContext*, void* args, void*, void*) {
     auto* hud = mods::arg<dMeter2Draw_c*>(args, 0);
     u8 button = mods::arg<u8>(args, 1);
     if (button > 1) return HOOK_CONTINUE;
+
+    // the fire-arrow bow shows no arrow count, like the lantern itself (its oil bar is the gauge)
+    if (fire_button() == button) {
+        countShown[button] = -1;
+        mods::arg_ref<f32>(args, 2) = 0.0f;
+        return HOOK_CONTINUE;
+    }
 
     dMeter2_c* meter = dMeter2Info_getMeterClass();
     int slot = armed_bag();
@@ -2519,16 +2543,19 @@ static HookAction oil_gauge_pre(ModContext*, void* args, void*, void*) {
 
 DEFINE_HOOK(&daArrow_c::execute, ArrowUpdate);
 
-// the lantern swing's fire: no damage of its own, the arrow still does that
+// the lantern swing's fire: no damage of its own, the arrow still does that. 0x1B in the attack
+// flags is what switches it on (the same flags Link's sword swing uses); with 0 it never touched
+// anything. Torches, candles, webs and grass look for exactly this type with fire as its material.
+static const f32 kFireReach = 50.0f;  // the lantern swing's own radius
 static const dCcD_SrcCps kArrowFireSrc = {
     {
-        {0x0, {{AT_TYPE_LANTERN_SWING, 0x0, 0x0}, {0x0, 0x0}, 0x0}},
+        {0x0, {{AT_TYPE_LANTERN_SWING, 0x0, 0x1B}, {0x0, 0x0}, 0x0}},
         {dCcD_SE_NONE, 0x0, 0x0, dCcD_MTRL_FIRE, 0x0},
         {dCcD_SE_NONE, 0x0, 0x0, 0x0, 0x0},
         {0x0},
     },
     {
-        {{0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f}, 30.0f},
+        {{0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f}, kFireReach},
     },
 };
 
@@ -2614,12 +2641,13 @@ static void arrow_post(ModContext*, void* args, void*, void*) {
     bool nocked = link != nullptr && link->mItemAcKeep.getID() == id;
     bool flying = !nocked && arrow->speed.abs2() > 4.0f;
 
-    // the burning tip, a little ahead of the arrow's middle
-    cXyz ahead(0.0f, 0.0f, 20.0f);
+    // The arrow's position is its back end; the head is 94 units along the model, the same spot
+    // the game hangs a bomb arrow's fuse on. Reading it off the model keeps it right in the hand
+    // (where the model follows Link's bow hand) and when it's stuck in something.
+    static cXyz headOnModel(-3.3f, -3.0f, 94.0f);
+    if (arrow->mpModel == nullptr) return;
     cXyz tip;
-    mDoMtx_stack_c::transS(arrow->current.pos);
-    mDoMtx_stack_c::ZXYrotM(arrow->shape_angle);
-    mDoMtx_stack_c::multVec(&ahead, &tip);
+    mDoMtx_multVec(arrow->mpModel->getBaseTRMtx(), &headOnModel, &tip);
 
     int fire = find_burning(id);
     // nocked: burns while there's oil for a shot, goes out if there isn't
@@ -2642,20 +2670,37 @@ static void arrow_post(ModContext*, void* args, void*, void*) {
 
     // the fire hit follows the arrow from where the tip was last frame, and stays on it once stuck
     if (!nocked && f.hitReady) {
-        static_cast<cM3dGCps*>(&f.hit)->Set(f.lastTip, tip, 30.0f);
+        static_cast<cM3dGCps*>(&f.hit)->Set(f.lastTip, tip, kFireReach);
         f.hit.CalcAtVec();
         dComIfG_Ccsp()->Set(&f.hit);
     }
     f.lastTip = tip;
     f.glow.mPosition = tip;
 
+    // the lantern's flame and its glow; a third of the size while it sits on the bow, so it
+    // doesn't swallow Link's hand, then full size once it's loose
     static const u16 kLanternFlame[2] = {0x3AF, 0x3AD};
-    for (int i = 0; i < 2; i++)
+    static const f32 kFlameSize[2] = {1.0f, 0.5f};
+    f32 size = nocked ? 1.0f / 3.0f : 1.0f;
+    for (int i = 0; i < 2; i++) {
         f.flame[i] = dComIfGp_particle_set(f.flame[i], kLanternFlame[i], &tip, &arrow->shape_angle, nullptr);
+        JPABaseEmitter* flame = dComIfGp_particle_getEmitter(f.flame[i]);
+        if (flame == nullptr) continue;
+        f32 s = size * kFlameSize[i];
+        flame->setGlobalScale(JGeometry::TVec3<f32>(s, s, s));
+        flame->setGlobalParticleScale(s, s);
+    }
 }
 
 // once a frame: arrows that are gone take their light with them
+static int oilWasEmpty = -1;  // -1 until the first look
+
 static void fire_arrow_tick() {
+    // the lantern on the button turns dark when the oil runs out, like the lantern's own icon
+    int empty = dComIfGs_getOil() == 0 ? 1 : 0;
+    if (empty != oilWasEmpty && fire_button() >= 0) redraw_buttons();
+    oilWasEmpty = empty;
+
     for (int i = 0; i < kArrowMemory; i++) {
         if (burning[i].id == fpcM_ERROR_PROCESS_ID_e || burning[i].id == 0) continue;
         if (fopAcM_SearchByID(burning[i].id) == nullptr) put_out(burning[i]);
