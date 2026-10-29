@@ -909,14 +909,24 @@ static void spawn(daAlink_c* link) {
     diveSpawn = wet(link);
 }
 
+// Getting off the sled is the game's own backflip. Other mods can refuse that backflip (Twilit
+// Essentials does when the stamina bar is empty), which would leave Link riding a sled that's
+// about to be deleted: the game crashes on his next update. So if he's still on it afterwards he
+// just stands up off it instead, and if even that is refused the sled is left alone for now.
+static bool get_off_sled(daAlink_c* link) {
+    if (!link->checkBoardRide()) return true;
+    link->setJumpMode();
+    link->procBackJumpInit(0);
+    if (!link->checkBoardRide()) return true;
+    link->procWaitInit();
+    return !link->checkBoardRide();
+}
+
 static void drop(daAlink_c* link) {
-    mounting = diveSpawn = false;
     daObjIceLeaf_c* leaf = findLeaf();
+    if (leaf && link && !get_off_sled(link)) return;  // try again next time
+    mounting = diveSpawn = false;
     if (leaf) {
-        if (link && link->checkBoardRide()) {
-            link->setJumpMode();
-            link->procBackJumpInit(0);
-        }
         // same break fx the leaf plays on its own delete, done here so it never gets skipped
         dComIfGp_particle_set(0x8C12, &leaf->eyePos, NULL, NULL);
         dComIfGp_particle_set(0x8C13, &leaf->eyePos, NULL, NULL);
@@ -3232,6 +3242,39 @@ static void force_flag(daAlink_c* lnk, daAlink_c::daPy_FLG3 flag, bool want, boo
     }
 }
 
+// Unarmed shield bash: the game's gate for it, minus the shield
+static bool unarmed_bash_ready(daAlink_c* lnk) {
+    bool ground = lnk->mLinkAcch.ChkGroundHit() || lnk->checkMagneBootsOn();
+    if (!cfgOn(vBash, true) || !ground || dComIfGp_getRStatus() != 0) return false;
+    if (!cfgOn(vSkill, false) && !dComIfGs_isEventBit(dSv_event_flag_c::F_0338) &&
+        !lnk->checkNoResetFlg3(daAlink_c::FLG3_TRANING_SHIELD_ATTACK))
+        return false;
+    if (!lnk->checkGuardActionChange() || lnk->checkUpperReadyThrowAnime()) return false;
+    return !lnk->checkModeFlg(0x70C52) && !daAlink_c::checkNotBattleStage();
+}
+
+// Mods with manual shielding (Dawnlight, for one) have Link shield while R is held during
+// targeting, and shield bash with B. The plain game never holds R while shielding (pressing it
+// bashes straight away), so shielding with R held is that style, whichever mod provides it.
+static bool manual_shielding(daAlink_c* lnk) {
+    if (lnk->checkWolf() || !lnk->checkNoResetFlg2(daAlink_c::FLG2_UNK_8000000)) return false;
+    bool holdingR = mDoCPd_c::getHoldR(PAD_1) || mDoCPd_c::getHoldLockR(PAD_1);
+    return holdingR && lnk->checkGuardActionChange();
+}
+
+// With no shield, in that style, B is the (unarmed) shield bash whatever weapon is out: it shows
+// the game's own Shield Attack on B and starts the bash before Link's update can turn the press
+// into a sword swing.
+static bool unarmed_manual_bash(daAlink_c* lnk) {
+    return !daAlink_c::checkShieldGet() && manual_shielding(lnk) && unarmed_bash_ready(lnk);
+}
+
+static HookAction manual_bash_pre(ModContext*, void* args, void*, void*) {
+    auto* lnk = mods::arg<daAlink_c*>(args, 0);
+    if (mDoCPd_c::getTrigB(PAD_1) && unarmed_manual_bash(lnk)) lnk->procGuardAttackInit();
+    return HOOK_CONTINUE;
+}
+
 static HookAction guard_pre(ModContext*, void* args, void*, void*) {
     daAlink_c* lnk = mods::arg<daAlink_c*>(args, 0);
     wasGuarding = lnk->checkUpperGuardAnime() != 0;
@@ -3263,7 +3306,10 @@ static void guard_post(ModContext*, void* args, void*, void*) {
     force_flag(lnk, daAlink_c::FLG3_TRANING_CUT_BACK, on && cfgOn(vBackAll, false), &forcedBack);
     force_flag(lnk, daAlink_c::FLG3_TRANING_CUT_DOWN, on && cfgOn(vEnding, false) && cfgOn(vEndingAll, false), &forcedDown);
 
-    if (!cfgOn(vShield, true) || lnk->checkNoResetFlg2(daAlink_c::FLG2_UNK_8000000)) return;
+    if (!cfgOn(vShield, true) || lnk->checkNoResetFlg2(daAlink_c::FLG2_UNK_8000000)) {
+        if (unarmed_manual_bash(lnk)) lnk->setBStatus(BUTTON_STATUS_SHIELD_ATTACK);
+        return;
+    }
 
     // checkGuardAccept without the shield part
     if (lnk->checkModeFlg(0x80) && !lnk->checkFmChainGrabAnime() && !daAlink_c::checkNotBattleStage() &&
@@ -3297,18 +3343,7 @@ static void item_action_post(ModContext*, void* args, void* retval, void*) {
 
     bool ground = lnk->mLinkAcch.ChkGroundHit() || lnk->checkMagneBootsOn();
 
-    // bash gate from the game, no shield check
-    bool bash = cfgOn(vBash, true) && ground && dComIfGp_getRStatus() == 0;
-    if (bash && !cfgOn(vSkill, false)) {
-        bash = dComIfGs_isEventBit(dSv_event_flag_c::F_0338);
-        if (!bash) bash = lnk->checkNoResetFlg3(daAlink_c::FLG3_TRANING_SHIELD_ATTACK);
-    }
-    if (bash && !lnk->checkGuardActionChange()) bash = false;
-    if (bash && lnk->checkUpperReadyThrowAnime()) bash = false;
-    if (bash && lnk->checkModeFlg(0x70C52)) bash = false;
-    if (bash && daAlink_c::checkNotBattleStage()) bash = false;
-
-    if (bash) {
+    if (unarmed_bash_ready(lnk)) {
         lnk->setRStatus(BUTTON_STATUS_SHIELD_ATTACK);
         if (lnk->spActionTrigger()) {
             *static_cast<int*>(retval) = lnk->procGuardAttackInit();
@@ -3317,6 +3352,8 @@ static void item_action_post(ModContext*, void* args, void* retval, void*) {
     }
 
     if (!cfgOn(vSwing, true) || !ground || daAlink_c::checkSwordGet()) return;
+    // shielding the manual way: B belongs to the shield bash (whoever shows it), not our swing
+    if (manual_shielding(lnk)) return;
     bool inCutscene = lnk->mDemo.getDemoType() != 0 || lnk->checkEventRun();
     if (inCutscene) return;
     bool onHorse = lnk->checkRideOn();
@@ -3494,6 +3531,7 @@ static void unarmed_init() {
 
     int lost = 0;
     lost += !post_hook(CheckItemAction, item_action_post);
+    lost += !pre_hook(Exec, manual_bash_pre);
     lost += !post_hook(DoStatus, do_status_post);
     lost += !pre_hook(NextAction, next_pre) + !post_hook(NextAction, next_post);
     lost += !pre_hook(CcAtCheck, cc_pre) + !post_hook(CcAtCheck, cc_post);
