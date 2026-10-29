@@ -109,10 +109,8 @@ enum FlourishMode : int { FLOURISH_ON, FLOURISH_WOODEN, FLOURISH_DEFAULT, FLOURI
 static const char* const flourishNames[] = {"On", "Wooden", "Default", "Off"};
 static ConfigVarHandle flourishOption;
 static ConfigVarHandle vLanternBurn;  // Deal Burn with Lantern
-enum HandPoseMode : int { HAND_POSE_ON, HAND_POSE_DEFAULT, HAND_POSE_OFF };
-static const char* const handPoseNames[] = {"On", "Default", "Off"};
-static ConfigVarHandle handPoseOption;  // Mortal Draw Hand Anim
-static ConfigVarHandle vFireDamage;     // Use Fire Damage (fire arrows)
+static ConfigVarHandle vHandPose;  // Mortal Draw Hand Anim
+static ConfigVarHandle vFireDamage;     // Deal Burn Damage (fire arrows)
 
 // items: which bombs can ride the Gale Boomerang (normal, water, bomblings)
 static ConfigVarHandle galeBombToggle[3];
@@ -2241,77 +2239,24 @@ static void flourish_exec_post(ModContext*, void* args, void*, void*) {
 
 // ======================== Mortal Draw Hand Anim ========================
 
-// When Link could do a mortal draw, he rests his hand on the hilt (the start of his sword-drawing
-// animation, held at frame 12). That pose is part of the game's "ready" state, which also puts
-// Draw on A, so it can't simply be switched on or off without changing what A does. Instead it's
-// added or taken away only while Link's body is being posed for drawing, and put back straight
-// after, so nothing else in the game ever sees a difference:
-//   On:      the pose whenever the sword is on his back and nothing else is moving his arms
-//   Default: the game's own behaviour
-//   Off:     the game still gets ready for a mortal draw (Draw on A works), the hand just stays put
+// When Link could do a mortal draw, he rests his hand on the hilt: the start of his sword-drawing
+// animation on his upper body. That pose is part of the game's "ready" state, which also puts Draw
+// on A, so turning the toggle off leaves the state alone and only stops the pose from showing.
+// setMatrix decides, each frame, how much of the upper-body animation his arms take before his
+// body is posed; with the toggle off and that animation being the mortal draw pose, the answer
+// becomes none. The mortal draw itself (Draw on A) works as normal.
 
-DEFINE_HOOK(&daAlink_c::modelCalc, ModelCalc);
-
-static const f32 kHandOnHilt = 12.0f;  // frame of the draw animation with the hand on the hilt
-static J3DAnmTransform* handPose;      // the draw animation, loaded where it doesn't disturb anything
-static daAlink_c* handPoseOwner;       // the Link it was loaded for (a new one comes with each area)
-
-enum PoseChange { POSE_UNTOUCHED, POSE_ADDED, POSE_HIDDEN };
-static PoseChange poseChange;
-static J3DAnmTransform* poseWasAnim;
-static f32 poseWasRatio;
-
-// Link's second upper-body slot is only used for a few walking styles; when it's free, the draw
-// animation is loaded there. The game reloads that slot whenever it needs it.
-static J3DAnmTransform* hand_pose_anim(daAlink_c* lnk) {
-    daPy_anmHeap_c& spare = lnk->mUpperAnmHeap[daAlink_c::UPPER_1];
-    if (handPoseOwner == lnk && handPose != nullptr && spare.getIdx() == dRes_ID_ALANM_BCK_WAITATOS_e)
-        return handPose;
-    if (!spare.checkNoSetIdx()) return nullptr;  // in use for something else right now
-    handPose = lnk->getAnimeResource(&spare, dRes_ID_ALANM_BCK_WAITATOS_e, 0x2C00);
-    handPoseOwner = lnk;
-    return handPose;
-}
-
-static bool hand_pose_fits(daAlink_c* lnk) {
-    if (lnk->checkWolf() || !daAlink_c::checkSwordGet() || lnk->mEquipItem != dItemNo_NONE_e) return false;
-    if (lnk->checkRideOn() || lnk->checkModeFlg(0x40000) || lnk->checkEventRun()) return false;
-    return lnk->checkNoSetUpperAnime();  // his arms are free
-}
-
-static HookAction hand_pose_pre(ModContext*, void* args, void*, void*) {
-    poseChange = POSE_UNTOUCHED;
-    auto* lnk = mods::arg<daAlink_c*>(args, 0);
-    if (mods::arg<J3DModel*>(args, 1) != lnk->mpLinkModel) return HOOK_CONTINUE;  // only his body
-    int mode = cfgInt(handPoseOption, HAND_POSE_DEFAULT);
-    mDoExt_AnmRatioPack& arms = lnk->mNowAnmPackUpper[daAlink_c::UPPER_2];
-
-    if (mode == HAND_POSE_OFF) {
-        bool ready = lnk->checkNoResetFlg0(daAlink_c::FLG0_UNK_1000000) &&
-                     lnk->checkUpperAnime(dRes_ID_ALANM_BCK_WAITATOS_e) && lnk->mEquipItem == dItemNo_NONE_e;
-        if (!ready || lnk->mProcID == daAlink_c::PROC_CUT_FAST_READY) return HOOK_CONTINUE;
-        poseWasRatio = arms.getRatio();
-        arms.setRatio(0.0f);
-        poseChange = POSE_HIDDEN;
-    } else if (mode == HAND_POSE_ON && hand_pose_fits(lnk)) {
-        J3DAnmTransform* pose = hand_pose_anim(lnk);
-        if (pose == nullptr) return HOOK_CONTINUE;
-        poseWasAnim = arms.getAnmTransform();
-        poseWasRatio = arms.getRatio();
-        pose->setFrame(kHandOnHilt);
-        arms.setAnmTransform(pose);
-        arms.setRatio(1.0f);
-        poseChange = POSE_ADDED;
-    }
-    return HOOK_CONTINUE;
-}
+DEFINE_HOOK(&daAlink_c::setMatrix, SetMatrix);
 
 static void hand_pose_post(ModContext*, void* args, void*, void*) {
-    if (poseChange == POSE_UNTOUCHED) return;
-    mDoExt_AnmRatioPack& arms = mods::arg<daAlink_c*>(args, 0)->mNowAnmPackUpper[daAlink_c::UPPER_2];
-    if (poseChange == POSE_ADDED) arms.setAnmTransform(poseWasAnim);
-    arms.setRatio(poseWasRatio);
-    poseChange = POSE_UNTOUCHED;
+    if (cfgOn(vHandPose)) return;
+    auto* lnk = mods::arg<daAlink_c*>(args, 0);
+    bool ready = lnk->checkNoResetFlg0(daAlink_c::FLG0_UNK_1000000) &&
+                 lnk->checkUpperAnime(dRes_ID_ALANM_BCK_WAITATOS_e) && lnk->mEquipItem == dItemNo_NONE_e;
+    // the cutscene version of the stance plays out in full
+    if (!ready || lnk->mProcID == daAlink_c::PROC_CUT_FAST_READY) return;
+    lnk->mNowAnmPackUpper[daAlink_c::UPPER_2].setRatio(0.0f);
+    lnk->field_0x3444 = 0.0f;  // what the arms' joints are given while he's being posed
 }
 
 // ======================== Gale-Bomb Combo ========================
@@ -2878,7 +2823,7 @@ struct BurningEnemy {
     fpc_ProcID id;
     int framesLeft;
     bool player;     // another player in Crests of Courage
-    bool fromArrow;  // a fire arrow lit it (Use Fire Damage applies), not a lantern swing
+    bool fromArrow;  // a fire arrow lit it (Deal Burn Damage applies), not a lantern swing
     u32 flame[2];
     dCcD_Stts scorchOwner;
     dCcD_Cps scorch;
@@ -2934,7 +2879,7 @@ static bool set_on_fire(fopAc_ac_c* actor) {
     return true;
 }
 
-// Use Fire Damage off: a fire arrow still sets things alight (the flame on an enemy, and on a
+// Deal Burn Damage off: a fire arrow still sets things alight (the flame on an enemy, and on a
 // player the first fire hit, which is what sets their Link on fire), but the burn does no damage
 // after that
 static bool hit_due(const BurningEnemy& enemy) {
@@ -3809,7 +3754,7 @@ static void combat_rows() {
 
     heading("Misc");
     choice("Sword Flourish", flourishOption, flourishNames, 4);
-    choice("Mortal Draw Hand Anim", handPoseOption, handPoseNames, 3);
+    toggle("Mortal Draw Hand Anim", vHandPose);
     toggle("Deal Burn with Lantern", vLanternBurn);
 }
 
@@ -3827,7 +3772,7 @@ static void item_rows() {
     toggle("Gale Boomerang + Bomblings", galeBombToggle[2], combos_off);
     note("Fire Arrows");
     toggle("Bow + Lantern", vFireArrows, combos_off);
-    toggle("Use Fire Damage", vFireDamage, fire_arrows_off);
+    toggle("Deal Burn Damage", vFireDamage, fire_arrows_off);
 }
 
 static const char* const tabTitles[3] = {"Quality of Life", "Combat", "Items"};
@@ -4051,9 +3996,8 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     // --- Combat > Misc: Sword Flourish and Deal Burn with Lantern ---
     if (!add_int_option("swordFlourish", FLOURISH_DEFAULT, &flourishOption)) flourishOption = 0;
     add_bool_option("lanternBurn", true, &vLanternBurn);
-    if (!add_int_option("mortalDrawHand", HAND_POSE_DEFAULT, &handPoseOption)) handPoseOption = 0;
-    if (!(pre_hook(ModelCalc, hand_pose_pre) && post_hook(ModelCalc, hand_pose_post)))
-        mods::log::warn("Mortal Draw Hand Anim stays at the game's normal behaviour");
+    add_bool_option("mortalDrawHandAnim", true, &vHandPose);
+    if (!post_hook(SetMatrix, hand_pose_post)) mods::log::warn("Mortal Draw Hand Anim stays on");
     // rides along on Link's update, next to the Ice Leaf's own hooks there
     bool flourishOk = pre_hook(Exec, flourish_exec_pre) && post_hook(Exec, flourish_exec_post);
     if (!flourishOk) mods::log::warn("sword flourish stays at the game's normal behaviour");
