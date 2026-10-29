@@ -108,6 +108,7 @@ static ConfigVarHandle vBoost, vAlways, vGoron, vChud, vLeaf;
 enum FlourishMode : int { FLOURISH_ON, FLOURISH_WOODEN, FLOURISH_DEFAULT, FLOURISH_OFF };
 static const char* const flourishNames[] = {"On", "Wooden", "Default", "Off"};
 static ConfigVarHandle flourishOption;
+static ConfigVarHandle vLanternBurn;  // Deal Burn with Lantern
 
 // items: which bombs can ride the Gale Boomerang (normal, water, bomblings)
 static ConfigVarHandle galeBombToggle[3];
@@ -2433,13 +2434,15 @@ static void ring_post(ModContext*, void* args, void*, void*) {
 
 // --- the boomerang button icon: the bow-combo layout, with the boomerang where the bow would be ---
 
-// The bomb arrow icon is two pictures: the bomb in front, the bow behind it. Both of our combos
-// draw the button as a bomb arrow, so the HUD uses the bomb arrow's own size, position and tilt
-// for it, and then repaint one picture:
-//   Gale-Bomb:   the bomb stays, the boomerang is painted over the bow
-//   Fire Arrows: the bow stays, the lantern is painted over the bomb
-// (Drawn as the bow or the boomerang instead, the front picture took that item's bigger, offset
-// and tilted placement, which stretched the lantern and knocked the bomb sideways.)
+// The bomb arrow icon is two pictures: the main one in front (the bomb), and a small bow in its
+// own little frame behind it. While the HUD reads the button's picture, our combos ask for the
+// bomb arrow's two pictures instead and repaint one:
+//   Gale-Bomb:   the bomb stays in front, the boomerang goes in the small frame
+//   Fire Arrows: the lantern goes in front, the game's own small bow stays in its frame
+// The HUD sizes the front picture for the button's real item, though. That's fine for the bomb,
+// but for Fire Arrows it's the bow's big, offset placement, which stretched the lantern; so once
+// the button is drawn, its front picture is placed again the way the lantern's own icon is sized
+// and the way the bomb arrow's front picture sits.
 static int galeIconButton = -1;  // button drawing the boomerang with bombs tied on, -1 if none
 static int fireIconButton = -1;  // button drawing the fire-arrow bow, -1 if none
 static u8 repaintItem;           // what goes over the borrowed picture after the read, 0 = nothing
@@ -2452,33 +2455,62 @@ static HookAction button_icon_pre(ModContext*, void* args, void*, void*) {
     u8 shown = mods::arg<u8>(args, 2);
     galeIconButton = shown == dItemNo_BOOMERANG_e && armed_bag() >= 0 ? button : -1;
     fireIconButton = shown == dItemNo_BOW_e && fire_button() == button ? button : -1;
-    if (galeIconButton >= 0 || fireIconButton >= 0) mods::arg_ref<u8>(args, 2) = dItemNo_BOMB_ARROW_e;
     return HOOK_CONTINUE;
 }
 
-static void button_icon_post(ModContext*, void*, void*, void*) {
+// the same sizing the HUD does in changeTextureItemXY and drawButtonXY, for a picture already loaded
+static void place_front_picture(dMeter2Draw_c* hud, int button, u8 sizedAs, u8 placedAs) {
+    CPaneMgr* pane = hud->mpItemXY[button];
+    ResTIMG* tex = hud->mpItemXYTex[button][hud->field_0x76c[button]][0];
+    if (pane == nullptr || tex == nullptr) return;
+
+    f32 size = dItem_data::getTexScale(sizedAs) / 100.0f;
+    if (g_drawHIO.mItemScaleAdjustON) size = g_drawHIO.mItemScalePercent / 100.0f;
+    f32 wide = size * (tex->width * pane->getInitSizeX() / 48.0f);
+    f32 tall = size * (tex->height * pane->getInitSizeY() / 48.0f);
+    hud->field_0x6c4[button] = wide;
+    hud->field_0x6d0[button] = tall;
+    hud->field_0x6ac[button] = (pane->getInitSizeX() - wide) * 0.5f;
+    hud->field_0x6b8[button] = (pane->getInitSizeY() - tall) * 0.5f;
+    pane->resize(wide, tall);
+
+    if (button == 0) hud->setItemParamX(placedAs);
+    else hud->setItemParamY(placedAs);
+    const auto& spot = hud->mItemParams[button];
+    pane->getPanePtr()->rotate(pane->getSizeX() * 0.5f, pane->getSizeY() * 0.5f, ROTATE_Z, spot.rotation);
+    f32 scale = spot.scale * g_drawHIO.field_0x54c;
+    pane->scale(scale, scale);
+    pane->paneTrans(spot.pos_x + hud->field_0x6ac[button], spot.pos_y + hud->field_0x6b8[button]);
+}
+
+static void button_icon_post(ModContext*, void* args, void*, void*) {
+    bool itemsShown = mods::arg<bool>(args, 4);
+    if (fireIconButton >= 0 && itemsShown)
+        place_front_picture(mods::arg<dMeter2Draw_c*>(args, 0), fireIconButton, dItemNo_KANTERA_e,
+                            dItemNo_BOMB_ARROW_e);
     galeIconButton = fireIconButton = -1;
 }
 
 static HookAction combo_tex_pre(ModContext*, void* args, void*, void*) {
     repaintItem = 0;
     if (repainting) return HOOK_CONTINUE;  // our own repaint comes back through here
-    u8 item = mods::arg<u8>(args, 1);
+    u8& item = mods::arg_ref<u8>(args, 1);
     void* front = mods::arg<void*>(args, 2);
     void* back = mods::arg<void*>(args, 4);
     if (front == nullptr || back == nullptr) return HOOK_CONTINUE;
 
-    if (item != dItemNo_BOMB_ARROW_e) return HOOK_CONTINUE;
-
-    if (galeIconButton >= 0) {
+    if (galeIconButton >= 0 && item == dItemNo_BOOMERANG_e) {
         repaintItem = dItemNo_BOOMERANG_e;
         repaintTex = back;
         repaintPic = mods::arg<J2DPicture*>(args, 5);
-    } else if (fireIconButton >= 0) {
+    } else if (fireIconButton >= 0 && item == dItemNo_BOW_e) {
         repaintItem = dItemNo_KANTERA_e;  // shows the unlit lantern when the oil's run out
         repaintTex = front;
         repaintPic = mods::arg<J2DPicture*>(args, 3);
+    } else {
+        return HOOK_CONTINUE;
     }
+    item = dItemNo_BOMB_ARROW_e;
     return HOOK_CONTINUE;
 }
 
@@ -2578,7 +2610,6 @@ struct BurningArrow {
     dCcD_Stts hitOwner;
     dCcD_Cps hit;
     cXyz lastTip;
-    cXyz moved;  // how far the head went this frame; the flame's particles are carried along by it
     bool spread;  // already set an enemy on fire; one arrow sets one fire
     bool hitReady;
     LIGHT_INFLUENCE glow;
@@ -2609,18 +2640,13 @@ static bool can_fire() {
     return fire_button() >= 0 && cost > 0 && dComIfGs_getOil() >= cost;
 }
 
-// the flame's particles stop following once the arrow's gone
+// forget a flame; once nothing sets it again each frame, the game lets it die out
 static void let_flames_go(u32* flames, int count) {
-    for (int i = 0; i < count; i++) {
-        JPABaseEmitter* flame = dComIfGp_particle_getEmitter(flames[i]);
-        if (flame != nullptr) flame->setParticleCallBackPtr(nullptr);
-        flames[i] = 0;
-    }
+    for (int i = 0; i < count; i++) flames[i] = 0;
 }
 
 static void put_out(BurningArrow& fire) {
     let_flames_go(fire.flame, 2);
-    fire.moved.set(0.0f, 0.0f, 0.0f);
     if (fire.glowing) dKy_plight_cut(&fire.glow);
     fire.glowing = false;
     fire.hitReady = false;
@@ -2641,7 +2667,6 @@ static int light_arrow(daArrow_c* arrow, const cXyz& tip) {
     fire.id = fopAcM_GetID(arrow);
     fire.flame[0] = fire.flame[1] = 0;
     fire.lastTip = tip;
-    fire.moved.set(0.0f, 0.0f, 0.0f);
     fire.spread = false;
     fire.hitOwner.Init(0xFF, 0xFF, arrow);
     fire.hit.Set(kArrowFireSrc);
@@ -2666,10 +2691,19 @@ static bool was_judged(fpc_ProcID id) {
     return false;
 }
 
-// --- enemies set on fire ---
-// An enemy a burning arrow hits (or whose fire brushes it) burns for a few seconds: the lantern's
-// flame on its body, and two scorches of fire damage, each about an Ordon Sword hit. The scorch is
-// the lantern's fire hit with some power, so enemies take it like one of Link's own hits.
+// --- enemies and players set on fire ---
+// An enemy a burning arrow sticks in (or whose fire passes close by it) burns for a few seconds:
+// the lantern's flame on its body, and two scorches of fire damage, each about an Ordon Sword hit.
+// The scorch is the lantern's fire hit with some power, so enemies take it like one of Link's own
+// hits. Stepping into water puts it out. With Deal Burn with Lantern on, a lantern swing that
+// reaches an enemy does the same.
+// Who's close enough is measured here rather than waiting for the game to report a hit, since a
+// lot of enemies never report being touched by the lantern's kind of fire.
+//
+// Other players in Crests of Courage are a stand-in actor of its own ("cpRival", counted as an
+// enemy) that passes any hit on to that player's game, fire included. So a player gets no big
+// flame: they get one fire hit instead, and their own game does the rest the way it does for any
+// fire attack on Link (Link catches fire, a Wooden Shield he blocks with burns, water puts it out).
 
 static const int kBurnFrames = 120;
 static const int kScorchAt[2] = {100, 50};  // frames left when each scorch lands
@@ -2687,6 +2721,26 @@ static const dCcD_SrcCps kScorchSrc = {
     },
 };
 
+// the stand-in Crests of Courage uses for another player, if it's loaded
+static bool is_other_player(fopAc_ac_c* actor) {
+    dStage_objectNameInf* rival = dStage_searchName("cpRival");
+    return rival != nullptr && fopAcM_GetName(actor) == rival->procname;
+}
+
+// one fire hit on another player, then a breather so it isn't every frame
+static const int kPlayerFireGap = 90;
+static const int kMaxPlayersHit = 4;
+
+struct PlayerFireHit {
+    fpc_ProcID id;
+    int waitLeft;
+    bool due;
+    dCcD_Stts owner;
+    dCcD_Cps hit;
+};
+
+static PlayerFireHit playerFire[kMaxPlayersHit];
+
 struct BurningEnemy {
     fpc_ProcID id;
     int framesLeft;
@@ -2703,10 +2757,28 @@ static void stop_burning(BurningEnemy& enemy) {
     enemy.id = fpcM_ERROR_PROCESS_ID_e;
 }
 
-// true if it's an enemy that's burning now
+static bool burn_player(fopAc_ac_c* player, daAlink_c* link) {
+    fpc_ProcID id = fopAcM_GetID(player);
+    PlayerFireHit* spot = nullptr;
+    for (int i = 0; i < kMaxPlayersHit; i++) {
+        if (playerFire[i].waitLeft > 0 && playerFire[i].id == id) return true;  // just burned
+        if (spot == nullptr && playerFire[i].waitLeft <= 0) spot = &playerFire[i];
+    }
+    if (spot == nullptr) return false;
+    spot->id = id;
+    spot->waitLeft = kPlayerFireGap;
+    spot->due = true;
+    spot->owner.Init(0xFF, 0xFF, link);
+    spot->hit.Set(kScorchSrc);  // the same fire hit an enemy's scorch is
+    spot->hit.SetStts(&spot->owner);
+    return true;
+}
+
+// true if it's an enemy (or another player) that's burning now
 static bool set_on_fire(fopAc_ac_c* actor) {
     daAlink_c* link = daAlink_getAlinkActorClass();
     if (actor == nullptr || link == nullptr || fopAcM_GetGroup(actor) != fopAc_ENEMY_e) return false;
+    if (is_other_player(actor)) return burn_player(actor, link);
     fpc_ProcID id = fopAcM_GetID(actor);
 
     // already burning: just keeps burning
@@ -2726,14 +2798,39 @@ static bool set_on_fire(fopAc_ac_c* actor) {
     return true;
 }
 
+// standing in water deep enough to cover its feet
+static bool in_water(fopAc_ac_c* actor) {
+    cXyz feet = actor->current.pos;
+    return fopAcM_wt_c::waterCheck(&feet) && fopAcM_wt_c::getWaterY() > feet.y + 10.0f;
+}
+
+static void burn_players() {
+    for (int i = 0; i < kMaxPlayersHit; i++) {
+        PlayerFireHit& player = playerFire[i];
+        if (player.waitLeft <= 0) continue;
+        player.waitLeft--;
+        if (!player.due) continue;
+        player.due = false;
+        fopAc_ac_c* actor = fopAcM_SearchByID(player.id);
+        if (actor == nullptr) continue;
+        cXyz head = actor->current.pos;
+        head.y += 120.0f;  // about Link's height
+        static_cast<cM3dGCps*>(&player.hit)->Set(actor->current.pos, head, 60.0f);
+        player.hit.CalcAtVec();
+        player.hit.ResetAtHit();
+        dComIfG_Ccsp()->Set(&player.hit);
+    }
+}
+
 // runs with Link's update, so the scorch is in time for this frame's hits
 static void burn_enemies() {
     static const u16 kLanternFlame[2] = {0x3AF, 0x3AD};
+    burn_players();
     for (int i = 0; i < kMaxBurning; i++) {
         BurningEnemy& enemy = onFire[i];
         if (enemy.framesLeft <= 0) continue;
         fopAc_ac_c* actor = fopAcM_SearchByID(enemy.id);
-        if (actor == nullptr || --enemy.framesLeft == 0) {
+        if (actor == nullptr || --enemy.framesLeft == 0 || in_water(actor)) {
             stop_burning(enemy);
             continue;
         }
@@ -2755,8 +2852,50 @@ static void burn_enemies() {
     }
 }
 
-static void burn_post(ModContext*, void*, void*, void*) {
-    if (fire_on()) burn_enemies();
+// how close a point is to the line from an actor's feet to its eyes (its body, roughly)
+static f32 distance_to_body(const cXyz& at, fopAc_ac_c* actor) {
+    cXyz feet = actor->current.pos;
+    cXyz up = actor->eyePos - feet;
+    f32 tall = up.abs2();
+    f32 along = tall > 1.0f ? (at - feet).inprod(up) / tall : 0.0f;
+    if (along < 0.0f) along = 0.0f;
+    if (along > 1.0f) along = 1.0f;
+    cXyz nearest = feet + up * along;
+    return at.abs(nearest);
+}
+
+struct FireNearby {
+    cXyz at;
+    f32 reach;
+    bool lit;
+};
+
+// called for every actor in the scene; never stops the search early
+static void* catch_fire_nearby(void* actor, void* data) {
+    auto* ac = static_cast<fopAc_ac_c*>(actor);
+    auto* fire = static_cast<FireNearby*>(data);
+    if (fopAcM_GetGroup(ac) != fopAc_ENEMY_e) return nullptr;
+    if (distance_to_body(fire->at, ac) > fire->reach) return nullptr;
+    if (set_on_fire(ac)) fire->lit = true;
+    return nullptr;
+}
+
+static bool set_fire_around(const cXyz& at, f32 reach) {
+    FireNearby fire = {at, reach, false};
+    fopAcIt_Judge(catch_fire_nearby, &fire);
+    return fire.lit;
+}
+
+// Deal Burn with Lantern: the swing's fire is live only for part of the swing, with oil
+static void lantern_swing_burns(daAlink_c* link) {
+    if (!cfgOn(vLanternBurn) || link->mProcID != daAlink_c::PROC_KANDELAAR_SWING) return;
+    if (!link->mAtSph.ChkAtSet()) return;
+    set_fire_around(link->mKandelaarFlamePos, link->mAtSph.GetR() + 30.0f);
+}
+
+static void burn_post(ModContext*, void* args, void*, void*) {
+    lantern_swing_burns(mods::arg<daAlink_c*>(args, 0));
+    burn_enemies();
 }
 
 static void arrow_post(ModContext*, void* args, void*, void*) {
@@ -2776,9 +2915,11 @@ static void arrow_post(ModContext*, void* args, void*, void*) {
     if (!is_own_arrow(id)) return;
 
     // The arrow's position is its back end; the head is 94 units along the shaft, the same spot
-    // the game hangs a bomb arrow's fuse on. On the bow and stuck in something, the model already
-    // sits where it's drawn. In flight the model is only placed when it's drawn, a frame behind
-    // a very fast arrow, so the head is worked out from where the arrow is right now instead.
+    // the game hangs a bomb arrow's fuse on. On the bow the model already sits where it's drawn.
+    // In flight the model is only placed when it's drawn, a frame behind a very fast arrow, so the
+    // head is worked out from where the arrow is right now instead.
+    // Once it stops (stuck in the ground, a wall or an enemy), the game moves its position right
+    // onto the point it hit, which is where the head is.
     static cXyz headOnModel(-3.3f, -3.0f, 94.0f);
     if (arrow->mpModel == nullptr) return;
     cXyz tip;
@@ -2786,8 +2927,10 @@ static void arrow_post(ModContext*, void* args, void*, void*) {
         mDoMtx_stack_c::transS(arrow->current.pos);
         mDoMtx_stack_c::ZXYrotM(arrow->shape_angle.x, arrow->shape_angle.y, 0);
         mDoMtx_stack_c::multVec(&headOnModel, &tip);
-    } else {
+    } else if (nocked) {
         mDoMtx_multVec(arrow->mpModel->getBaseTRMtx(), &headOnModel, &tip);
+    } else {
+        tip = arrow->current.pos;
     }
 
     int fire = find_burning(id);
@@ -2809,11 +2952,13 @@ static void arrow_post(ModContext*, void* args, void*, void*) {
     if (fire < 0) return;
     BurningArrow& f = burning[fire];
 
-    // whatever the arrow or its fire touched last frame catches fire, if it's an enemy
-    // (once: an arrow left stuck in an enemy doesn't keep relighting it)
+    // The enemy it sticks in catches fire, or one its flame passes close to. Once only: an arrow
+    // left stuck in an enemy doesn't keep relighting it. (A shield block doesn't count.)
     if (!nocked && !f.spread) {
-        if (arrow->field_0x688.ChkAtHit()) f.spread = set_on_fire(arrow->field_0x688.GetAtHitAc());
-        if (!f.spread && f.hitReady && f.hit.ChkAtHit()) f.spread = set_on_fire(f.hit.GetAtHitAc());
+        u32 stuckIn = arrow->getHitAcID();
+        if (stuckIn != 0xFFFFFFFFu && arrow->field_0x93e == 0)
+            f.spread = set_on_fire(fopAcM_SearchByID(stuckIn));
+        if (!f.spread && flying) f.spread = set_fire_around(tip, kFireReach + 20.0f);
     }
 
     // the fire hit follows the arrow from where the tip was last frame, and stays on it once stuck
@@ -2822,26 +2967,21 @@ static void arrow_post(ModContext*, void* args, void*, void*) {
         f.hit.CalcAtVec();
         dComIfG_Ccsp()->Set(&f.hit);
     }
-    f.moved = tip - f.lastTip;
     f.lastTip = tip;
     f.glow.mPosition = tip;
 
-    // the lantern's flame and its glow; a third of the size while it sits on the bow, so it
-    // doesn't swallow Link's hand, then full size once it's loose
+    // The lantern's flame, set up exactly the way the flame on a burning enemy is (the one other
+    // players in Crests of Courage can see), only smaller: a third of the enemy's size once it's
+    // loose, and smaller again while it sits on the bow so it doesn't swallow Link's hand.
     static const u16 kLanternFlame[2] = {0x3AF, 0x3AD};
-    static const f32 kFlameSize[2] = {1.0f, 0.5f};
-    f32 size = nocked ? 1.0f / 3.0f : 1.0f;
+    static const f32 kFlameSize[2] = {0.5f, 0.25f};  // the burning enemy's are 1.5 and 0.75
+    f32 size = nocked ? 0.5f : 1.0f;
     for (int i = 0; i < 2; i++) {
         f.flame[i] = dComIfGp_particle_set(f.flame[i], kLanternFlame[i], &tip, &arrow->shape_angle, nullptr);
         JPABaseEmitter* flame = dComIfGp_particle_getEmitter(f.flame[i]);
         if (flame == nullptr) continue;
         f32 s = size * kFlameSize[i];
         flame->setGlobalScale(JGeometry::TVec3<f32>(s, s, s));
-        flame->setGlobalParticleScale(s, s);
-        // a flame already in the air moves with the head instead of being left behind it
-        // (the game's own trick for the smoke off a bomb arrow's fuse)
-        flame->setParticleCallBackPtr(dPa_control_c::getParticleTracePCB());
-        flame->setUserWork((uintptr_t)&f.moved);
     }
 }
 
@@ -2862,6 +3002,7 @@ static void fire_arrow_tick() {
 
 static void fire_arrow_shutdown() {
     for (int i = 0; i < kMaxBurning; i++) stop_burning(onFire[i]);
+    for (int i = 0; i < kMaxPlayersHit; i++) playerFire[i].waitLeft = 0;
     for (int i = 0; i < kArrowMemory; i++) put_out(burning[i]);
 }
 
@@ -3498,9 +3639,6 @@ static void quality_rows() {
 static const char* const damageNames[] = {"x0.5 Wooden Sword", "x1 Ordon Sword", "x2 Master Sword", "x4 Light Sword"};
 
 static void combat_rows() {
-    heading("Sword Flourish");
-    choice("Flourish when sheathing", flourishOption, flourishNames, 4);
-
     heading("Unarmed Combat");
     note("Unarmed Shielding");
     toggle("Blocking while unarmed", vShield);
@@ -3519,6 +3657,10 @@ static void combat_rows() {
     toggle("Helm splitter while unarmed", vHead, swing_off);
     toggle("Always have helm splitter", vHeadAll, move_off, &vHead);
     toggle("Always have back slice", vBackAll, swing_off);
+
+    heading("Misc");
+    choice("Sword Flourish", flourishOption, flourishNames, 4);
+    toggle("Deal Burn with Lantern", vLanternBurn);
 }
 
 static void item_rows() {
@@ -3755,8 +3897,9 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     if (missed) mods::log::warn("{} unarmed settings didn't register, those use their defaults", missed);
     unarmed_init();
 
-    // --- Sword Flourish ---
+    // --- Combat > Misc: Sword Flourish and Deal Burn with Lantern ---
     if (!add_int_option("swordFlourish", FLOURISH_DEFAULT, &flourishOption)) flourishOption = 0;
+    add_bool_option("lanternBurn", true, &vLanternBurn);
     // rides along on Link's update, next to the Ice Leaf's own hooks there
     bool flourishOk = pre_hook(Exec, flourish_exec_pre) && post_hook(Exec, flourish_exec_post);
     if (!flourishOk) mods::log::warn("sword flourish stays at the game's normal behaviour");
