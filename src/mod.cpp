@@ -109,6 +109,7 @@ enum FlourishMode : int { FLOURISH_ON, FLOURISH_WOODEN, FLOURISH_DEFAULT, FLOURI
 static const char* const flourishNames[] = {"On", "Wooden", "Default", "Off"};
 static ConfigVarHandle flourishOption;
 static ConfigVarHandle vLanternBurn;  // Deal Burn with Lantern
+static ConfigVarHandle vManualShield; // Manual Shielding
 static ConfigVarHandle vHandPose;  // Mortal Draw Hand Anim
 static ConfigVarHandle vFireDamage;     // Deal Burn Damage (fire arrows)
 
@@ -909,17 +910,33 @@ static void spawn(daAlink_c* link) {
     diveSpawn = wet(link);
 }
 
-// Getting off the sled is the game's own backflip. Other mods can refuse that backflip (Twilit
-// Essentials does when the stamina bar is empty), which would leave Link riding a sled that's
-// about to be deleted: the game crashes on his next update. So if he's still on it afterwards he
-// just stands up off it instead, and if even that is refused the sled is left alone for now.
+// Getting off the sled is the game's own backflip, both when we put the sled away and when the
+// game itself does (riding off the snow). Other mods can refuse that backflip (a stamina mod with
+// an empty bar, say). The game deletes the sled straight after asking for it either way, so Link
+// would be left "riding" a sled that's gone: the next time he gets off it for real, the game
+// crashes. So whenever a backflip asked for from the sled is refused, Link stands up off the sled
+// instead (the game's own stand-still), which gets him off it properly before it goes.
+
+DEFINE_HOOK(&daAlink_c::procBackJumpInit, BackJump);
+
+static bool backflipFromSled;
+
+static HookAction backflip_pre(ModContext*, void* args, void*, void*) {
+    backflipFromSled = mods::arg<daAlink_c*>(args, 0)->checkBoardRide();
+    return HOOK_CONTINUE;
+}
+
+static void backflip_post(ModContext*, void* args, void*, void*) {
+    auto* link = mods::arg<daAlink_c*>(args, 0);
+    if (backflipFromSled && link->checkBoardRide()) link->procWaitInit();  // the backflip was refused
+    backflipFromSled = false;
+}
+
 static bool get_off_sled(daAlink_c* link) {
     if (!link->checkBoardRide()) return true;
     link->setJumpMode();
     link->procBackJumpInit(0);
-    if (!link->checkBoardRide()) return true;
-    link->procWaitInit();
-    return !link->checkBoardRide();
+    return !link->checkBoardRide();  // still on: leave the sled alone for now
 }
 
 static void drop(daAlink_c* link) {
@@ -3279,6 +3296,54 @@ static bool unarmed_manual_bash(daAlink_c* lnk) {
     return !daAlink_c::checkShieldGet() && manual_shielding(lnk) && unarmed_bash_ready(lnk, true);
 }
 
+// --- Manual Shielding (Combat > Misc) ---
+// Our own take on that style: L targets as usual, holding R as well raises the shield (Link no
+// longer shields just because he's targeting), B while shielding is the shield bash, and R no
+// longer bashes on its own. With the "hold" style of targeting, R alone shields while a target is
+// locked. Works with a shield, and without one when Blocking while unarmed is on.
+
+static bool our_manual_shielding() { return cfgOn(vManualShield, false); }
+
+// the game's own bash gate with a shield (the skill, targeting, on the ground...), R aside
+static bool shield_bash_ready_on_b(daAlink_c* lnk) {
+    if (!daAlink_c::checkShieldGet()) return unarmed_bash_ready(lnk, true);
+    bool ground = lnk->mLinkAcch.ChkGroundHit() || lnk->checkMagneBootsOn();
+    bool skill = dComIfGs_isEventBit(dSv_event_flag_c::F_0338) ||
+                 lnk->checkNoResetFlg3(daAlink_c::FLG3_TRANING_SHIELD_ATTACK);
+    return ground && skill && lnk->checkGuardActionChange() && !lnk->checkUpperReadyThrowAnime() &&
+           !lnk->checkModeFlg(0x70C52) && !daAlink_c::checkNotBattleStage();
+}
+
+static bool bash_on_b(daAlink_c* lnk) {
+    if (our_manual_shielding()) return manual_shielding(lnk) && shield_bash_ready_on_b(lnk);
+    return unarmed_manual_bash(lnk);  // someone else's manual shielding, no shield
+}
+
+static bool in_guard_proc(daAlink_c* lnk) {
+    return lnk->mProcID == daAlink_c::PROC_GUARD_SLIP || lnk->mProcID == daAlink_c::PROC_GUARD_ATTACK ||
+           lnk->mProcID == daAlink_c::PROC_GUARD_BREAK;
+}
+
+// after the game (and Blocking while unarmed) decided whether he's shielding this frame
+static void manual_guard(daAlink_c* lnk) {
+    if (!our_manual_shielding() || lnk->checkWolf()) return;
+    bool held = manual_shield_held(lnk) && lnk->checkGuardActionChange();
+    if (!held && !in_guard_proc(lnk)) lnk->offNoResetFlg2(daAlink_c::FLG2_UNK_8000000);
+    if (dComIfGp_getRStatus() == BUTTON_STATUS_SHIELD_ATTACK) lnk->setRStatus(BUTTON_STATUS_NONE);
+}
+
+// R's own bash is turned away while this is on; only the bash started from B goes through
+// (and any the game plays in a cutscene)
+DEFINE_HOOK(&daAlink_c::procGuardAttackInit, GuardAttackInit);
+static bool bashFromB;
+
+static HookAction guard_attack_pre(ModContext*, void* args, void* ret, void*) {
+    auto* lnk = mods::arg<daAlink_c*>(args, 0);
+    if (!our_manual_shielding() || bashFromB || lnk->checkEventRun()) return HOOK_CONTINUE;
+    if (ret) *static_cast<int*>(ret) = 0;
+    return HOOK_SKIP_ORIGINAL;
+}
+
 // One bash at a time, with a breather after it, the way the bash on R can't be spammed either.
 static const int kBashGap = 30;  // frames after a bash ends before the next one
 static int bashWait;
@@ -3288,8 +3353,10 @@ static HookAction manual_bash_pre(ModContext*, void* args, void*, void*) {
     bool bashing = lnk->mProcID == daAlink_c::PROC_GUARD_ATTACK;
     if (bashing) bashWait = kBashGap;
     else if (bashWait > 0) bashWait--;
-    if (bashing || bashWait > 0 || !mDoCPd_c::getTrigB(PAD_1)) return HOOK_CONTINUE;
-    if (unarmed_manual_bash(lnk)) lnk->procGuardAttackInit();
+    if (bashing || bashWait > 0 || !mDoCPd_c::getTrigB(PAD_1) || !bash_on_b(lnk)) return HOOK_CONTINUE;
+    bashFromB = true;
+    lnk->procGuardAttackInit();
+    bashFromB = false;
     return HOOK_CONTINUE;
 }
 
@@ -3333,7 +3400,8 @@ static void guard_post(ModContext*, void* args, void*, void*) {
         lnk->checkGuardActionChange())
         lnk->onNoResetFlg2(daAlink_c::FLG2_UNK_8000000);
 
-    if (unarmed_manual_bash(lnk)) lnk->setBStatus(BUTTON_STATUS_SHIELD_ATTACK);
+    manual_guard(lnk);
+    if (bash_on_b(lnk)) lnk->setBStatus(BUTTON_STATUS_SHIELD_ATTACK);
 }
 
 // even steps = hand swing arm, odd steps = right hook (end of the right spin cut arm, no spin). same lunge
@@ -3549,6 +3617,7 @@ static void unarmed_init() {
     int lost = 0;
     lost += !post_hook(CheckItemAction, item_action_post);
     lost += !pre_hook(Exec, manual_bash_pre);
+    lost += !pre_hook(GuardAttackInit, guard_attack_pre);
     lost += !post_hook(DoStatus, do_status_post);
     lost += !pre_hook(NextAction, next_pre) + !post_hook(NextAction, next_post);
     lost += !pre_hook(CcAtCheck, cc_pre) + !post_hook(CcAtCheck, cc_post);
@@ -3810,6 +3879,7 @@ static void combat_rows() {
     heading("Misc");
     choice("Sword Flourish", flourishOption, flourishNames, 4);
     toggle("Mortal Draw Hand Anim", vHandPose);
+    toggle("Manual Shielding", vManualShield);
     toggle("Deal Burn with Lantern", vLanternBurn);
 }
 
@@ -3993,6 +4063,8 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     res = mods::hook::add_post<LineUp>(lineup_post);
     if (res == MOD_OK) res = mods::hook::add_pre<MsgStr>(msg_pre);
     if (res == MOD_OK) res = mods::hook::add_pre<ReadTex>(tex_pre);
+    if (!(pre_hook(BackJump, backflip_pre) && post_hook(BackJump, backflip_post)))
+        mods::log::warn("a refused backflip off the sled can leave Link riding nothing");
     if (res == MOD_OK) res = mods::hook::add_post<ReadTex>(tex_post);
     if (res != MOD_OK)
         mods::log::warn("wheel hooks failed ({}), item may be missing its name or icon", (int)res);
@@ -4051,6 +4123,7 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     // --- Combat > Misc: Sword Flourish and Deal Burn with Lantern ---
     if (!add_int_option("swordFlourish", FLOURISH_DEFAULT, &flourishOption)) flourishOption = 0;
     add_bool_option("lanternBurn", true, &vLanternBurn);
+    add_bool_option("manualShielding", false, &vManualShield);
     add_bool_option("mortalDrawHandAnim", true, &vHandPose);
     if (!post_hook(SetMatrix, hand_pose_post)) mods::log::warn("Mortal Draw Hand Anim stays on");
     // rides along on Link's update, next to the Ice Leaf's own hooks there
