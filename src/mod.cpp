@@ -2567,6 +2567,8 @@ struct BurningArrow {
     dCcD_Stts hitOwner;
     dCcD_Cps hit;
     cXyz lastTip;
+    cXyz moved;  // how far the head went this frame; the flame's particles are carried along by it
+    bool spread;  // already set an enemy on fire; one arrow sets one fire
     bool hitReady;
     LIGHT_INFLUENCE glow;
     bool glowing;
@@ -2586,7 +2588,18 @@ static bool can_fire() {
     return fire_button() >= 0 && cost > 0 && dComIfGs_getOil() >= cost;
 }
 
+// the flame's particles stop following once the arrow's gone
+static void let_flames_go(u32* flames, int count) {
+    for (int i = 0; i < count; i++) {
+        JPABaseEmitter* flame = dComIfGp_particle_getEmitter(flames[i]);
+        if (flame != nullptr) flame->setParticleCallBackPtr(nullptr);
+        flames[i] = 0;
+    }
+}
+
 static void put_out(BurningArrow& fire) {
+    let_flames_go(fire.flame, 2);
+    fire.moved.set(0.0f, 0.0f, 0.0f);
     if (fire.glowing) dKy_plight_cut(&fire.glow);
     fire.glowing = false;
     fire.hitReady = false;
@@ -2607,6 +2620,8 @@ static int light_arrow(daArrow_c* arrow, const cXyz& tip) {
     fire.id = fopAcM_GetID(arrow);
     fire.flame[0] = fire.flame[1] = 0;
     fire.lastTip = tip;
+    fire.moved.set(0.0f, 0.0f, 0.0f);
+    fire.spread = false;
     fire.hitOwner.Init(0xFF, 0xFF, arrow);
     fire.hit.Set(kArrowFireSrc);
     fire.hit.SetStts(&fire.hitOwner);
@@ -2630,6 +2645,99 @@ static bool was_judged(fpc_ProcID id) {
     return false;
 }
 
+// --- enemies set on fire ---
+// An enemy a burning arrow hits (or whose fire brushes it) burns for a few seconds: the lantern's
+// flame on its body, and two scorches of fire damage, each about an Ordon Sword hit. The scorch is
+// the lantern's fire hit with some power, so enemies take it like one of Link's own hits.
+
+static const int kBurnFrames = 120;
+static const int kScorchAt[2] = {100, 50};  // frames left when each scorch lands
+static const int kMaxBurning = 8;
+
+static const dCcD_SrcCps kScorchSrc = {
+    {
+        {0x0, {{AT_TYPE_LANTERN_SWING, 0x2, 0x1B}, {0x0, 0x0}, 0x0}},
+        {dCcD_SE_NONE, 0x0, 0x0, dCcD_MTRL_FIRE, 0x0},
+        {dCcD_SE_NONE, 0x0, 0x0, 0x0, 0x0},
+        {0x0},
+    },
+    {
+        {{0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f}, 60.0f},
+    },
+};
+
+struct BurningEnemy {
+    fpc_ProcID id;
+    int framesLeft;
+    u32 flame[2];
+    dCcD_Stts scorchOwner;
+    dCcD_Cps scorch;
+};
+
+static BurningEnemy onFire[kMaxBurning];
+
+static void stop_burning(BurningEnemy& enemy) {
+    let_flames_go(enemy.flame, 2);
+    enemy.framesLeft = 0;
+    enemy.id = fpcM_ERROR_PROCESS_ID_e;
+}
+
+// true if it's an enemy that's burning now
+static bool set_on_fire(fopAc_ac_c* actor) {
+    daAlink_c* link = daAlink_getAlinkActorClass();
+    if (actor == nullptr || link == nullptr || fopAcM_GetGroup(actor) != fopAc_ENEMY_e) return false;
+    fpc_ProcID id = fopAcM_GetID(actor);
+
+    // already burning: just keeps burning
+    BurningEnemy* spot = nullptr;
+    for (int i = 0; i < kMaxBurning; i++) {
+        if (onFire[i].framesLeft > 0 && onFire[i].id == id) return true;
+        if (spot == nullptr && onFire[i].framesLeft <= 0) spot = &onFire[i];
+    }
+    if (spot == nullptr) return false;  // eight at once is plenty
+
+    spot->id = id;
+    spot->framesLeft = kBurnFrames;
+    spot->flame[0] = spot->flame[1] = 0;
+    spot->scorchOwner.Init(0xFF, 0xFF, link);  // counts as Link's hit
+    spot->scorch.Set(kScorchSrc);
+    spot->scorch.SetStts(&spot->scorchOwner);
+    return true;
+}
+
+// runs with Link's update, so the scorch is in time for this frame's hits
+static void burn_enemies() {
+    static const u16 kLanternFlame[2] = {0x3AF, 0x3AD};
+    for (int i = 0; i < kMaxBurning; i++) {
+        BurningEnemy& enemy = onFire[i];
+        if (enemy.framesLeft <= 0) continue;
+        fopAc_ac_c* actor = fopAcM_SearchByID(enemy.id);
+        if (actor == nullptr || --enemy.framesLeft == 0) {
+            stop_burning(enemy);
+            continue;
+        }
+
+        // halfway between its feet and its eyes is roughly its middle
+        cXyz middle = (actor->current.pos + actor->eyePos) * 0.5f;
+        for (int k = 0; k < 2; k++) {
+            enemy.flame[k] = dComIfGp_particle_set(enemy.flame[k], kLanternFlame[k], &middle, &actor->shape_angle, nullptr);
+            JPABaseEmitter* flame = dComIfGp_particle_getEmitter(enemy.flame[k]);
+            f32 size = k == 0 ? 1.5f : 0.75f;
+            if (flame != nullptr) flame->setGlobalScale(JGeometry::TVec3<f32>(size, size, size));
+        }
+
+        if (enemy.framesLeft != kScorchAt[0] && enemy.framesLeft != kScorchAt[1]) continue;
+        static_cast<cM3dGCps*>(&enemy.scorch)->Set(actor->current.pos, actor->eyePos, 60.0f);
+        enemy.scorch.CalcAtVec();
+        enemy.scorch.ResetAtHit();
+        dComIfG_Ccsp()->Set(&enemy.scorch);
+    }
+}
+
+static void burn_post(ModContext*, void*, void*, void*) {
+    if (fire_on()) burn_enemies();
+}
+
 static void arrow_post(ModContext*, void* args, void*, void*) {
     auto* arrow = mods::arg<daArrow_c*>(args, 0);
     if (arrow->mArrowType != 0) return;  // bomb, light and slingshot shots stay as they are
@@ -2641,13 +2749,20 @@ static void arrow_post(ModContext*, void* args, void*, void*) {
     bool nocked = link != nullptr && link->mItemAcKeep.getID() == id;
     bool flying = !nocked && arrow->speed.abs2() > 4.0f;
 
-    // The arrow's position is its back end; the head is 94 units along the model, the same spot
-    // the game hangs a bomb arrow's fuse on. Reading it off the model keeps it right in the hand
-    // (where the model follows Link's bow hand) and when it's stuck in something.
+    // The arrow's position is its back end; the head is 94 units along the shaft, the same spot
+    // the game hangs a bomb arrow's fuse on. On the bow and stuck in something, the model already
+    // sits where it's drawn. In flight the model is only placed when it's drawn, a frame behind
+    // a very fast arrow, so the head is worked out from where the arrow is right now instead.
     static cXyz headOnModel(-3.3f, -3.0f, 94.0f);
     if (arrow->mpModel == nullptr) return;
     cXyz tip;
-    mDoMtx_multVec(arrow->mpModel->getBaseTRMtx(), &headOnModel, &tip);
+    if (flying) {
+        mDoMtx_stack_c::transS(arrow->current.pos);
+        mDoMtx_stack_c::ZXYrotM(arrow->shape_angle.x, arrow->shape_angle.y, 0);
+        mDoMtx_stack_c::multVec(&headOnModel, &tip);
+    } else {
+        mDoMtx_multVec(arrow->mpModel->getBaseTRMtx(), &headOnModel, &tip);
+    }
 
     int fire = find_burning(id);
     // nocked: burns while there's oil for a shot, goes out if there isn't
@@ -2668,12 +2783,20 @@ static void arrow_post(ModContext*, void* args, void*, void*) {
     if (fire < 0) return;
     BurningArrow& f = burning[fire];
 
+    // whatever the arrow or its fire touched last frame catches fire, if it's an enemy
+    // (once: an arrow left stuck in an enemy doesn't keep relighting it)
+    if (!nocked && !f.spread) {
+        if (arrow->field_0x688.ChkAtHit()) f.spread = set_on_fire(arrow->field_0x688.GetAtHitAc());
+        if (!f.spread && f.hitReady && f.hit.ChkAtHit()) f.spread = set_on_fire(f.hit.GetAtHitAc());
+    }
+
     // the fire hit follows the arrow from where the tip was last frame, and stays on it once stuck
     if (!nocked && f.hitReady) {
         static_cast<cM3dGCps*>(&f.hit)->Set(f.lastTip, tip, kFireReach);
         f.hit.CalcAtVec();
         dComIfG_Ccsp()->Set(&f.hit);
     }
+    f.moved = tip - f.lastTip;
     f.lastTip = tip;
     f.glow.mPosition = tip;
 
@@ -2689,6 +2812,10 @@ static void arrow_post(ModContext*, void* args, void*, void*) {
         f32 s = size * kFlameSize[i];
         flame->setGlobalScale(JGeometry::TVec3<f32>(s, s, s));
         flame->setGlobalParticleScale(s, s);
+        // a flame already in the air moves with the head instead of being left behind it
+        // (the game's own trick for the smoke off a bomb arrow's fuse)
+        flame->setParticleCallBackPtr(dPa_control_c::getParticleTracePCB());
+        flame->setUserWork((uintptr_t)&f.moved);
     }
 }
 
@@ -2708,6 +2835,7 @@ static void fire_arrow_tick() {
 }
 
 static void fire_arrow_shutdown() {
+    for (int i = 0; i < kMaxBurning; i++) stop_burning(onFire[i]);
     for (int i = 0; i < kArrowMemory; i++) put_out(burning[i]);
 }
 
@@ -3636,6 +3764,7 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     // Fire Arrows
     if (!pre_hook(ButtonOilGauge, oil_gauge_pre)) mods::log::warn("no oil gauge on the fire-arrow bow");
     if (!post_hook(ArrowUpdate, arrow_post)) mods::log::warn("arrows won't catch fire");
+    if (!post_hook(Exec, burn_post)) mods::log::warn("enemies won't catch fire from fire arrows");
 
     settings_init();
 
