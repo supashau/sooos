@@ -2480,12 +2480,56 @@ static void place_front_picture(dMeter2Draw_c* hud, int button, u8 sizedAs, u8 p
     pane->paneTrans(spot.pos_x + hud->field_0x6ac[button], spot.pos_y + hud->field_0x6b8[button]);
 }
 
+// The small frame is resized by the HUD to the front picture's exact box, which is right for the
+// bomb arrow (a round bomb over a small bow drawn at the same size) but squeezes the bow into the
+// lantern's tall, narrow shape. So it gets the bow's own shape back, a bit wider than the lantern,
+// centred on it.
+static void widen_small_bow(dMeter2Draw_c* hud, int button) {
+    J2DPicture* bow = hud->mpItemXYPane[button];
+    ResTIMG* tex = hud->mpItemXYTex[button][hud->field_0x76c[button]][1];
+    if (bow == nullptr || tex == nullptr || tex->width == 0) return;
+    f32 lanternWide = hud->field_0x6c4[button];
+    f32 lanternTall = hud->field_0x6d0[button];
+    f32 wide = lanternWide * 1.4f;
+    f32 tall = wide * tex->height / tex->width;
+    f32 left = (lanternWide - wide) * 0.5f;
+    f32 top = (lanternTall - tall) * 0.5f;
+    bow->place(JGeometry::TBox2<f32>(left, top, left + wide, top + tall));
+}
+
+// whether each button is currently drawn as its combination; until it is, it keeps being redrawn
+static bool comboShown[2];
+
 static void button_icon_post(ModContext*, void* args, void*, void*) {
+    auto* hud = mods::arg<dMeter2Draw_c*>(args, 0);
+    int button = mods::arg<int>(args, 1);
     bool itemsShown = mods::arg<bool>(args, 4);
-    if (fireIconButton >= 0 && itemsShown)
-        place_front_picture(mods::arg<dMeter2Draw_c*>(args, 0), fireIconButton, dItemNo_KANTERA_e,
-                            dItemNo_BOMB_ARROW_e);
+    if (fireIconButton >= 0 && itemsShown) {
+        place_front_picture(hud, fireIconButton, dItemNo_KANTERA_e, dItemNo_BOMB_ARROW_e);
+        widen_small_bow(hud, fireIconButton);
+    }
+    if (itemsShown && button >= 0 && button < 2) comboShown[button] = galeIconButton >= 0 || fireIconButton >= 0;
     galeIconButton = fireIconButton = -1;
+}
+
+// After a warp or a new area the HUD is built from scratch, sometimes before the item buttons can
+// show anything, so a combined button could come back as the plain item. Until each button with a
+// combination on it has actually been drawn that way, it's asked to redraw (a few times a second).
+static void keep_combos_drawn() {
+    static int wait = 0;
+    if (dMeter2Info_getMeterClass() == nullptr || daAlink_getAlinkActorClass() == nullptr) return;
+    if (wait > 0) {
+        wait--;
+        return;
+    }
+    for (int b = 0; b < 2; b++) {
+        bool combo = fire_button() == b || (armed_bag() >= 0 && boomerang_button() == b);
+        if (combo && !comboShown[b]) {
+            redraw_buttons();
+            wait = 10;
+            return;
+        }
+    }
 }
 
 // one item's picture into one buffer, nothing else
@@ -3016,6 +3060,7 @@ static int oilWasEmpty = -1;  // -1 until the first look
 static int fireButtonWas = -2;  // -2 until the first look
 
 static void fire_arrow_tick() {
+    keep_combos_drawn();
     // Combining the lantern onto the bow doesn't change the item the HUD thinks is on the button
     // (it's the bow either way), so the HUD never redrew it and kept showing the plain bow. It's
     // redrawn here whenever the combination is made or split, and when the oil runs out or comes
@@ -3111,6 +3156,7 @@ static int hudFreshFrames;
 
 static void hud_created(ModContext*, void*, void*, void*) {
     hudFreshFrames = 5;
+    comboShown[0] = comboShown[1] = false;
 }
 
 static void galebomb_tick() {
