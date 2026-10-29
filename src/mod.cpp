@@ -276,9 +276,18 @@ static void allow_horse_call(ModContext*, void* args, void* ret, void*) {
         *(bool*)ret = true;
 }
 
+// Where Link's feet really are. Other mods can move his drawn position between his updates (the
+// Upside-Down Link mod lifts him up so he can stand on his head), so the height comes from the
+// floor his own ground check found this frame instead.
+static cXyz link_feet(daAlink_c* link) {
+    cXyz feet = link->current.pos;
+    if (link->mLinkAcch.ChkGroundHit()) feet.y = link->mLinkAcch.GetGroundH();
+    return feet;
+}
+
 // one candidate spot: nothing between Link and it, dry ground near his height
 static bool try_spot(daAlink_c* link, s16 dir, f32 reach, cXyz* out) {
-    const cXyz& feet = link->current.pos;
+    const cXyz feet = link_feet(link);
     cXyz eye(feet.x, feet.y + 80.0f, feet.z);
     cXyz spot(feet.x + cM_ssin(dir) * reach, eye.y, feet.z + cM_scos(dir) * reach);
     if (fopAcM_lc_c::lineCheck(&eye, &spot, link)) return false;
@@ -308,7 +317,7 @@ static bool pick_epona_spot(daAlink_c* link, cXyz* out) {
 static void bring_epona(daAlink_c* link, bool riding) {
     if (!pick_epona_spot(link, &eponaSpot)) {
         if (!riding) return;
-        eponaSpot = link->current.pos;
+        eponaSpot = link_feet(link);
     }
     eponaFacing = cLib_targetAngleY(&eponaSpot, &link->current.pos) + 0x4000;
 
@@ -2175,34 +2184,33 @@ static void shop_shutdown() {
 // ======================== Sword Flourish ========================
 
 // The flourish is only an option on the A "Put away" press while the kill timer
-// (mSwordFlourishTimer) is still running, and the wooden sword is never allowed. That check sits
-// deep in Link's update where a hook can't reach, so On and Wooden start the flourish themselves
-// right before Link updates, and Off just keeps the kill timer at zero.
+// (mSwordFlourishTimer) is still running, and the wooden sword is never allowed. Nothing else reads
+// that timer, so:
+//   On:      the timer is kept full, and the game's own put-away flourishes every time
+//   Off:     the timer is kept at zero
+//   Wooden:  the game handles the real swords as normal
+// The game never lets the Wooden Sword flourish, so for the stick (On, or Wooden after a kill) the
+// flourish is started here instead, right before Link updates.
 
-// the same gate the game runs before a put-away, minus the timer and the wooden sword
+// the game's own put-away gate, minus the timer and the wooden sword
 static bool could_put_away(daAlink_c* lnk) {
     if (!mDoCPd_c::getTrigA(PAD_1) || dComIfGp_getDoStatus() != BUTTON_STATUS_PUT_AWAY) return false;
     if (lnk->mEquipItem != 0x103 || !daAlink_c::checkSwordGet() || lnk->checkWolf()) return false;
-    if (!lnk->checkModeFlg(4) || lnk->checkModeFlg(0x402)) return false;
-    if (lnk->checkEquipAnime() || lnk->checkBoomerangThrowAnime() || lnk->checkCopyRodThrowAnime()) return false;
-    if (lnk->checkKandelaarSwingAnime() || lnk->checkNoResetFlg2(daAlink_c::FLG2_UNK_1)) return false;
-    return !lnk->checkCanoeRide() && !lnk->checkRideOn() && !lnk->checkEventRun();
+    if (lnk->checkModeFlg(0x402) || lnk->checkNoResetFlg2(daAlink_c::FLG2_UNK_1)) return false;
+    return !lnk->checkCanoeRide() && !lnk->checkEventRun();
 }
 
 // runs before Link's own update every frame
 static void flourish_before(daAlink_c* lnk) {
     int mode = cfgInt(flourishOption, FLOURISH_DEFAULT);
     if (mode == FLOURISH_OFF) lnk->mSwordFlourishTimer = 0;
+    if (mode == FLOURISH_ON) lnk->mSwordFlourishTimer = lnk->mpHIO->mCut.m.mFlourishTime;
     if (mode != FLOURISH_ON && mode != FLOURISH_WOODEN) return;
-    if (!could_put_away(lnk)) return;
 
-    // Wooden leaves the real swords to the game and only steps in for the stick, on the normal timing.
-    // the game ticks the timer down once before it checks, hence > 1
-    if (mode == FLOURISH_WOODEN) {
-        bool stick = daPy_py_c::checkWoodSwordEquip();
-        if (!stick || lnk->mSwordFlourishTimer <= 1) return;
-    }
-    lnk->procSwordUnequipSpInit();
+    // the stick: the game ticks the timer down once before it checks, hence > 1
+    if (!daPy_py_c::checkWoodSwordEquip()) return;
+    if (mode == FLOURISH_WOODEN && lnk->mSwordFlourishTimer <= 1) return;
+    if (could_put_away(lnk)) lnk->procSwordUnequipSpInit();
 }
 
 // and after it, so a kill this frame can't sneak one past Off
@@ -2578,6 +2586,16 @@ static BurningArrow burning[kArrowMemory];
 static int burningNext;
 static fpc_ProcID judgedArrows[kArrowMemory];  // arrows already checked when they were shot
 static int judgedNext;
+// arrows this Link nocked himself; any other arrow (another player's in multiplayer, say) is left
+// alone, so it never takes oil from this lantern
+static fpc_ProcID ownArrows[kArrowMemory];
+static int ownNext;
+
+static bool is_own_arrow(fpc_ProcID id) {
+    for (int i = 0; i < kArrowMemory; i++)
+        if (ownArrows[i] == id) return true;
+    return false;
+}
 
 static u16 fire_arrow_cost() {
     return dComIfGs_getMaxOil() / 20;
@@ -2748,6 +2766,11 @@ static void arrow_post(ModContext*, void* args, void*, void*) {
     daAlink_c* link = daAlink_getAlinkActorClass();
     bool nocked = link != nullptr && link->mItemAcKeep.getID() == id;
     bool flying = !nocked && arrow->speed.abs2() > 4.0f;
+    if (nocked && !is_own_arrow(id)) {
+        ownArrows[ownNext] = id;
+        ownNext = (ownNext + 1) % kArrowMemory;
+    }
+    if (!is_own_arrow(id)) return;
 
     // The arrow's position is its back end; the head is 94 units along the shaft, the same spot
     // the game hangs a bomb arrow's fuse on. On the bow and stuck in something, the model already
