@@ -279,9 +279,9 @@ static void allow_horse_call(ModContext*, void* args, void* ret, void*) {
         *(bool*)ret = true;
 }
 
-// Where Link's feet really are. Other mods can move his drawn position between his updates (the
-// Upside-Down Link mod lifts him up so he can stand on his head), so the height comes from the
-// floor his own ground check found this frame instead.
+// Where Link's feet really are. Other mods can move his drawn position between his updates (lifting
+// him up to stand him on his head, say), so the height comes from the floor his own ground check
+// found this frame instead.
 static cXyz link_feet(daAlink_c* link) {
     cXyz feet = link->current.pos;
     if (link->mLinkAcch.ChkGroundHit()) feet.y = link->mLinkAcch.GetGroundH();
@@ -2779,11 +2779,11 @@ static bool was_judged(fpc_ProcID id) {
 // Who's close enough is measured here rather than waiting for the game to report a hit, since a
 // lot of enemies never report being touched by the lantern's kind of fire.
 //
-// Other players in Crests of Courage are a stand-in actor of its own ("cpRival", counted as an
-// enemy) that passes any hit on to that player's game, fire included. So a player gets no big
-// flame: they get fire hits instead, and their own game shows Link catching fire. A hit they block
-// isn't passed on as one (Crests of Courage only plays the block sound and push-back), so their
-// shield can't be set alight from here.
+// In online multiplayer, other players are a stand-in actor (named "cpRival", counted as an enemy)
+// that passes any hit on to that player's game, fire included. So a player gets no big flame:
+// they get fire hits instead, and their own game shows Link catching fire. A hit they block isn't
+// passed on as one (only the block sound and push-back are), so their shield can't be set alight
+// from here.
 
 static const int kBurnFrames = 120;
 static const int kScorchAt[2] = {100, 50};  // frames left when each scorch lands
@@ -2818,7 +2818,7 @@ static const dCcD_SrcCps kPlayerFireSrc = {
     },
 };
 
-// the stand-in Crests of Courage uses for another player, if it's loaded
+// the stand-in actor online multiplayer uses for another player, if it's loaded
 static bool is_other_player(fopAc_ac_c* actor) {
     dStage_objectNameInf* rival = dStage_searchName("cpRival");
     return rival != nullptr && fopAcM_GetName(actor) == rival->procname;
@@ -2832,7 +2832,7 @@ static const int kPlayerFireAt[3] = {kBurnFrames - 1, 80, 40};  // frames left w
 struct BurningEnemy {
     fpc_ProcID id;
     int framesLeft;
-    bool player;     // another player in Crests of Courage
+    bool player;     // another player in online multiplayer
     bool fromArrow;  // a fire arrow lit it (Deal Burn Damage applies), not a lantern swing
     u32 flame[2];
     dCcD_Stts scorchOwner;
@@ -2854,7 +2854,7 @@ static bool in_water(fopAc_ac_c* actor) {
 }
 
 // the top of an actor's body: its eyes, or Link's height above its feet if it never set them
-// (Crests of Courage's stand-ins for other players, for one)
+// (the stand-ins for other players in online multiplayer, for one)
 static cXyz body_top(fopAc_ac_c* actor) {
     cXyz up = actor->eyePos - actor->current.pos;
     if (up.abs2() < 1.0f || up.abs2() > 600.0f * 600.0f) up.set(0.0f, 140.0f, 0.0f);
@@ -3242,10 +3242,12 @@ static void force_flag(daAlink_c* lnk, daAlink_c::daPy_FLG3 flag, bool want, boo
     }
 }
 
-// Unarmed shield bash: the game's gate for it, minus the shield
-static bool unarmed_bash_ready(daAlink_c* lnk) {
+// Unarmed shield bash: the game's gate for it, minus the shield. The game also wants R free (R is
+// its bash button); with manual shielding R is the shield instead and the bash is on B, so that
+// part is skipped then.
+static bool unarmed_bash_ready(daAlink_c* lnk, bool bashOnB = false) {
     bool ground = lnk->mLinkAcch.ChkGroundHit() || lnk->checkMagneBootsOn();
-    if (!cfgOn(vBash, true) || !ground || dComIfGp_getRStatus() != 0) return false;
+    if (!cfgOn(vBash, true) || !ground || (!bashOnB && dComIfGp_getRStatus() != 0)) return false;
     if (!cfgOn(vSkill, false) && !dComIfGs_isEventBit(dSv_event_flag_c::F_0338) &&
         !lnk->checkNoResetFlg3(daAlink_c::FLG3_TRANING_SHIELD_ATTACK))
         return false;
@@ -3253,25 +3255,41 @@ static bool unarmed_bash_ready(daAlink_c* lnk) {
     return !lnk->checkModeFlg(0x70C52) && !daAlink_c::checkNotBattleStage();
 }
 
-// Mods with manual shielding (Dawnlight, for one) have Link shield while R is held during
-// targeting, and shield bash with B. The plain game never holds R while shielding (pressing it
-// bashes straight away), so shielding with R held is that style, whichever mod provides it.
+// Mods with manual shielding have Link shield while both triggers are held all the way in (L to
+// target, R to shield), and shield bash with B. With the "hold" style of targeting, R alone
+// shields while a target is locked. That's the input those mods shield on, so that's what's
+// looked for here, together with Link actually targeting; normal shielding (targeting with L, R
+// pressed to bash) never has both triggers held in.
+static bool manual_shield_held(daAlink_c* lnk) {
+    if (!mDoCPd_c::getHoldLockR(PAD_1)) return false;
+    if (mDoCPd_c::getHoldLockL(PAD_1)) return true;
+    bool holdToTarget = dComIfGs_getOptAttentionType() == 1;
+    return holdToTarget && lnk->mAttention != nullptr && lnk->mAttention->LockonTarget(0) != nullptr;
+}
+
 static bool manual_shielding(daAlink_c* lnk) {
-    if (lnk->checkWolf() || !lnk->checkNoResetFlg2(daAlink_c::FLG2_UNK_8000000)) return false;
-    bool holdingR = mDoCPd_c::getHoldR(PAD_1) || mDoCPd_c::getHoldLockR(PAD_1);
-    return holdingR && lnk->checkGuardActionChange();
+    if (lnk->checkWolf() || !lnk->checkGuardActionChange() || !manual_shield_held(lnk)) return false;
+    return !daAlink_c::checkShieldGet() || lnk->checkNoResetFlg2(daAlink_c::FLG2_UNK_8000000);
 }
 
 // With no shield, in that style, B is the (unarmed) shield bash whatever weapon is out: it shows
 // the game's own Shield Attack on B and starts the bash before Link's update can turn the press
 // into a sword swing.
 static bool unarmed_manual_bash(daAlink_c* lnk) {
-    return !daAlink_c::checkShieldGet() && manual_shielding(lnk) && unarmed_bash_ready(lnk);
+    return !daAlink_c::checkShieldGet() && manual_shielding(lnk) && unarmed_bash_ready(lnk, true);
 }
+
+// One bash at a time, with a breather after it, the way the bash on R can't be spammed either.
+static const int kBashGap = 30;  // frames after a bash ends before the next one
+static int bashWait;
 
 static HookAction manual_bash_pre(ModContext*, void* args, void*, void*) {
     auto* lnk = mods::arg<daAlink_c*>(args, 0);
-    if (mDoCPd_c::getTrigB(PAD_1) && unarmed_manual_bash(lnk)) lnk->procGuardAttackInit();
+    bool bashing = lnk->mProcID == daAlink_c::PROC_GUARD_ATTACK;
+    if (bashing) bashWait = kBashGap;
+    else if (bashWait > 0) bashWait--;
+    if (bashing || bashWait > 0 || !mDoCPd_c::getTrigB(PAD_1)) return HOOK_CONTINUE;
+    if (unarmed_manual_bash(lnk)) lnk->procGuardAttackInit();
     return HOOK_CONTINUE;
 }
 
@@ -3306,17 +3324,16 @@ static void guard_post(ModContext*, void* args, void*, void*) {
     force_flag(lnk, daAlink_c::FLG3_TRANING_CUT_BACK, on && cfgOn(vBackAll, false), &forcedBack);
     force_flag(lnk, daAlink_c::FLG3_TRANING_CUT_DOWN, on && cfgOn(vEnding, false) && cfgOn(vEndingAll, false), &forcedDown);
 
-    if (!cfgOn(vShield, true) || lnk->checkNoResetFlg2(daAlink_c::FLG2_UNK_8000000)) {
-        if (unarmed_manual_bash(lnk)) lnk->setBStatus(BUTTON_STATUS_SHIELD_ATTACK);
-        return;
-    }
-
     // checkGuardAccept without the shield part
-    if (lnk->checkModeFlg(0x80) && !lnk->checkFmChainGrabAnime() && !daAlink_c::checkNotBattleStage() &&
-        !lnk->checkGrabAnime() && !lnk->checkUpperReadyThrowAnime() && !lnk->checkDkCaught2Anime() &&
-        !lnk->checkKandelaarSwingAnime() && !lnk->checkCutDashAnime() && !lnk->checkCutDashChargeAnime() &&
-        (!lnk->checkEquipAnime() || wasGuarding) && !lnk->checkRideOn() && lnk->checkGuardActionChange())
+    bool guarding = lnk->checkNoResetFlg2(daAlink_c::FLG2_UNK_8000000);
+    if (cfgOn(vShield, true) && !guarding && lnk->checkModeFlg(0x80) && !lnk->checkFmChainGrabAnime() &&
+        !daAlink_c::checkNotBattleStage() && !lnk->checkGrabAnime() && !lnk->checkUpperReadyThrowAnime() &&
+        !lnk->checkDkCaught2Anime() && !lnk->checkKandelaarSwingAnime() && !lnk->checkCutDashAnime() &&
+        !lnk->checkCutDashChargeAnime() && (!lnk->checkEquipAnime() || wasGuarding) && !lnk->checkRideOn() &&
+        lnk->checkGuardActionChange())
         lnk->onNoResetFlg2(daAlink_c::FLG2_UNK_8000000);
+
+    if (unarmed_manual_bash(lnk)) lnk->setBStatus(BUTTON_STATUS_SHIELD_ATTACK);
 }
 
 // even steps = hand swing arm, odd steps = right hook (end of the right spin cut arm, no spin). same lunge
