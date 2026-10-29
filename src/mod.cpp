@@ -2771,23 +2771,16 @@ static bool is_other_player(fopAc_ac_c* actor) {
     return rival != nullptr && fopAcM_GetName(actor) == rival->procname;
 }
 
-// one fire hit on another player, then a breather so it isn't every frame
-static const int kPlayerFireGap = 90;
-static const int kMaxPlayersHit = 4;
-
-struct PlayerFireHit {
-    fpc_ProcID id;
-    int waitLeft;
-    bool due;
-    dCcD_Stts owner;
-    dCcD_Cps hit;
-};
-
-static PlayerFireHit playerFire[kMaxPlayersHit];
+// Players burn on the same clock as enemies, just without the big flame (their own game shows
+// Link on fire): a fire hit as they catch fire, then two more while they burn. Each one is passed
+// on to their game as a fire hit, so it hurts a bit each time and keeps them burning, and their
+// Wooden or Ordon Shield catches if they block it.
+static const int kPlayerFireAt[3] = {kBurnFrames - 1, 80, 40};  // frames left when each one lands
 
 struct BurningEnemy {
     fpc_ProcID id;
     int framesLeft;
+    bool player;  // another player in Crests of Courage
     u32 flame[2];
     dCcD_Stts scorchOwner;
     dCcD_Cps scorch;
@@ -2815,29 +2808,11 @@ static cXyz body_top(fopAc_ac_c* actor) {
     return actor->current.pos + up;
 }
 
-static bool burn_player(fopAc_ac_c* player, daAlink_c* link) {
-    fpc_ProcID id = fopAcM_GetID(player);
-    PlayerFireHit* spot = nullptr;
-    for (int i = 0; i < kMaxPlayersHit; i++) {
-        if (playerFire[i].waitLeft > 0 && playerFire[i].id == id) return true;  // just burned
-        if (spot == nullptr && playerFire[i].waitLeft <= 0) spot = &playerFire[i];
-    }
-    if (spot == nullptr) return false;
-    spot->id = id;
-    spot->waitLeft = kPlayerFireGap;
-    spot->due = true;
-    spot->owner.Init(0xFF, 0xFF, link);
-    spot->hit.Set(kPlayerFireSrc);
-    spot->hit.SetStts(&spot->owner);
-    return true;
-}
-
 // true if it's an enemy (or another player) that's burning now
 static bool set_on_fire(fopAc_ac_c* actor) {
     daAlink_c* link = daAlink_getAlinkActorClass();
     if (actor == nullptr || link == nullptr || fopAcM_GetGroup(actor) != fopAc_ENEMY_e) return false;
     if (in_water(actor)) return false;  // nothing catches fire standing or swimming in water
-    if (is_other_player(actor)) return burn_player(actor, link);
     fpc_ProcID id = fopAcM_GetID(actor);
 
     // already burning: just keeps burning
@@ -2850,35 +2825,26 @@ static bool set_on_fire(fopAc_ac_c* actor) {
 
     spot->id = id;
     spot->framesLeft = kBurnFrames;
+    spot->player = is_other_player(actor);
     spot->flame[0] = spot->flame[1] = 0;
     spot->scorchOwner.Init(0xFF, 0xFF, link);  // counts as Link's hit
-    spot->scorch.Set(kScorchSrc);
+    spot->scorch.Set(spot->player ? kPlayerFireSrc : kScorchSrc);
     spot->scorch.SetStts(&spot->scorchOwner);
     return true;
 }
 
-static void burn_players() {
-    for (int i = 0; i < kMaxPlayersHit; i++) {
-        PlayerFireHit& player = playerFire[i];
-        if (player.waitLeft <= 0) continue;
-        player.waitLeft--;
-        if (!player.due) continue;
-        player.due = false;
-        fopAc_ac_c* actor = fopAcM_SearchByID(player.id);
-        if (actor == nullptr) continue;
-        cXyz head = actor->current.pos;
-        head.y += 120.0f;  // about Link's height
-        static_cast<cM3dGCps*>(&player.hit)->Set(actor->current.pos, head, 60.0f);
-        player.hit.CalcAtVec();
-        player.hit.ResetAtHit();
-        dComIfG_Ccsp()->Set(&player.hit);
+static bool hit_due(const BurningEnemy& enemy) {
+    if (enemy.player) {
+        for (int at : kPlayerFireAt)
+            if (enemy.framesLeft == at) return true;
+        return false;
     }
+    return enemy.framesLeft == kScorchAt[0] || enemy.framesLeft == kScorchAt[1];
 }
 
 // runs with Link's update, so the scorch is in time for this frame's hits
 static void burn_enemies() {
     static const u16 kLanternFlame[2] = {0x3AF, 0x3AD};
-    burn_players();
     for (int i = 0; i < kMaxBurning; i++) {
         BurningEnemy& enemy = onFire[i];
         if (enemy.framesLeft <= 0) continue;
@@ -2888,16 +2854,19 @@ static void burn_enemies() {
             continue;
         }
 
-        // halfway between its feet and its eyes is roughly its middle
-        cXyz middle = (actor->current.pos + body_top(actor)) * 0.5f;
-        for (int k = 0; k < 2; k++) {
-            enemy.flame[k] = dComIfGp_particle_set(enemy.flame[k], kLanternFlame[k], &middle, &actor->shape_angle, nullptr);
-            JPABaseEmitter* flame = dComIfGp_particle_getEmitter(enemy.flame[k]);
-            f32 size = k == 0 ? 1.5f : 0.75f;
-            if (flame != nullptr) flame->setGlobalScale(JGeometry::TVec3<f32>(size, size, size));
+        // the big flame is for enemies; a player's own game already shows their Link on fire
+        if (!enemy.player) {
+            // halfway between its feet and its eyes is roughly its middle
+            cXyz middle = (actor->current.pos + body_top(actor)) * 0.5f;
+            for (int k = 0; k < 2; k++) {
+                enemy.flame[k] = dComIfGp_particle_set(enemy.flame[k], kLanternFlame[k], &middle, &actor->shape_angle, nullptr);
+                JPABaseEmitter* flame = dComIfGp_particle_getEmitter(enemy.flame[k]);
+                f32 size = k == 0 ? 1.5f : 0.75f;
+                if (flame != nullptr) flame->setGlobalScale(JGeometry::TVec3<f32>(size, size, size));
+            }
         }
 
-        if (enemy.framesLeft != kScorchAt[0] && enemy.framesLeft != kScorchAt[1]) continue;
+        if (!hit_due(enemy)) continue;
         static_cast<cM3dGCps*>(&enemy.scorch)->Set(actor->current.pos, body_top(actor), 60.0f);
         enemy.scorch.CalcAtVec();
         enemy.scorch.ResetAtHit();
@@ -3008,6 +2977,12 @@ static void arrow_post(ModContext*, void* args, void*, void*) {
     if (fire < 0) return;
     BurningArrow& f = burning[fire];
 
+    // The arrow's own hit is made of fire too, the way a Bulblin's fire arrow is. Crests of
+    // Courage passes a hit's material on to the player it hits, so in their game this lands like a
+    // Bulblin's fire arrow: Link catches fire, or, if he blocks it with a Wooden or Ordon Shield,
+    // the shield catches fire and burns up unless he gets it into water.
+    if (!nocked) arrow->field_0x688.SetAtMtrl(dCcD_MTRL_FIRE);
+
     // In flight the fire reaches from where the head was last frame to a little past where it'll
     // be next frame, so whatever is in front of the arrow catches fire before (or as) the arrow
     // gets there, not after. Every enemy or player it reaches burns, each once while it burns.
@@ -3086,7 +3061,6 @@ static void fire_arrow_tick() {
 
 static void fire_arrow_shutdown() {
     for (int i = 0; i < kMaxBurning; i++) stop_burning(onFire[i]);
-    for (int i = 0; i < kMaxPlayersHit; i++) playerFire[i].waitLeft = 0;
     for (int i = 0; i < kArrowMemory; i++) put_out(burning[i]);
 }
 
