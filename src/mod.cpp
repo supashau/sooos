@@ -109,6 +109,10 @@ enum FlourishMode : int { FLOURISH_ON, FLOURISH_WOODEN, FLOURISH_DEFAULT, FLOURI
 static const char* const flourishNames[] = {"On", "Wooden", "Default", "Off"};
 static ConfigVarHandle flourishOption;
 static ConfigVarHandle vLanternBurn;  // Deal Burn with Lantern
+enum HandPoseMode : int { HAND_POSE_ON, HAND_POSE_DEFAULT, HAND_POSE_OFF };
+static const char* const handPoseNames[] = {"On", "Default", "Off"};
+static ConfigVarHandle handPoseOption;  // Mortal Draw Hand Anim
+static ConfigVarHandle vFireDamage;     // Use Fire Damage (fire arrows)
 
 // items: which bombs can ride the Gale Boomerang (normal, water, bomblings)
 static ConfigVarHandle galeBombToggle[3];
@@ -2235,6 +2239,81 @@ static void flourish_exec_post(ModContext*, void* args, void*, void*) {
     flourish_after(mods::arg<daAlink_c*>(args, 0));
 }
 
+// ======================== Mortal Draw Hand Anim ========================
+
+// When Link could do a mortal draw, he rests his hand on the hilt (the start of his sword-drawing
+// animation, held at frame 12). That pose is part of the game's "ready" state, which also puts
+// Draw on A, so it can't simply be switched on or off without changing what A does. Instead it's
+// added or taken away only while Link's body is being posed for drawing, and put back straight
+// after, so nothing else in the game ever sees a difference:
+//   On:      the pose whenever the sword is on his back and nothing else is moving his arms
+//   Default: the game's own behaviour
+//   Off:     the game still gets ready for a mortal draw (Draw on A works), the hand just stays put
+
+DEFINE_HOOK(&daAlink_c::modelCalc, ModelCalc);
+
+static const f32 kHandOnHilt = 12.0f;  // frame of the draw animation with the hand on the hilt
+static J3DAnmTransform* handPose;      // the draw animation, loaded where it doesn't disturb anything
+static daAlink_c* handPoseOwner;       // the Link it was loaded for (a new one comes with each area)
+
+enum PoseChange { POSE_UNTOUCHED, POSE_ADDED, POSE_HIDDEN };
+static PoseChange poseChange;
+static J3DAnmTransform* poseWasAnim;
+static f32 poseWasRatio;
+
+// Link's second upper-body slot is only used for a few walking styles; when it's free, the draw
+// animation is loaded there. The game reloads that slot whenever it needs it.
+static J3DAnmTransform* hand_pose_anim(daAlink_c* lnk) {
+    daPy_anmHeap_c& spare = lnk->mUpperAnmHeap[daAlink_c::UPPER_1];
+    if (handPoseOwner == lnk && handPose != nullptr && spare.getIdx() == dRes_ID_ALANM_BCK_WAITATOS_e)
+        return handPose;
+    if (!spare.checkNoSetIdx()) return nullptr;  // in use for something else right now
+    handPose = lnk->getAnimeResource(&spare, dRes_ID_ALANM_BCK_WAITATOS_e, 0x2C00);
+    handPoseOwner = lnk;
+    return handPose;
+}
+
+static bool hand_pose_fits(daAlink_c* lnk) {
+    if (lnk->checkWolf() || !daAlink_c::checkSwordGet() || lnk->mEquipItem != dItemNo_NONE_e) return false;
+    if (lnk->checkRideOn() || lnk->checkModeFlg(0x40000) || lnk->checkEventRun()) return false;
+    return lnk->checkNoSetUpperAnime();  // his arms are free
+}
+
+static HookAction hand_pose_pre(ModContext*, void* args, void*, void*) {
+    poseChange = POSE_UNTOUCHED;
+    auto* lnk = mods::arg<daAlink_c*>(args, 0);
+    if (mods::arg<J3DModel*>(args, 1) != lnk->mpLinkModel) return HOOK_CONTINUE;  // only his body
+    int mode = cfgInt(handPoseOption, HAND_POSE_DEFAULT);
+    mDoExt_AnmRatioPack& arms = lnk->mNowAnmPackUpper[daAlink_c::UPPER_2];
+
+    if (mode == HAND_POSE_OFF) {
+        bool ready = lnk->checkNoResetFlg0(daAlink_c::FLG0_UNK_1000000) &&
+                     lnk->checkUpperAnime(dRes_ID_ALANM_BCK_WAITATOS_e) && lnk->mEquipItem == dItemNo_NONE_e;
+        if (!ready || lnk->mProcID == daAlink_c::PROC_CUT_FAST_READY) return HOOK_CONTINUE;
+        poseWasRatio = arms.getRatio();
+        arms.setRatio(0.0f);
+        poseChange = POSE_HIDDEN;
+    } else if (mode == HAND_POSE_ON && hand_pose_fits(lnk)) {
+        J3DAnmTransform* pose = hand_pose_anim(lnk);
+        if (pose == nullptr) return HOOK_CONTINUE;
+        poseWasAnim = arms.getAnmTransform();
+        poseWasRatio = arms.getRatio();
+        pose->setFrame(kHandOnHilt);
+        arms.setAnmTransform(pose);
+        arms.setRatio(1.0f);
+        poseChange = POSE_ADDED;
+    }
+    return HOOK_CONTINUE;
+}
+
+static void hand_pose_post(ModContext*, void* args, void*, void*) {
+    if (poseChange == POSE_UNTOUCHED) return;
+    mDoExt_AnmRatioPack& arms = mods::arg<daAlink_c*>(args, 0)->mNowAnmPackUpper[daAlink_c::UPPER_2];
+    if (poseChange == POSE_ADDED) arms.setAnmTransform(poseWasAnim);
+    arms.setRatio(poseWasRatio);
+    poseChange = POSE_UNTOUCHED;
+}
+
 // ======================== Gale-Bomb Combo ========================
 
 // R on a bomb bag in the item ring, with the Gale Boomerang on X or Y, ties those bombs to the
@@ -2439,7 +2518,7 @@ static void ring_post(ModContext*, void* args, void*, void*) {
     redraw_buttons();
 }
 
-// --- the boomerang button icon: the bow-combo layout, with the boomerang where the bow would be ---
+// --- the combination pictures on X and Y ---
 
 // Each combination has a picture of its own: res/galebomb_icon.rgba (a bomb on the Gale Boomerang,
 // used for all three kinds of bomb) and res/firearrow_icon.rgba (the lantern on the bow). Both are
@@ -2453,7 +2532,15 @@ static ResourceBuffer fireArrowIcon = RESOURCE_BUFFER_INIT;
 static int galeIconButton = -1;  // button drawing the boomerang with bombs tied on, -1 if none
 static int fireIconButton = -1;  // button drawing the fire-arrow bow, -1 if none
 static void* comboIconTex;       // the picture just loaded for that button, to paint ours over
+static J2DPicture* comboIconPic;
 static const ResourceBuffer* comboIcon;
+
+// whether our picture is set to show over that texture buffer
+static bool icon_painted(void* buf) {
+    for (int i = 0; i < nIcons; i++)
+        if (iconOwner[i] == buf) return true;
+    return false;
+}
 
 static HookAction button_icon_pre(ModContext*, void* args, void*, void*) {
     int button = mods::arg<int>(args, 1);
@@ -2463,15 +2550,15 @@ static HookAction button_icon_pre(ModContext*, void* args, void*, void*) {
     return HOOK_CONTINUE;
 }
 
-// the same sizing the HUD does in changeTextureItemXY and drawButtonXY, for a picture already loaded
-static void place_front_picture(dMeter2Draw_c* hud, int button, u8 sizedAs, u8 placedAs) {
+// The same sizing and placing the HUD does in changeTextureItemXY and drawButtonXY, done again for
+// the picture already on the button as if it were placedAs. Our pictures are square.
+static void place_picture(dMeter2Draw_c* hud, int button, u8 placedAs) {
     CPaneMgr* pane = hud->mpItemXY[button];
     ResTIMG* tex = hud->mpItemXYTex[button][hud->field_0x76c[button]][0];
     if (pane == nullptr || tex == nullptr) return;
 
-    f32 size = dItem_data::getTexScale(sizedAs) / 100.0f;
+    f32 size = dItem_data::getTexScale(placedAs) / 100.0f;
     if (g_drawHIO.mItemScaleAdjustON) size = g_drawHIO.mItemScalePercent / 100.0f;
-    // our pictures are square, whatever shape the borrowed texture was
     f32 side = tex->width > tex->height ? tex->width : tex->height;
     f32 wide = size * (side * pane->getInitSizeX() / 48.0f);
     f32 tall = size * (side * pane->getInitSizeY() / 48.0f);
@@ -2498,8 +2585,8 @@ static void button_icon_post(ModContext*, void* args, void*, void*) {
     int button = mods::arg<int>(args, 1);
     bool itemsShown = mods::arg<bool>(args, 4);
     int combo = galeIconButton >= 0 ? galeIconButton : fireIconButton;
-    // placed like an ordinary item (the bomb arrow is one with no tilt or offset of its own)
-    if (combo >= 0 && itemsShown) place_front_picture(hud, combo, dItemNo_BOMB_ARROW_e, dItemNo_BOMB_ARROW_e);
+    // placed like an ordinary item with no tilt or offset of its own (the bomb arrow is one)
+    if (combo >= 0 && itemsShown) place_picture(hud, combo, dItemNo_BOMB_ARROW_e);
     if (itemsShown && button >= 0 && button < 2) comboShown[button] = combo >= 0;
     galeIconButton = fireIconButton = -1;
 }
@@ -2514,9 +2601,15 @@ static void keep_combos_drawn() {
         wait--;
         return;
     }
+    dMeter2Draw_c* hud = dMeter2Info_getMeterClass()->getMeterDrawPtr();
     for (int b = 0; b < 2; b++) {
         bool combo = fire_button() == b || (armed_bag() >= 0 && boomerang_button() == b);
-        if (combo && !comboShown[b]) {
+        // drawn as the combination, and our picture is still on the texture it's showing
+        bool showing = comboShown[b];
+        const ResourceBuffer& picture = fire_button() == b ? fireArrowIcon : galeBombIcon;
+        if (showing && hud != nullptr && picture.data != nullptr)
+            showing = icon_painted(hud->mpItemXYTex[b][hud->field_0x76c[b]][0]);
+        if (combo && !showing) {
             redraw_buttons();
             wait = 10;
             return;
@@ -2533,6 +2626,7 @@ static HookAction combo_tex_pre(ModContext*, void* args, void*, void*) {
     bool fire = fireIconButton >= 0 && item == dItemNo_BOW_e;
     if (front == nullptr || (!gale && !fire)) return HOOK_CONTINUE;
     comboIconTex = front;
+    comboIconPic = mods::arg<J2DPicture*>(args, 3);
     comboIcon = gale ? &galeBombIcon : &fireArrowIcon;
     return HOOK_CONTINUE;
 }
@@ -2540,7 +2634,12 @@ static HookAction combo_tex_pre(ModContext*, void* args, void*, void*) {
 static void combo_tex_post(ModContext*, void*, void*, void*) {
     void* tex = comboIconTex;
     comboIconTex = nullptr;
-    if (tex != nullptr) paint_icon(tex, *comboIcon, comboIconSize);
+    if (tex == nullptr) return;
+    paint_icon(tex, *comboIcon, comboIconSize);
+    // The picture took the texture before ours was set over it. Right after loading a new area the
+    // screen can hold on to that first look, so the picture is handed the texture once more now
+    // that ours is in place, which makes it look again.
+    if (comboIconPic != nullptr) comboIconPic->changeTexture(static_cast<const ResTIMG*>(tex), 0);
 }
 
 // --- the bomb count, in the same spot the bow shows its arrows ---
@@ -2727,17 +2826,16 @@ static bool was_judged(fpc_ProcID id) {
 //
 // Other players in Crests of Courage are a stand-in actor of its own ("cpRival", counted as an
 // enemy) that passes any hit on to that player's game, fire included. So a player gets no big
-// flame: they get one fire hit instead, and their own game does the rest the way it does for any
-// fire attack on Link (Link catches fire, a Wooden Shield he blocks with burns, water puts it out).
+// flame: they get fire hits instead, and their own game shows Link catching fire. A hit they block
+// isn't passed on as one (Crests of Courage only plays the block sound and push-back), so their
+// shield can't be set alight from here.
 
 static const int kBurnFrames = 120;
 static const int kScorchAt[2] = {100, 50};  // frames left when each scorch lands
 static const int kMaxBurning = 8;
 
 // The scorch hits as a sword would, with fire as its material. A lot of enemies (Bulblins among
-// them) ignore the lantern's own kind of hit entirely, but every enemy takes a sword hit. For
-// another player it's an ordinary fire hit on their Link, so their game burns them the usual way:
-// Link catches fire, a Wooden or Ordon Shield he blocks with catches fire, and water puts both out.
+// them) ignore the lantern's own kind of hit entirely, but every enemy takes a sword hit.
 static const dCcD_SrcCps kScorchSrc = {
     {
         {0x0, {{AT_TYPE_NORMAL_SWORD, 0x2, 0x1B}, {0x0, 0x0}, 0x0}},
@@ -2773,14 +2871,14 @@ static bool is_other_player(fopAc_ac_c* actor) {
 
 // Players burn on the same clock as enemies, just without the big flame (their own game shows
 // Link on fire): a fire hit as they catch fire, then two more while they burn. Each one is passed
-// on to their game as a fire hit, so it hurts a bit each time and keeps them burning, and their
-// Wooden or Ordon Shield catches if they block it.
+// on to their game as a fire hit, so it hurts a bit each time and keeps them burning.
 static const int kPlayerFireAt[3] = {kBurnFrames - 1, 80, 40};  // frames left when each one lands
 
 struct BurningEnemy {
     fpc_ProcID id;
     int framesLeft;
-    bool player;  // another player in Crests of Courage
+    bool player;     // another player in Crests of Courage
+    bool fromArrow;  // a fire arrow lit it (Use Fire Damage applies), not a lantern swing
     u32 flame[2];
     dCcD_Stts scorchOwner;
     dCcD_Cps scorch;
@@ -2808,6 +2906,8 @@ static cXyz body_top(fopAc_ac_c* actor) {
     return actor->current.pos + up;
 }
 
+static bool lightingFromLantern;  // set_on_fire is being asked by a lantern swing, not an arrow
+
 // true if it's an enemy (or another player) that's burning now
 static bool set_on_fire(fopAc_ac_c* actor) {
     daAlink_c* link = daAlink_getAlinkActorClass();
@@ -2826,6 +2926,7 @@ static bool set_on_fire(fopAc_ac_c* actor) {
     spot->id = id;
     spot->framesLeft = kBurnFrames;
     spot->player = is_other_player(actor);
+    spot->fromArrow = !lightingFromLantern;
     spot->flame[0] = spot->flame[1] = 0;
     spot->scorchOwner.Init(0xFF, 0xFF, link);  // counts as Link's hit
     spot->scorch.Set(spot->player ? kPlayerFireSrc : kScorchSrc);
@@ -2833,7 +2934,12 @@ static bool set_on_fire(fopAc_ac_c* actor) {
     return true;
 }
 
+// Use Fire Damage off: a fire arrow still sets things alight (the flame on an enemy, and on a
+// player the first fire hit, which is what sets their Link on fire), but the burn does no damage
+// after that
 static bool hit_due(const BurningEnemy& enemy) {
+    bool burnDamage = !enemy.fromArrow || cfgOn(vFireDamage);
+    if (!burnDamage) return enemy.player && enemy.framesLeft == kPlayerFireAt[0];
     if (enemy.player) {
         for (int at : kPlayerFireAt)
             if (enemy.framesLeft == at) return true;
@@ -2912,7 +3018,9 @@ static bool set_fire_around(const cXyz& at, f32 reach) {
 static void lantern_swing_burns(daAlink_c* link) {
     if (!cfgOn(vLanternBurn) || link->mProcID != daAlink_c::PROC_KANDELAAR_SWING) return;
     if (!link->mAtSph.ChkAtSet()) return;
+    lightingFromLantern = true;
     set_fire_around(link->mKandelaarFlamePos, link->mAtSph.GetR() + 30.0f);
+    lightingFromLantern = false;
 }
 
 static void burn_post(ModContext*, void* args, void*, void*) {
@@ -2977,12 +3085,6 @@ static void arrow_post(ModContext*, void* args, void*, void*) {
     if (fire < 0) return;
     BurningArrow& f = burning[fire];
 
-    // The arrow's own hit is made of fire too, the way a Bulblin's fire arrow is. Crests of
-    // Courage passes a hit's material on to the player it hits, so in their game this lands like a
-    // Bulblin's fire arrow: Link catches fire, or, if he blocks it with a Wooden or Ordon Shield,
-    // the shield catches fire and burns up unless he gets it into water.
-    if (!nocked) arrow->field_0x688.SetAtMtrl(dCcD_MTRL_FIRE);
-
     // In flight the fire reaches from where the head was last frame to a little past where it'll
     // be next frame, so whatever is in front of the arrow catches fire before (or as) the arrow
     // gets there, not after. Every enemy or player it reaches burns, each once while it burns.
@@ -3033,26 +3135,20 @@ static void arrow_post(ModContext*, void* args, void*, void*) {
     }
 }
 
-// once a frame: arrows that are gone take their light with them
-static int oilWasEmpty = -1;  // -1 until the first look
-
 static int fireButtonWas = -2;  // -2 until the first look
 
+// once a frame
 static void fire_arrow_tick() {
     keep_combos_drawn();
-    // Combining the lantern onto the bow doesn't change the item the HUD thinks is on the button
-    // (it's the bow either way), so the HUD never redrew it and kept showing the plain bow. It's
-    // redrawn here whenever the combination is made or split, and when the oil runs out or comes
-    // back (the lantern on the button goes dark like the lantern's own icon).
+    // Combining the lantern onto the bow (or splitting it off) doesn't change the item the HUD
+    // thinks is on the button, it's the bow either way, so the HUD wouldn't redraw it by itself.
     int button = fire_button();
-    int empty = dComIfGs_getOil() == 0 ? 1 : 0;
-    bool changed = button != fireButtonWas || (button >= 0 && empty != oilWasEmpty);
-    if (changed && dMeter2Info_getMeterClass() != nullptr) {
+    if (button != fireButtonWas && dMeter2Info_getMeterClass() != nullptr) {
         redraw_buttons();
         fireButtonWas = button;
-        oilWasEmpty = empty;
     }
 
+    // arrows that are gone take their light with them
     for (int i = 0; i < kArrowMemory; i++) {
         if (burning[i].id == fpcM_ERROR_PROCESS_ID_e || burning[i].id == 0) continue;
         if (fopAcM_SearchByID(burning[i].id) == nullptr) put_out(burning[i]);
@@ -3126,17 +3222,16 @@ static void galebomb_exec_post(ModContext*, void* args, void*, void*) {
     hang_bomb(mods::arg<daAlink_c*>(args, 0));
 }
 
-// once a frame: untie when the bombs run out, the boomerang leaves both buttons or the kind is switched off
-// a new HUD (after a warp, a load or a stage change) starts blank: our bomb and count need
-// writing onto it again for a few frames while it settles
+// A new HUD (after a warp, a load or a stage change) starts blank: nothing on it is drawn as a
+// combination yet, and the bomb count needs writing again.
 DEFINE_HOOK(&dMeter2_c::_create, HudCreate);
-static int hudFreshFrames;
 
 static void hud_created(ModContext*, void*, void*, void*) {
-    hudFreshFrames = 5;
     comboShown[0] = comboShown[1] = false;
+    countShown[0] = countShown[1] = -1;
 }
 
+// once a frame: untie when the bombs run out, the boomerang leaves both buttons or the kind is switched off
 static void galebomb_tick() {
     static int wasArmed = -2;
     int armed = armed_bag();
@@ -3149,13 +3244,7 @@ static void galebomb_tick() {
     if (bomblings) bombling_art_ready();
     else drop_bombling_art();
 
-    if (hudFreshFrames > 0) {
-        hudFreshFrames--;
-        countShown[0] = countShown[1] = -1;
-        redraw_buttons();
-    } else if (armed != wasArmed) {
-        redraw_buttons();
-    }
+    if (armed != wasArmed) redraw_buttons();
     wasArmed = armed;
 }
 
@@ -3642,6 +3731,7 @@ static void check_button(ModContext*, void*) {
 // greyed-out rules for rows that depend on another toggle
 static bool leaf_off(ModContext*, void*) { return !cfgOn(vLeaf); }
 static bool combos_off(ModContext*, void*) { return !combos_on(); }
+static bool fire_arrows_off(ModContext*, void*) { return !fire_on(); }
 static bool bash_off(ModContext*, void*) { return !cfgOn(vBash, true); }
 static bool swing_off(ModContext*, void*) { return !cfgOn(vSwing, true); }
 
@@ -3719,6 +3809,7 @@ static void combat_rows() {
 
     heading("Misc");
     choice("Sword Flourish", flourishOption, flourishNames, 4);
+    choice("Mortal Draw Hand Anim", handPoseOption, handPoseNames, 3);
     toggle("Deal Burn with Lantern", vLanternBurn);
 }
 
@@ -3736,6 +3827,7 @@ static void item_rows() {
     toggle("Gale Boomerang + Bomblings", galeBombToggle[2], combos_off);
     note("Fire Arrows");
     toggle("Bow + Lantern", vFireArrows, combos_off);
+    toggle("Use Fire Damage", vFireDamage, fire_arrows_off);
 }
 
 static const char* const tabTitles[3] = {"Quality of Life", "Combat", "Items"};
@@ -3959,6 +4051,9 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     // --- Combat > Misc: Sword Flourish and Deal Burn with Lantern ---
     if (!add_int_option("swordFlourish", FLOURISH_DEFAULT, &flourishOption)) flourishOption = 0;
     add_bool_option("lanternBurn", true, &vLanternBurn);
+    if (!add_int_option("mortalDrawHand", HAND_POSE_DEFAULT, &handPoseOption)) handPoseOption = 0;
+    if (!(pre_hook(ModelCalc, hand_pose_pre) && post_hook(ModelCalc, hand_pose_post)))
+        mods::log::warn("Mortal Draw Hand Anim stays at the game's normal behaviour");
     // rides along on Link's update, next to the Ice Leaf's own hooks there
     bool flourishOk = pre_hook(Exec, flourish_exec_pre) && post_hook(Exec, flourish_exec_post);
     if (!flourishOk) mods::log::warn("sword flourish stays at the game's normal behaviour");
@@ -3969,6 +4064,7 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     add_bool_option("galeWaterBombs", true, &galeBombToggle[1]);
     add_bool_option("galeBomblings", true, &galeBombToggle[2]);
     add_bool_option("fireArrows", true, &vFireArrows);
+    add_bool_option("fireDamage", true, &vFireDamage);
 
     // each combination's own picture on its button
     if (svc_resource->load(mod_ctx, "galebomb_icon.rgba", &galeBombIcon) != MOD_OK)
