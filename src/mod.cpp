@@ -3930,7 +3930,7 @@ static const f32 kMidnaSlack = 150.0f;    // how far Link gets before she sets o
 static const f32 kMidnaLeash = 300.0f;    // she's never let fall further behind her spot than this
 static const f32 kMidnaSettle = 8.0f;     // close enough to the spot to stop
 static const f32 kMidnaMinSpeed = 6.0f;   // her slowest flying pace (rising, drifting into place)
-static const f32 kMidnaReturnHurry = 4.0f;  // times her usual pace when she flies back to his shadow
+static const f32 kMidnaReturnSpeed = 80.0f;  // her least pace (units a frame) zooming back to his shadow
 static const f32 kMidnaTooFar = 1500.0f;  // past this (a warp, a load) she just appears by him
 
 // --- her real body, loaded once from the wolf's model archive ---
@@ -4117,10 +4117,11 @@ static void midna_follow_tick() {
 }
 
 // steps the spot from where she is toward where she's going, at Link's pace
-static void midna_step_toward(daMidna_c* midna, daAlink_c* lnk, const cXyz& goal, f32 hurry = 1.0f) {
+static void midna_step_toward(daMidna_c* midna, daAlink_c* lnk, const cXyz& goal, f32 leastPace = kMidnaMinSpeed) {
     midnaGoal = goal;
-    f32 linkPace = (lnk->current.pos - lnk->old.pos).absXZ();
-    f32 pace = (linkPace > kMidnaMinSpeed ? linkPace : kMidnaMinSpeed) * hurry;
+    // Link's real pace this frame, however he's moving (a sprint, a roll, a horse, a mod's speed)
+    f32 linkPace = (lnk->current.pos - lnk->old.pos).abs();
+    f32 pace = linkPace > leastPace ? linkPace : leastPace;
     cXyz to = goal - midna->current.pos;
     f32 dist = to.abs();
     midnaSpot = dist <= pace ? goal : midna->current.pos + to * (pace / dist);
@@ -4195,19 +4196,16 @@ static HookAction midna_exec_pre(ModContext*, void* args, void*, void*) {
         if (!midnaMoving && midna->current.pos.abs(home) > kMidnaSlack) midnaMoving = true;
         if (midnaMoving) {
             midna_step_toward(midna, lnk, home);
-            // however fast Link goes (a roll, a gallop, a long fall), she stays within the leash:
-            // past it she's carried along at the edge, keeping pace with him
-            cXyz behind = midnaSpot - home;
-            if (behind.abs() > kMidnaLeash) midnaSpot = home + behind * (kMidnaLeash / behind.abs());
             if (midnaSpot.abs(home) < kMidnaSettle) midnaMoving = false;
         } else {
             midnaSpot = midna->current.pos;
         }
         break;
     case MIDNA_LEAVING: {
-        // going back she darts in, well faster than Link, so she never trails after him to get there
+        // going back she zooms in, much faster than Link, so she never trails after him to get there
         cXyz feet = lnk->current.pos;
-        midna_step_toward(midna, lnk, feet, kMidnaReturnHurry);
+        f32 linkPace = (lnk->current.pos - lnk->old.pos).abs();
+        midna_step_toward(midna, lnk, feet, linkPace * 2.0f > kMidnaReturnSpeed ? linkPace * 2.0f : kMidnaReturnSpeed);
         if (midnaSpot.abs(feet) < kMidnaSettle) midnaPhase = MIDNA_DIVING, midnaMoving = false;
         break;
     }
@@ -4217,6 +4215,12 @@ static HookAction midna_exec_pre(ModContext*, void* args, void*, void*) {
     default:
         break;
     }
+    // However fast Link goes (a roll, a gallop, a long fall, a sprint mod), she stays within the
+    // leash of her spot beside him: past it she's carried along at the edge, keeping pace with him.
+    if (midnaPhase == MIDNA_RISING || midnaPhase == MIDNA_FOLLOWING) {
+        cXyz behind = midnaSpot - home;
+        if (behind.abs() > kMidnaLeash) midnaSpot = home + behind * (kMidnaLeash / behind.abs());
+    }
     midna->onTagWaitPos(&midnaSpot);
     // no beckoning with her hair-hand ("this way!"): she's just keeping Link company
     midna->onTagNoHairLead();
@@ -4225,6 +4229,16 @@ static HookAction midna_exec_pre(ModContext*, void* args, void*, void*) {
 
 static void midna_exec_post(ModContext*, void*, void*, void*) {
     if (auto* lnk = (daAlink_c*)dComIfGp_getPlayer(0)) take_body_back(lnk);
+}
+
+// The game moves her toward her wait spot at no more than 30 units a frame, slower than a sprint
+// (or a mod's speed). Her pace is ours to set, so she's put on this frame's spot before it moves
+// her: she's always exactly where her pace and the leash put her.
+static HookAction midna_pos_pre(ModContext*, void* args, void*, void*) {
+    auto* midna = mods::arg<daMidna_c*>(args, 0);
+    if (midnaPhase == MIDNA_HIDDEN || !midna->checkStateFlg0(daMidna_c::FLG0_TAG_WAIT)) return HOOK_CONTINUE;
+    midna->current.pos = midnaSpot;
+    return HOOK_CONTINUE;
 }
 
 // while flying she isn't "there yet", so she keeps her floating-move animation; while she hangs
@@ -4474,7 +4488,7 @@ static void particle_set_post(ModContext*, void*, void* retval, void*) {
 
 static void midna_follow_init() {
     bool ok = pre_hook(MidnaExec, midna_exec_pre) && post_hook(MidnaExec, midna_exec_post) &&
-              post_hook(MidnaPos, midna_pos_post) && pre_hook(MidnaAnm, midna_anm_pre) &&
+              pre_hook(MidnaPos, midna_pos_pre) && post_hook(MidnaPos, midna_pos_post) && pre_hook(MidnaAnm, midna_anm_pre) &&
               post_hook(MidnaNoDraw, midna_draw_post) &&
               pre_hook(MidnaDraw, real_body_for_drawing) && post_hook(MidnaDraw, shadow_form_after_drawing) &&
               pre_hook(LinkShadowDraw, real_body_for_drawing) && post_hook(LinkShadowDraw, shadow_form_after_drawing);
