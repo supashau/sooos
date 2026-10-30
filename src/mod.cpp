@@ -38,6 +38,7 @@
 #include "JSystem/JParticle/JPAResourceManager.h"
 #include "d/d_particle.h"
 #include "m_Do/m_Do_dvd_thread.h"
+#include "dolphin/dvd.h"
 #include "m_Do/m_Do_graphic.h"
 #include "d/actor/d_a_kytag08.h"
 #include "d/actor/d_a_nbomb.h"
@@ -3915,6 +3916,7 @@ static MidnaPhase midnaPhase = MIDNA_HIDDEN;
 static bool midnaWanted;     // L3 has called her out (she may still be away for a cutscene)
 static bool midnaMoving;     // flying to catch up, rather than hanging in place
 static bool midnaShadowForced;  // we turned on her shadow-form state (see midna_draw_post)
+static bool midnaShowsReal;     // her real body is what's actually drawn
 static s16 midnaFacing;      // where she looks while hanging in place
 static cXyz midnaGoal;       // where she's flying to
 static cXyz midnaSpot;       // the spot we're steering her wait mode to this frame
@@ -3925,8 +3927,10 @@ static const f32 kMidnaSide = 90.0f;      // to Link's left
 static const f32 kMidnaBack = 40.0f;      // and a little behind him
 static const f32 kMidnaHeight = 30.0f;    // floating off the ground
 static const f32 kMidnaSlack = 150.0f;    // how far Link gets before she sets off after him
+static const f32 kMidnaLeash = 300.0f;    // she's never let fall further behind her spot than this
 static const f32 kMidnaSettle = 8.0f;     // close enough to the spot to stop
 static const f32 kMidnaMinSpeed = 6.0f;   // her slowest flying pace (rising, drifting into place)
+static const f32 kMidnaReturnHurry = 4.0f;  // times her usual pace when she flies back to his shadow
 static const f32 kMidnaTooFar = 1500.0f;  // past this (a warp, a load) she just appears by him
 
 // --- her real body, loaded once from the wolf's model archive ---
@@ -3938,11 +3942,25 @@ struct MidnaBody {
 };
 static MidnaBody ourBody;
 static bool midnaBodyTried;
+static JKRHeap* bodyHeap;        // the body and the archive it came from live here, and only here
+static JKRArchive* bodyArchive;
 
 static J3DModel* body_part(JKRArchive* arc, u32 index, u32 tag, u32 modelFlags, u32 diffFlags) {
     void* raw = arc->getIdxResource(index);
     J3DModelData* data = raw ? dRes_info_c::loaderBasicBmd(tag, raw) : nullptr;
     return data ? mDoExt_J3DModel__create(data, modelFlags, diffFlags | 0x11000084) : nullptr;
+}
+
+// Throws the body away, all of it. Each Midna that wears it hooks her own eye, face and hand
+// animations into it, and those go with her when she's removed (any reload: a loading zone, a
+// fall into a pit, a warp), so a body one Midna wore is never handed to the next.
+static void free_midna_body() {
+    if (bodyArchive) bodyArchive->unmount();  // also takes it off the game's list of archives
+    if (bodyHeap) bodyHeap->destroy();
+    bodyArchive = nullptr;
+    bodyHeap = nullptr;
+    ourBody = {};
+    midnaBodyTried = false;
 }
 
 // the same four models (and settings) Link makes for her when he turns into the wolf
@@ -3951,30 +3969,52 @@ static bool load_midna_body() {
     if (midnaBodyTried) return false;
     midnaBodyTried = true;
 
-    JKRHeap* heap = nullptr;
-    JKRHeap* parents[] = {JKRHeap::sRootHeap, mDoExt_getArchiveHeap(), mDoExt_getGameHeap()};
-    for (JKRHeap* parent : parents) {
-        if (parent && (heap = JKRExpHeap::create(0x180000, parent, false))) break;
-    }
-    if (!heap) {
-        mods::log::warn("no room to load Midna's body, she'll show in her shadow form");
+    // Room for the archive (unpacked if it's packed) and the models built from it. A model mod
+    // can make the file several times its usual size, so the room is sized from the file actually
+    // there (with a mod's replacement in place), not from the game's own.
+    static const char* const kWolfModels = "/res/Object/Wmdl.arc";
+    DVDFileInfo file;
+    if (!DVDOpen(kWolfModels, &file)) {
+        mods::log::warn("couldn't find Wmdl.arc, Midna will show in her shadow form");
         return false;
     }
-    JKRHeap* was = mDoExt_setCurrentHeap(heap);
-    JKRArchive* arc = JKRArchive::mount("/res/Object/Wmdl.arc", JKRArchive::MOUNT_MEM, heap,
-                                        JKRArchive::MOUNT_DIRECTION_HEAD);
-    if (arc) {
+    u32 fileSize = file.length;
+    DVDClose(&file);
+    u32 room = fileSize * 3 + 0x200000;
+
+    JKRHeap* parents[] = {JKRHeap::sRootHeap, mDoExt_getArchiveHeap(), mDoExt_getGameHeap()};
+    for (JKRHeap* parent : parents) {
+        if (parent && (bodyHeap = JKRExpHeap::create(room, parent, false))) break;
+    }
+    if (!bodyHeap) {
+        mods::log::warn("no room ({} KB) to load Midna's body, she'll show in her shadow form", room / 1024);
+        return false;
+    }
+    JKRHeap* was = mDoExt_setCurrentHeap(bodyHeap);
+    bodyArchive = JKRArchive::mount(kWolfModels, JKRArchive::MOUNT_MEM, bodyHeap,
+                                    JKRArchive::MOUNT_DIRECTION_HEAD);
+    // The model loader doesn't cope with running out of memory part way through (it crashes), so
+    // only go ahead with plenty left: at least the file's size again for the models.
+    if (bodyArchive && u32(bodyHeap->getFreeSize()) < fileSize + 0x100000) {
+        mods::log::warn("not enough room left for Midna's body after loading Wmdl.arc");
+        mDoExt_setCurrentHeap(was);
+        free_midna_body();
+        midnaBodyTried = true;
+        return false;
+    }
+    if (bodyArchive) {
         // md.bmd, md_mask.bmd, md_hands.bmd and md_hair_hand.bmd, by their slots in Wmdl.arc
-        ourBody.body = body_part(arc, 10, 'BMDV', 0, 0x1020200);
-        ourBody.mask = body_part(arc, 7, 'BMDR', 0x80000, 0x1000000);
-        ourBody.hands = body_part(arc, 6, 'BMDR', 0x80000, 0x1000000);
-        ourBody.hair = body_part(arc, 11, 'BMDV', 0, 0x1000000);
+        ourBody.body = body_part(bodyArchive, 10, 'BMDV', 0, 0x1020200);
+        ourBody.mask = body_part(bodyArchive, 7, 'BMDR', 0x80000, 0x1000000);
+        ourBody.hands = body_part(bodyArchive, 6, 'BMDR', 0x80000, 0x1000000);
+        ourBody.hair = body_part(bodyArchive, 11, 'BMDV', 0, 0x1000000);
     }
     mDoExt_setCurrentHeap(was);
 
     if (!ourBody.body || !ourBody.mask || !ourBody.hands || !ourBody.hair) {
         mods::log::warn("couldn't load Midna's body, she'll show in her shadow form");
-        ourBody = {};
+        free_midna_body();
+        midnaBodyTried = true;  // don't keep trying (and hitching) every frame
         return false;
     }
     return true;
@@ -4066,7 +4106,6 @@ static void midna_follow_tick() {
             midnaWanted = false;  // she flies back and dives in (see midna_exec_pre)
         } else if (midna_allowed(lnk)) {
             midnaWanted = true;
-            load_midna_body();
             trail_wanted();
         }
     }
@@ -4078,19 +4117,33 @@ static void midna_follow_tick() {
 }
 
 // steps the spot from where she is toward where she's going, at Link's pace
-static void midna_step_toward(daMidna_c* midna, daAlink_c* lnk, const cXyz& goal) {
+static void midna_step_toward(daMidna_c* midna, daAlink_c* lnk, const cXyz& goal, f32 hurry = 1.0f) {
     midnaGoal = goal;
     f32 linkPace = (lnk->current.pos - lnk->old.pos).absXZ();
-    f32 pace = linkPace > kMidnaMinSpeed ? linkPace : kMidnaMinSpeed;
+    f32 pace = (linkPace > kMidnaMinSpeed ? linkPace : kMidnaMinSpeed) * hurry;
     cXyz to = goal - midna->current.pos;
     f32 dist = to.abs();
     midnaSpot = dist <= pace ? goal : midna->current.pos + to * (pace / dist);
 }
 
+static fpc_ProcID midnaSeen = fpcM_ERROR_PROCESS_ID_e;  // the Midna the follow state belongs to
+
 static HookAction midna_exec_pre(ModContext*, void* args, void*, void*) {
     auto* midna = mods::arg<daMidna_c*>(args, 0);
     auto* lnk = (daAlink_c*)dComIfGp_getPlayer(0);
     if (!lnk) return HOOK_CONTINUE;
+
+    // A new Midna (the area was reloaded): nothing from the old one carries over, not her place in
+    // the follow, not the body she wore. If she's still wanted she rises again with a fresh body.
+    fpc_ProcID me = fopAcM_GetID(midna);
+    if (me != midnaSeen) {
+        midnaSeen = me;
+        midnaPhase = MIDNA_HIDDEN;
+        midnaMoving = false;
+        midnaShadowForced = false;
+        midnaShowsReal = false;
+        if (ourBody.body) free_midna_body();
+    }
 
     if (!midna_allowed(lnk) || midna->mDemoMode != 0) {
         midna_hide_now(midna);  // she comes back up after the cutscene if she's still wanted
@@ -4099,6 +4152,7 @@ static HookAction midna_exec_pre(ModContext*, void* args, void*, void*) {
     if (midnaPhase == MIDNA_HIDDEN) {
         if (!midnaWanted) return HOOK_CONTINUE;
         // rise up out of Link's shadow, from the same spot at his feet she dives back into
+        load_midna_body();
         midnaSpot = lnk->current.pos;
         midna->current.pos = midna->old.pos = midnaSpot;
         midna->shape_angle.y = midna->current.angle.y = midnaFacing = lnk->shape_angle.y;
@@ -4141,14 +4195,19 @@ static HookAction midna_exec_pre(ModContext*, void* args, void*, void*) {
         if (!midnaMoving && midna->current.pos.abs(home) > kMidnaSlack) midnaMoving = true;
         if (midnaMoving) {
             midna_step_toward(midna, lnk, home);
+            // however fast Link goes (a roll, a gallop, a long fall), she stays within the leash:
+            // past it she's carried along at the edge, keeping pace with him
+            cXyz behind = midnaSpot - home;
+            if (behind.abs() > kMidnaLeash) midnaSpot = home + behind * (kMidnaLeash / behind.abs());
             if (midnaSpot.abs(home) < kMidnaSettle) midnaMoving = false;
         } else {
             midnaSpot = midna->current.pos;
         }
         break;
     case MIDNA_LEAVING: {
+        // going back she darts in, well faster than Link, so she never trails after him to get there
         cXyz feet = lnk->current.pos;
-        midna_step_toward(midna, lnk, feet);
+        midna_step_toward(midna, lnk, feet, kMidnaReturnHurry);
         if (midnaSpot.abs(feet) < kMidnaSettle) midnaPhase = MIDNA_DIVING, midnaMoving = false;
         break;
     }
@@ -4217,8 +4276,6 @@ static HookAction midna_anm_pre(ModContext*, void* args, void*, void*) {
 // which the game skips while that state is on) sees her real body.
 DEFINE_HOOK(&daMidna_c::draw, MidnaDraw);
 DEFINE_HOOK(&daAlink_c::shadowDraw, LinkShadowDraw);
-
-static bool midnaShowsReal;  // her real body is what's actually drawn
 
 static void midna_draw_post(ModContext*, void* args, void*, void*) {
     auto* midna = mods::arg<daMidna_c*>(args, 0);
@@ -4888,6 +4945,8 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
     shop_shutdown();
     drop_bombling_art();
     fire_arrow_shutdown();
+    if (daMidna_c* midna = daPy_py_c::getMidnaActor()) midna_hide_now(midna);
+    free_midna_body();
     return MOD_OK;
 }
 
