@@ -33,6 +33,7 @@
 #include "d/actor/d_a_horse.h"
 #include "d/actor/d_a_midna.h"
 #include "JSystem/JUtility/JUTGamePad.h"
+#include "JSystem/JKernel/JKRExpHeap.h"
 #include "d/actor/d_a_kytag08.h"
 #include "d/actor/d_a_nbomb.h"
 #include "d/actor/d_a_obj_iceleaf.h"
@@ -3821,26 +3822,125 @@ static void check_button(ModContext*, void*) {
 }
 
 // ======================== L3 Midna Follow ========================
-// Clicking the left stick in human form brings Midna out to float along beside Link; clicking it
-// again sends her back into his shadow. She uses the game's own "wait at a spot" mode, the one
-// that has her float ahead of wolf Link: we keep moving that spot to beside Link, and she flies to
-// it (her floating-move animation) once he's got far enough away, then hangs there in her float
-// idle. In the light world she shows as the shadow form she has there, the same as when you talk
-// to her.
+// Clicking the left stick in human form brings Midna up out of Link's shadow to float along beside
+// him; clicking it again sends her back down into it. She runs on the game's own "wait at a spot"
+// mode (the one that has her float ahead of wolf Link), which gives her floating-move and floating
+// idle animations; we just move that spot along beside Link at his pace.
+//
+// Her real body normally only exists while Link is the wolf (it's loaded with the wolf's models),
+// so the first time she's called the mod loads its own copy of it from the wolf's model file.
 DEFINE_HOOK(&daMidna_c::execute, MidnaExec);
+DEFINE_HOOK(&daMidna_c::checkMidnaPosState, MidnaPos);
+DEFINE_HOOK(&daMidna_c::setAnm, MidnaAnm);
 DEFINE_HOOK(&daMidna_c::setMidnaNoDrawFlg, MidnaNoDraw);
 
-static bool midnaOut;           // she's been called out
-static bool midnaPlaced;        // she's in our wait spot right now (not back in the shadow)
-static bool midnaForcedShadow;  // we turned on her shadow-model draw, so we turn it off again
-static cXyz midnaSpot;          // where she's floating to / waiting at
+enum MidnaPhase { MIDNA_HIDDEN, MIDNA_RISING, MIDNA_FOLLOWING, MIDNA_LEAVING, MIDNA_DIVING };
+static MidnaPhase midnaPhase = MIDNA_HIDDEN;
+static bool midnaWanted;     // L3 has called her out (she may still be away for a cutscene)
+static bool midnaMoving;     // flying to catch up, rather than hanging in place
+static bool midnaShadowForced;  // we turned on her shadow-form drawing (only if her body didn't load)
+static s16 midnaFacing;      // where she looks while hanging in place
+static cXyz midnaSpot;       // the spot we're steering her wait mode to this frame
 static u32 lastExtButtons;
 
-static const f32 kMidnaSide = 90.0f;       // to Link's left
-static const f32 kMidnaBack = 40.0f;       // and a little behind him
-static const f32 kMidnaHeight = 60.0f;     // floating off the ground
-static const f32 kMidnaSlack = 150.0f;     // how far Link gets before she catches up
-static const f32 kMidnaTooFar = 1500.0f;   // past this (a warp, a load) she just appears there
+static const f32 kMidnaSide = 90.0f;      // to Link's left
+static const f32 kMidnaBack = 40.0f;      // and a little behind him
+static const f32 kMidnaHeight = 30.0f;    // floating off the ground
+static const f32 kMidnaSlack = 150.0f;    // how far Link gets before she sets off after him
+static const f32 kMidnaSettle = 8.0f;     // close enough to the spot to stop
+static const f32 kMidnaMinSpeed = 6.0f;   // her slowest flying pace (rising, drifting into place)
+static const f32 kMidnaTooFar = 1500.0f;  // past this (a warp, a load) she just appears by him
+
+// --- her real body, loaded once from the wolf's model archive ---
+struct MidnaBody {
+    J3DModel* body;
+    J3DModel* mask;
+    J3DModel* hands;
+    J3DModel* hair;
+};
+static MidnaBody ourBody;
+static bool midnaBodyTried;
+
+static J3DModel* body_part(JKRArchive* arc, u32 index, u32 tag, u32 modelFlags, u32 diffFlags) {
+    void* raw = arc->getIdxResource(index);
+    J3DModelData* data = raw ? dRes_info_c::loaderBasicBmd(tag, raw) : nullptr;
+    return data ? mDoExt_J3DModel__create(data, modelFlags, diffFlags | 0x11000084) : nullptr;
+}
+
+// the same four models (and settings) Link makes for her when he turns into the wolf
+static bool load_midna_body() {
+    if (ourBody.body) return true;
+    if (midnaBodyTried) return false;
+    midnaBodyTried = true;
+
+    JKRHeap* heap = nullptr;
+    JKRHeap* parents[] = {JKRHeap::sRootHeap, mDoExt_getArchiveHeap(), mDoExt_getGameHeap()};
+    for (JKRHeap* parent : parents) {
+        if (parent && (heap = JKRExpHeap::create(0x180000, parent, false))) break;
+    }
+    if (!heap) {
+        mods::log::warn("no room to load Midna's body, she'll show in her shadow form");
+        return false;
+    }
+    JKRHeap* was = mDoExt_setCurrentHeap(heap);
+    JKRArchive* arc = JKRArchive::mount("/res/Object/Wmdl.arc", JKRArchive::MOUNT_MEM, heap,
+                                        JKRArchive::MOUNT_DIRECTION_HEAD);
+    if (arc) {
+        // md.bmd, md_mask.bmd, md_hands.bmd and md_hair_hand.bmd, by their slots in Wmdl.arc
+        ourBody.body = body_part(arc, 10, 'BMDV', 0, 0x1020200);
+        ourBody.mask = body_part(arc, 7, 'BMDR', 0x80000, 0x1000000);
+        ourBody.hands = body_part(arc, 6, 'BMDR', 0x80000, 0x1000000);
+        ourBody.hair = body_part(arc, 11, 'BMDV', 0, 0x1000000);
+    }
+    mDoExt_setCurrentHeap(was);
+
+    if (!ourBody.body || !ourBody.mask || !ourBody.hands || !ourBody.hair) {
+        mods::log::warn("couldn't load Midna's body, she'll show in her shadow form");
+        ourBody = {};
+        return false;
+    }
+    return true;
+}
+
+// Midna picks her body up from Link while she updates; while she's out with human Link, he hands
+// her ours instead of the wolf ones he doesn't have
+struct LinkMidnaModels {
+    J3DModel* body;
+    J3DModel* mask;
+    J3DModel* hands;
+    J3DModel* hair;
+};
+static LinkMidnaModels lendSaved;
+static bool lending;
+
+static void lend_body(daAlink_c* lnk) {
+    lendSaved = {lnk->mpWlMidnaModel, lnk->mpWlMidnaMaskModel, lnk->mpWlMidnaHandModel, lnk->mpWlMidnaHairModel};
+    lnk->mpWlMidnaModel = ourBody.body;
+    lnk->mpWlMidnaMaskModel = ourBody.mask;
+    lnk->mpWlMidnaHandModel = ourBody.hands;
+    lnk->mpWlMidnaHairModel = ourBody.hair;
+    lending = true;
+}
+
+static void take_body_back(daAlink_c* lnk) {
+    if (!lending) return;
+    lnk->mpWlMidnaModel = lendSaved.body;
+    lnk->mpWlMidnaMaskModel = lendSaved.mask;
+    lnk->mpWlMidnaHandModel = lendSaved.hands;
+    lnk->mpWlMidnaHairModel = lendSaved.hair;
+    lending = false;
+}
+
+// she keeps whatever body she last picked up; clearing it makes her pick up Link's own again
+static void forget_body(daMidna_c* midna) {
+    if (midna->mpModel != ourBody.body || !ourBody.body) return;
+    midna->mpModel = nullptr;
+    midna->mpMaskBmd = nullptr;
+    midna->mpHandsBmd = nullptr;
+    midna->mpHairhandBmd = nullptr;
+    midna->mpLeftHandShape = nullptr;
+    midna->mpRightHandShape = nullptr;
+}
 
 static bool l3_pressed() {
     u32 now = JUTGamePad::mPadStatus[PAD_1].extButton;
@@ -3860,85 +3960,181 @@ static cXyz midna_home(daAlink_c* lnk) {
 }
 
 // she only comes out for human Link, outside cutscenes, once she's met him
-static bool midna_can_be_out(daAlink_c* lnk) {
+static bool midna_allowed(daAlink_c* lnk) {
     return cfgOn(vMidnaFollow, true) && !lnk->checkWolf() && daPy_py_c::checkFirstMidnaDemo() &&
            !dComIfGp_event_runCheck() && !lnk->checkMetamorphose();
 }
 
-static void midna_go_back(daMidna_c* midna) {
-    if (!midna) return;
-    midna->offTagWaitPos();
-    midna->offStateFlg0((daMidna_c::daMidna_FLG0)(daMidna_c::FLG0_WOLF_NO_POS | daMidna_c::FLG0_UNK_200 |
-                                       daMidna_c::FLG0_UNK_100));
-    if (midnaForcedShadow) midna->offStateFlg1(daMidna_c::FLG1_SHADOW_MODEL_DRAW_DEMO_FORCE);
-    midnaForcedShadow = false;
-    midnaPlaced = false;
+// straight back into the shadow, no animation (cutscenes, the wolf, the setting turned off)
+static void midna_hide_now(daMidna_c* midna) {
+    if (midna && midnaPhase != MIDNA_HIDDEN) {
+        midna->offTagWaitPos();
+        midna->offStateFlg0((daMidna_c::daMidna_FLG0)(daMidna_c::FLG0_WOLF_NO_POS | daMidna_c::FLG0_UNK_200 |
+                                                      daMidna_c::FLG0_UNK_100));
+        forget_body(midna);
+    }
+    midnaPhase = MIDNA_HIDDEN;
+    midnaMoving = false;
 }
 
 static void midna_follow_tick() {
     auto* lnk = (daAlink_c*)dComIfGp_getPlayer(0);
     bool pressed = l3_pressed();
     if (!lnk) return;
-    if (pressed && (midnaOut || midna_can_be_out(lnk))) {
-        midnaOut = !midnaOut;
-        if (!midnaOut) midna_go_back(daPy_py_c::getMidnaActor());
-        else midnaSpot = midna_home(lnk);
+    if (pressed) {
+        if (midnaWanted) {
+            midnaWanted = false;  // she flies back and dives in (see midna_exec_pre)
+        } else if (midna_allowed(lnk)) {
+            midnaWanted = true;
+            load_midna_body();
+        }
     }
-    // turning into the wolf or switching the setting off sends her back for good
-    if (midnaOut && (lnk->checkWolf() || !cfgOn(vMidnaFollow, true))) {
-        midnaOut = false;
-        midna_go_back(daPy_py_c::getMidnaActor());
+    // turning into the wolf or switching the setting off ends it for good
+    if (midnaWanted && (lnk->checkWolf() || !cfgOn(vMidnaFollow, true))) {
+        midnaWanted = false;
+        midna_hide_now(daPy_py_c::getMidnaActor());
     }
 }
 
-// a cutscene or talking to someone takes her back into the shadow for the moment; she comes
-// back out after it
-static bool midna_floating(daMidna_c* midna) {
-    auto* lnk = (daAlink_c*)dComIfGp_getPlayer(0);
-    return midnaOut && lnk && midna_can_be_out(lnk) && midna->mDemoMode == 0;
+// steps the spot from where she is toward where she's going, at Link's pace
+static void midna_step_toward(daMidna_c* midna, daAlink_c* lnk, const cXyz& goal) {
+    f32 linkPace = (lnk->current.pos - lnk->old.pos).absXZ();
+    f32 pace = linkPace > kMidnaMinSpeed ? linkPace : kMidnaMinSpeed;
+    cXyz to = goal - midna->current.pos;
+    f32 dist = to.abs();
+    midnaSpot = dist <= pace ? goal : midna->current.pos + to * (pace / dist);
 }
 
 static HookAction midna_exec_pre(ModContext*, void* args, void*, void*) {
     auto* midna = mods::arg<daMidna_c*>(args, 0);
-    if (!midna_floating(midna)) {
-        if (midnaPlaced) midna_go_back(midna);
+    auto* lnk = (daAlink_c*)dComIfGp_getPlayer(0);
+    if (!lnk) return HOOK_CONTINUE;
+
+    if (!midna_allowed(lnk) || midna->mDemoMode != 0) {
+        midna_hide_now(midna);  // she comes back up after the cutscene if she's still wanted
         return HOOK_CONTINUE;
+    }
+    if (midnaPhase == MIDNA_HIDDEN) {
+        if (!midnaWanted) return HOOK_CONTINUE;
+        // rise up out of Link's shadow
+        midnaSpot = lnk->current.pos;
+        midna->onTagWaitPosWarp(&midnaSpot);
+        midna->offStateFlg0(daMidna_c::FLG0_UNK_200);
+        midna->mSound.startCreatureSound(Z2SE_MIDNA_APPEAR, 0, -1);
+        midnaPhase = MIDNA_RISING;
+        midnaMoving = true;
+    } else if (!midnaWanted && midnaPhase != MIDNA_LEAVING && midnaPhase != MIDNA_DIVING) {
+        midnaPhase = MIDNA_LEAVING;
+        midnaMoving = true;
     }
 
-    auto* lnk = (daAlink_c*)dComIfGp_getPlayer(0);
-    cXyz home = midna_home(lnk);
-    f32 behind = midna->current.pos.abs(home);
-    if (behind > kMidnaTooFar) {
-        midnaSpot = home;
-        midna->onTagWaitPosWarp(&midnaSpot);  // appear right there
-        midnaPlaced = true;
-        return HOOK_CONTINUE;
+    if (ourBody.body) {
+        // make her pick our body up this frame rather than keep an older one
+        if (midna->mpModel != ourBody.body) midna->mpModel = nullptr;
+        lend_body(lnk);
     }
-    // she only sets off once Link has pulled away, so she trails him instead of sticking to him
-    if (!midnaPlaced || midnaSpot.abs(home) > kMidnaSlack) {
-        midnaSpot = home;
-        midna->offStateFlg0(daMidna_c::FLG0_UNK_200);  // not "arrived" any more: fly
+
+    cXyz home = midna_home(lnk);
+    switch (midnaPhase) {
+    case MIDNA_RISING:
+        midna_step_toward(midna, lnk, home);
+        if (midnaSpot.abs(home) < kMidnaSettle) midnaPhase = MIDNA_FOLLOWING, midnaMoving = false;
+        break;
+    case MIDNA_FOLLOWING:
+        if (midna->current.pos.abs(home) > kMidnaTooFar) {
+            midnaSpot = home;
+            midna->onTagWaitPosWarp(&midnaSpot);  // appear right by him
+            midnaMoving = false;
+            return HOOK_CONTINUE;
+        }
+        // she only sets off once Link has pulled away, so she trails him instead of sticking to him
+        if (!midnaMoving && midna->current.pos.abs(home) > kMidnaSlack) midnaMoving = true;
+        if (midnaMoving) {
+            midna_step_toward(midna, lnk, home);
+            if (midnaSpot.abs(home) < kMidnaSettle) midnaMoving = false;
+        } else {
+            midnaSpot = midna->current.pos;
+        }
+        break;
+    case MIDNA_LEAVING: {
+        cXyz feet = lnk->current.pos;
+        midna_step_toward(midna, lnk, feet);
+        if (midnaSpot.abs(feet) < kMidnaSettle) midnaPhase = MIDNA_DIVING, midnaMoving = false;
+        break;
+    }
+    case MIDNA_DIVING:
+        midnaSpot = lnk->current.pos;
+        break;
+    default:
+        break;
     }
     midna->onTagWaitPos(&midnaSpot);
-    midnaPlaced = true;
     return HOOK_CONTINUE;
 }
 
-// in human form the game hides her unless she's talking; keep her drawn while she's out
+static void midna_exec_post(ModContext*, void*, void*, void*) {
+    if (auto* lnk = (daAlink_c*)dComIfGp_getPlayer(0)) take_body_back(lnk);
+}
+
+// while flying she isn't "there yet", so she keeps her floating-move animation; while she hangs
+// in place she looks where Link is facing, not back at him
+static void midna_pos_post(ModContext*, void* args, void*, void*) {
+    auto* midna = mods::arg<daMidna_c*>(args, 0);
+    if (midnaPhase == MIDNA_HIDDEN || midnaPhase == MIDNA_DIVING) return;
+    if (midnaMoving) {
+        midna->offStateFlg0(daMidna_c::FLG0_UNK_200);
+        midnaFacing = midna->shape_angle.y;  // the game turns her the way she's flying
+        return;
+    }
+    auto* lnk = (daAlink_c*)dComIfGp_getPlayer(0);
+    if (!lnk) return;
+    cLib_addCalcAngleS(&midnaFacing, lnk->shape_angle.y, 4, 0x1000, 0x100);
+    midna->shape_angle.y = midnaFacing;
+    midna->current.angle.y = midnaFacing;
+}
+
+// at Link's feet she plays her dive back into his shadow, then she's gone
+static HookAction midna_anm_pre(ModContext*, void* args, void*, void*) {
+    auto* midna = mods::arg<daMidna_c*>(args, 0);
+    if (midnaPhase != MIDNA_DIVING) return HOOK_CONTINUE;
+    if (!midna->checkSetAnime(0, daMidna_c::ANM_RETURN)) {
+        u16 res = daMidna_c::m_anmDataTable[daMidna_c::ANM_RETURN].mResID;
+        auto* bck = (J3DAnmTransform*)midna->mBckHeap[0].loadDataIdx(res);
+        if (!bck) {
+            midna_hide_now(midna);
+            return HOOK_CONTINUE;
+        }
+        midna->setBckAnime(bck, -1, 5.0f);
+        midna->setUpperAnimeAndSe(daMidna_c::ANM_RETURN);
+        midna->mSound.startCreatureSound(Z2SE_MIDNA_DISAPPEAR, 0, -1);
+    } else if (midna->mpMorf->isStop()) {
+        midna_hide_now(midna);
+        return HOOK_CONTINUE;
+    }
+    return HOOK_SKIP_ORIGINAL;
+}
+
+// in human form the game keeps her hidden; while she's out she's drawn (her real body, or her
+// shadow form if the body couldn't be loaded)
 static void midna_draw_post(ModContext*, void* args, void*, void*) {
     auto* midna = mods::arg<daMidna_c*>(args, 0);
-    if (!midna_floating(midna)) return;
-    bool realBody = (dKy_darkworld_check() || dComIfGs_isTransformLV(3)) && midna->mpModel != nullptr;
-    if (realBody) {
+    if (midnaPhase == MIDNA_HIDDEN) {
+        if (midnaShadowForced) midna->offStateFlg1(daMidna_c::FLG1_SHADOW_MODEL_DRAW_DEMO_FORCE);
+        midnaShadowForced = false;
+        return;
+    }
+    if (midna->mpModel) {
         midna->offStateFlg0((daMidna_c::daMidna_FLG0)(daMidna_c::FLG0_NO_DRAW | daMidna_c::FLG0_UNK_10000));
     } else if (!midna->checkStateFlg1(daMidna_c::FLG1_SHADOW_MODEL_DRAW_DEMO_FORCE)) {
         midna->onStateFlg1(daMidna_c::FLG1_SHADOW_MODEL_DRAW_DEMO_FORCE);
-        midnaForcedShadow = true;
+        midnaShadowForced = true;
     }
 }
 
 static void midna_follow_init() {
-    bool ok = pre_hook(MidnaExec, midna_exec_pre) && post_hook(MidnaNoDraw, midna_draw_post);
+    bool ok = pre_hook(MidnaExec, midna_exec_pre) && post_hook(MidnaExec, midna_exec_post) &&
+              post_hook(MidnaPos, midna_pos_post) && pre_hook(MidnaAnm, midna_anm_pre) &&
+              post_hook(MidnaNoDraw, midna_draw_post);
     if (!ok) mods::log::warn("L3 Midna Follow won't work");
 }
 
