@@ -31,6 +31,8 @@
 #include "d/actor/d_a_bg_obj.h"
 #include "d/actor/d_a_boomerang.h"
 #include "d/actor/d_a_horse.h"
+#include "d/actor/d_a_midna.h"
+#include "JSystem/JUtility/JUTGamePad.h"
 #include "d/actor/d_a_kytag08.h"
 #include "d/actor/d_a_nbomb.h"
 #include "d/actor/d_a_obj_iceleaf.h"
@@ -101,6 +103,7 @@ static const char* const shopNames[] = {"Off", "Semi-Default", "Partial-Default"
 static ConfigVarHandle shopOption;
 static ConfigVarHandle bridgeJump;
 static ConfigVarHandle vDialogueFix;  // Dialogue Correction
+static ConfigVarHandle vMidnaFollow;  // L3 Midna Follow
 
 // shop + ice leaf (0 if registering failed)
 static ConfigVarHandle vBoost, vAlways, vGoron, vChud, vLeaf;
@@ -3817,6 +3820,128 @@ static void check_button(ModContext*, void*) {
     check_for_updates();
 }
 
+// ======================== L3 Midna Follow ========================
+// Clicking the left stick in human form brings Midna out to float along beside Link; clicking it
+// again sends her back into his shadow. She uses the game's own "wait at a spot" mode, the one
+// that has her float ahead of wolf Link: we keep moving that spot to beside Link, and she flies to
+// it (her floating-move animation) once he's got far enough away, then hangs there in her float
+// idle. In the light world she shows as the shadow form she has there, the same as when you talk
+// to her.
+DEFINE_HOOK(&daMidna_c::execute, MidnaExec);
+DEFINE_HOOK(&daMidna_c::setMidnaNoDrawFlg, MidnaNoDraw);
+
+static bool midnaOut;           // she's been called out
+static bool midnaPlaced;        // she's in our wait spot right now (not back in the shadow)
+static bool midnaForcedShadow;  // we turned on her shadow-model draw, so we turn it off again
+static cXyz midnaSpot;          // where she's floating to / waiting at
+static u32 lastExtButtons;
+
+static const f32 kMidnaSide = 90.0f;       // to Link's left
+static const f32 kMidnaBack = 40.0f;       // and a little behind him
+static const f32 kMidnaHeight = 60.0f;     // floating off the ground
+static const f32 kMidnaSlack = 150.0f;     // how far Link gets before she catches up
+static const f32 kMidnaTooFar = 1500.0f;   // past this (a warp, a load) she just appears there
+
+static bool l3_pressed() {
+    u32 now = JUTGamePad::mPadStatus[PAD_1].extButton;
+    bool pressed = (now & PAD_BUTTON_LEFT_STICK) && !(lastExtButtons & PAD_BUTTON_LEFT_STICK);
+    lastExtButtons = now;
+    return pressed;
+}
+
+// the spot beside Link she likes to float at
+static cXyz midna_home(daAlink_c* lnk) {
+    f32 s = cM_ssin(lnk->shape_angle.y), c = cM_scos(lnk->shape_angle.y);
+    cXyz home = lnk->current.pos;
+    home.x += kMidnaSide * c - kMidnaBack * s;
+    home.z += -kMidnaSide * s - kMidnaBack * c;
+    home.y += kMidnaHeight;
+    return home;
+}
+
+// she only comes out for human Link, outside cutscenes, once she's met him
+static bool midna_can_be_out(daAlink_c* lnk) {
+    return cfgOn(vMidnaFollow, true) && !lnk->checkWolf() && daPy_py_c::checkFirstMidnaDemo() &&
+           !dComIfGp_event_runCheck() && !lnk->checkMetamorphose();
+}
+
+static void midna_go_back(daMidna_c* midna) {
+    if (!midna) return;
+    midna->offTagWaitPos();
+    midna->offStateFlg0((daMidna_c::daMidna_FLG0)(daMidna_c::FLG0_WOLF_NO_POS | daMidna_c::FLG0_UNK_200 |
+                                       daMidna_c::FLG0_UNK_100));
+    if (midnaForcedShadow) midna->offStateFlg1(daMidna_c::FLG1_SHADOW_MODEL_DRAW_DEMO_FORCE);
+    midnaForcedShadow = false;
+    midnaPlaced = false;
+}
+
+static void midna_follow_tick() {
+    auto* lnk = (daAlink_c*)dComIfGp_getPlayer(0);
+    bool pressed = l3_pressed();
+    if (!lnk) return;
+    if (pressed && (midnaOut || midna_can_be_out(lnk))) {
+        midnaOut = !midnaOut;
+        if (!midnaOut) midna_go_back(daPy_py_c::getMidnaActor());
+        else midnaSpot = midna_home(lnk);
+    }
+    // turning into the wolf or switching the setting off sends her back for good
+    if (midnaOut && (lnk->checkWolf() || !cfgOn(vMidnaFollow, true))) {
+        midnaOut = false;
+        midna_go_back(daPy_py_c::getMidnaActor());
+    }
+}
+
+// a cutscene or talking to someone takes her back into the shadow for the moment; she comes
+// back out after it
+static bool midna_floating(daMidna_c* midna) {
+    auto* lnk = (daAlink_c*)dComIfGp_getPlayer(0);
+    return midnaOut && lnk && midna_can_be_out(lnk) && midna->mDemoMode == 0;
+}
+
+static HookAction midna_exec_pre(ModContext*, void* args, void*, void*) {
+    auto* midna = mods::arg<daMidna_c*>(args, 0);
+    if (!midna_floating(midna)) {
+        if (midnaPlaced) midna_go_back(midna);
+        return HOOK_CONTINUE;
+    }
+
+    auto* lnk = (daAlink_c*)dComIfGp_getPlayer(0);
+    cXyz home = midna_home(lnk);
+    f32 behind = midna->current.pos.abs(home);
+    if (behind > kMidnaTooFar) {
+        midnaSpot = home;
+        midna->onTagWaitPosWarp(&midnaSpot);  // appear right there
+        midnaPlaced = true;
+        return HOOK_CONTINUE;
+    }
+    // she only sets off once Link has pulled away, so she trails him instead of sticking to him
+    if (!midnaPlaced || midnaSpot.abs(home) > kMidnaSlack) {
+        midnaSpot = home;
+        midna->offStateFlg0(daMidna_c::FLG0_UNK_200);  // not "arrived" any more: fly
+    }
+    midna->onTagWaitPos(&midnaSpot);
+    midnaPlaced = true;
+    return HOOK_CONTINUE;
+}
+
+// in human form the game hides her unless she's talking; keep her drawn while she's out
+static void midna_draw_post(ModContext*, void* args, void*, void*) {
+    auto* midna = mods::arg<daMidna_c*>(args, 0);
+    if (!midna_floating(midna)) return;
+    bool realBody = (dKy_darkworld_check() || dComIfGs_isTransformLV(3)) && midna->mpModel != nullptr;
+    if (realBody) {
+        midna->offStateFlg0((daMidna_c::daMidna_FLG0)(daMidna_c::FLG0_NO_DRAW | daMidna_c::FLG0_UNK_10000));
+    } else if (!midna->checkStateFlg1(daMidna_c::FLG1_SHADOW_MODEL_DRAW_DEMO_FORCE)) {
+        midna->onStateFlg1(daMidna_c::FLG1_SHADOW_MODEL_DRAW_DEMO_FORCE);
+        midnaForcedShadow = true;
+    }
+}
+
+static void midna_follow_init() {
+    bool ok = pre_hook(MidnaExec, midna_exec_pre) && post_hook(MidnaNoDraw, midna_draw_post);
+    if (!ok) mods::log::warn("L3 Midna Follow won't work");
+}
+
 // ======================== Dialogue Correction ========================
 // A few lines of the English text say something the original never did. Each one is swapped for
 // the corrected line from ahrbro's translation fix, by its message group (the area's text file)
@@ -3919,6 +4044,9 @@ static void quality_rows() {
     heading("Shop Changes");
     toggle("Goron Outpost Changes", vGoron);
     toggle("Chudleys/Malomart Changes", vChud);
+
+    heading("Midna");
+    toggle("L3 Midna Follow", vMidnaFollow);
 }
 
 static const char* const damageNames[] = {"x0.5 Wooden Sword", "x1 Ordon Sword", "x2 Master Sword", "x4 Light Sword"};
@@ -4241,6 +4369,10 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     add_bool_option("dialogueCorrection", true, &vDialogueFix);
     dialogue_tick();
 
+    // --- Midna: L3 Midna Follow ---
+    add_bool_option("midnaFollow", true, &vMidnaFollow);
+    midna_follow_init();
+
     // --- update check ---
     add_bool_option("autoUpdateCheck", true, &vAutoCheck);
     if (cfgOn(vAutoCheck)) check_for_updates();
@@ -4257,6 +4389,7 @@ MOD_EXPORT ModResult mod_update(ModError*) {
     galebomb_tick();
     fire_arrow_tick();
     dialogue_tick();
+    midna_follow_tick();
     return MOD_OK;
 }
 
