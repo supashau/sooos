@@ -2714,6 +2714,11 @@ struct BurningArrow {
     cXyz moved;  // how far the head went this frame; the flame's particles move with it
     bool spread;  // already set an enemy on fire; one arrow sets one fire
     bool hitReady;
+    // who the fire has brushed but not lit yet (see confirm_brushed), and who blocked the arrow
+    fpc_ProcID brushed[4];
+    u8 brushedFor[4];
+    fpc_ProcID blocked[4];
+    u8 blockedNext;
     LIGHT_INFLUENCE glow;
     bool glowing;
 };
@@ -2756,6 +2761,7 @@ static void put_out(BurningArrow& fire) {
     if (fire.glowing) dKy_plight_cut(&fire.glow);
     fire.glowing = false;
     fire.hitReady = false;
+    for (fpc_ProcID& who : fire.brushed) who = fpcM_ERROR_PROCESS_ID_e;
     fire.id = fpcM_ERROR_PROCESS_ID_e;
 }
 
@@ -2775,6 +2781,8 @@ static int light_arrow(daArrow_c* arrow, const cXyz& tip) {
     fire.lastTip = tip;
     fire.moved.set(0.0f, 0.0f, 0.0f);
     fire.spread = false;
+    for (int i = 0; i < 4; i++) fire.brushed[i] = fire.blocked[i] = fpcM_ERROR_PROCESS_ID_e;
+    fire.blockedNext = 0;
     fire.hitOwner.Init(0xFF, 0xFF, arrow);
     fire.hit.Set(kArrowFireSrc);
     fire.hit.SetStts(&fire.hitOwner);
@@ -2819,10 +2827,12 @@ static const int kMaxBurning = 8;
 
 // The scorch hits as a sword would, with fire as its material. A lot of enemies (Bulblins among
 // them) ignore the lantern's own kind of hit entirely, but every enemy takes a sword hit.
+// The burn is already on them, so it gets past a raised shield (a Darknut's, a Lizalfos's, another
+// player's): the hit is the "can't be guarded" kind.
 static const dCcD_SrcCps kScorchSrc = {
     {
         {0x0, {{AT_TYPE_NORMAL_SWORD, 0x2, 0x1B}, {0x0, 0x0}, 0x0}},
-        {dCcD_SE_NONE, 0x0, 0x0, dCcD_MTRL_FIRE, 0x0},
+        {dCcD_SE_NONE, 0x0, dCcG_At_Spl_UNK_C, dCcD_MTRL_FIRE, 0x0},
         {dCcD_SE_NONE, 0x0, 0x0, 0x0, 0x0},
         {0x0},
     },
@@ -2837,7 +2847,7 @@ static const dCcD_SrcCps kScorchSrc = {
 static const dCcD_SrcCps kPlayerFireSrc = {
     {
         {0x0, {{AT_TYPE_LANTERN_SWING, 0x2, 0x1B}, {0x0, 0x0}, 0x0}},
-        {dCcD_SE_NONE, 0x0, 0x0, dCcD_MTRL_FIRE, 0x0},
+        {dCcD_SE_NONE, 0x0, dCcG_At_Spl_UNK_C, dCcD_MTRL_FIRE, 0x0},
         {dCcD_SE_NONE, 0x0, 0x0, 0x0, 0x0},
         {0x0},
     },
@@ -2979,7 +2989,26 @@ struct FireNearby {
     cXyz at;
     f32 reach;
     bool lit;
+    BurningArrow* arrow;  // an arrow's fire only notes who it brushed (see confirm_brushed)
 };
+
+static bool blocked_arrow(const BurningArrow& fire, fpc_ProcID id) {
+    for (fpc_ProcID who : fire.blocked)
+        if (who == id) return true;
+    return false;
+}
+
+static void note_brushed(BurningArrow& fire, fpc_ProcID id) {
+    if (blocked_arrow(fire, id)) return;
+    int free = -1;
+    for (int i = 0; i < 4; i++) {
+        if (fire.brushed[i] == id) return;
+        if (free < 0 && fire.brushed[i] == fpcM_ERROR_PROCESS_ID_e) free = i;
+    }
+    if (free < 0) return;
+    fire.brushed[free] = id;
+    fire.brushedFor[free] = 0;
+}
 
 // called for every actor in the scene; never stops the search early
 static void* catch_fire_nearby(void* actor, void* data) {
@@ -2987,14 +3016,49 @@ static void* catch_fire_nearby(void* actor, void* data) {
     auto* fire = static_cast<FireNearby*>(data);
     if (fopAcM_GetGroup(ac) != fopAc_ENEMY_e) return nullptr;
     if (distance_to_body(fire->at, ac) > fire->reach) return nullptr;
-    if (set_on_fire(ac)) fire->lit = true;
+    if (fire->arrow) note_brushed(*fire->arrow, fopAcM_GetID(ac));
+    else if (set_on_fire(ac)) fire->lit = true;
     return nullptr;
 }
 
-static bool set_fire_around(const cXyz& at, f32 reach) {
-    FireNearby fire = {at, reach, false};
+static bool set_fire_around(const cXyz& at, f32 reach, BurningArrow* arrow = nullptr) {
+    FireNearby fire = {at, reach, false, arrow};
     fopAcIt_Judge(catch_fire_nearby, &fire);
     return fire.lit;
+}
+
+// A burning arrow lights whoever its fire brushes, unless they catch the arrow on a shield (a
+// Darknut, a Lizalfos, another player guarding): the game only reports the block a frame or two
+// after the fire has got there, so a brushed target waits that long before it catches fire, and a
+// block in that time (or any time later, for this arrow) means it doesn't.
+static const u8 kBlockWait = 3;  // frames
+
+static void confirm_brushed(BurningArrow& fire, daArrow_c* arrow) {
+    dCcD_Cps& shot = arrow->field_0x688;
+    if (shot.ChkAtHit()) {
+        if (fopAc_ac_c* hit = shot.GetAtHitAc()) {
+            fpc_ProcID id = fopAcM_GetID(hit);
+            if (shot.ChkAtShieldHit()) {
+                if (!blocked_arrow(fire, id)) {
+                    fire.blocked[fire.blockedNext] = id;
+                    fire.blockedNext = (fire.blockedNext + 1) % 4;
+                }
+            } else if (!blocked_arrow(fire, id)) {
+                set_on_fire(hit);  // a clean hit: no need to wait
+            }
+            for (fpc_ProcID& who : fire.brushed)
+                if (who == id) who = fpcM_ERROR_PROCESS_ID_e;
+        }
+    }
+    for (int i = 0; i < 4; i++) {
+        if (fire.brushed[i] == fpcM_ERROR_PROCESS_ID_e) continue;
+        if (blocked_arrow(fire, fire.brushed[i])) {
+            fire.brushed[i] = fpcM_ERROR_PROCESS_ID_e;
+        } else if (++fire.brushedFor[i] >= kBlockWait) {
+            set_on_fire(fopAcM_SearchByID(fire.brushed[i]));
+            fire.brushed[i] = fpcM_ERROR_PROCESS_ID_e;
+        }
+    }
 }
 
 // Deal Burn with Lantern: the swing's fire is live only for part of the swing, with oil
@@ -3076,15 +3140,16 @@ static void arrow_post(ModContext*, void* args, void*, void*) {
     if (flying) {
         for (int step = 0; step <= 4; step++) {
             cXyz along = f.lastTip + (ahead - f.lastTip) * (step / 4.0f);
-            set_fire_around(along, kFireReach + 20.0f);
+            set_fire_around(along, kFireReach + 20.0f, &f);
         }
     }
-    // Whatever the arrow itself hits burns too (another player, say, that the fire somehow missed).
-    if (!nocked && arrow->field_0x688.ChkAtHit()) set_on_fire(arrow->field_0x688.GetAtHitAc());
+    // Whatever the arrow itself hits burns too (another player, say, that the fire somehow missed),
+    // unless it was a shield it hit; the fire's brushes get lit once no block has come in.
+    if (!nocked) confirm_brushed(f, arrow);
     // Stuck in an enemy: that enemy burns, once. (A shield block doesn't count.)
     if (!nocked && !flying && !f.spread) {
         u32 stuckIn = arrow->getHitAcID();
-        if (stuckIn != 0xFFFFFFFFu && arrow->field_0x93e == 0)
+        if (stuckIn != 0xFFFFFFFFu && arrow->field_0x93e == 0 && !blocked_arrow(f, stuckIn))
             f.spread = set_on_fire(fopAcM_SearchByID(stuckIn));
     }
 
@@ -3131,10 +3196,15 @@ static void fire_arrow_tick() {
         fireButtonWas = button;
     }
 
-    // arrows that are gone take their light with them
+    // arrows that are gone take their light with them; anyone their fire brushed that didn't
+    // block it still catches fire
     for (int i = 0; i < kArrowMemory; i++) {
-        if (burning[i].id == fpcM_ERROR_PROCESS_ID_e || burning[i].id == 0) continue;
-        if (fopAcM_SearchByID(burning[i].id) == nullptr) put_out(burning[i]);
+        BurningArrow& fire = burning[i];
+        if (fire.id == fpcM_ERROR_PROCESS_ID_e || fire.id == 0) continue;
+        if (fopAcM_SearchByID(fire.id) != nullptr) continue;
+        for (fpc_ProcID who : fire.brushed)
+            if (who != fpcM_ERROR_PROCESS_ID_e && !blocked_arrow(fire, who)) set_on_fire(fopAcM_SearchByID(who));
+        put_out(fire);
     }
 }
 
@@ -3844,7 +3914,7 @@ enum MidnaPhase { MIDNA_HIDDEN, MIDNA_RISING, MIDNA_FOLLOWING, MIDNA_LEAVING, MI
 static MidnaPhase midnaPhase = MIDNA_HIDDEN;
 static bool midnaWanted;     // L3 has called her out (she may still be away for a cutscene)
 static bool midnaMoving;     // flying to catch up, rather than hanging in place
-static bool midnaShadowForced;  // we turned on her shadow-form drawing (only if her body didn't load)
+static bool midnaShadowForced;  // we turned on her shadow-form state (see midna_draw_post)
 static s16 midnaFacing;      // where she looks while hanging in place
 static cXyz midnaGoal;       // where she's flying to
 static cXyz midnaSpot;       // the spot we're steering her wait mode to this frame
@@ -3980,7 +4050,9 @@ static void midna_hide_now(daMidna_c* midna) {
         midna->offStateFlg0((daMidna_c::daMidna_FLG0)(daMidna_c::FLG0_WOLF_NO_POS | daMidna_c::FLG0_UNK_200 |
                                                       daMidna_c::FLG0_UNK_100));
         forget_body(midna);
+        if (midnaShadowForced) midna->offStateFlg1(daMidna_c::FLG1_SHADOW_MODEL_DRAW_DEMO_FORCE);
     }
+    midnaShadowForced = false;
     midnaPhase = MIDNA_HIDDEN;
     midnaMoving = false;
 }
@@ -4136,21 +4208,45 @@ static HookAction midna_anm_pre(ModContext*, void* args, void*, void*) {
     return HOOK_SKIP_ORIGINAL;
 }
 
-// in human form the game keeps her hidden; while she's out she's drawn (her real body, or her
-// shadow form if the body couldn't be loaded)
+// In human form the game keeps her hidden; while she's out she's drawn in her real body (or her
+// shadow form if the body couldn't be loaded).
+//
+// Between frames, though, she's left in the state the game itself uses for Midna showing beside
+// human Link: her shadow form. Anything outside her own drawing that looks at her (another mod
+// mirroring her to other players, say) sees that, and only her drawing (and Link's ground shadow,
+// which the game skips while that state is on) sees her real body.
+DEFINE_HOOK(&daMidna_c::draw, MidnaDraw);
+DEFINE_HOOK(&daAlink_c::shadowDraw, LinkShadowDraw);
+
+static bool midnaShowsReal;  // her real body is what's actually drawn
+
 static void midna_draw_post(ModContext*, void* args, void*, void*) {
     auto* midna = mods::arg<daMidna_c*>(args, 0);
     if (midnaPhase == MIDNA_HIDDEN) {
         if (midnaShadowForced) midna->offStateFlg1(daMidna_c::FLG1_SHADOW_MODEL_DRAW_DEMO_FORCE);
         midnaShadowForced = false;
+        midnaShowsReal = false;
         return;
     }
-    if (midna->mpModel) {
+    midnaShowsReal = midna->mpModel != nullptr;
+    if (midnaShowsReal)
         midna->offStateFlg0((daMidna_c::daMidna_FLG0)(daMidna_c::FLG0_NO_DRAW | daMidna_c::FLG0_UNK_10000));
-    } else if (!midna->checkStateFlg1(daMidna_c::FLG1_SHADOW_MODEL_DRAW_DEMO_FORCE)) {
+    if (!midna->checkStateFlg1(daMidna_c::FLG1_SHADOW_MODEL_DRAW_DEMO_FORCE)) {
         midna->onStateFlg1(daMidna_c::FLG1_SHADOW_MODEL_DRAW_DEMO_FORCE);
         midnaShadowForced = true;
     }
+}
+
+// lift the shadow-form state just while she (or Link's shadow) is being drawn
+static HookAction real_body_for_drawing(ModContext*, void*, void*, void*) {
+    daMidna_c* midna = daPy_py_c::getMidnaActor();
+    if (midna && midnaShadowForced && midnaShowsReal) midna->offStateFlg1(daMidna_c::FLG1_SHADOW_MODEL_DRAW_DEMO_FORCE);
+    return HOOK_CONTINUE;
+}
+
+static void shadow_form_after_drawing(ModContext*, void*, void*, void*) {
+    daMidna_c* midna = daPy_py_c::getMidnaActor();
+    if (midna && midnaShadowForced && midnaShowsReal) midna->onStateFlg1(daMidna_c::FLG1_SHADOW_MODEL_DRAW_DEMO_FORCE);
 }
 
 // --- her flying trail, in every area ---
@@ -4281,22 +4377,29 @@ static void trail_wanted() {
     trailState = remembered >= 0 ? TRAIL_LOADING : TRAIL_SEARCHING;
 }
 
-// Midna asks for a trail particle the area doesn't have: hand the game ours for that one call,
-// then point the new sparkle at our set so it keeps drawing from it
-using ParticleSetFn = JPABaseEmitter* (dPa_control_c::*)(u8, u16, cXyz const*, dKy_tevstr_c const*,
+// Midna asks for her trail every frame she flies. The game looks the particle up in this area's
+// set before anything else, and an area with no particle set of its own at all (some have none)
+// isn't checked for: that's a crash. So while the area can't supply it, the call gets our set in
+// that slot for its whole length (and the new sparkle is pointed at our slot so it keeps drawing
+// from it), or, before ours has loaded, it's simply skipped.
+using KeyedParticleSetFn = u32 (dPa_control_c::*)(u32, u8, u16, cXyz const*, dKy_tevstr_c const*,
     csXyz const*, cXyz const*, u8, dPa_levelEcallBack*, s8, GXColor const*, GXColor const*, cXyz const*, f32);
-static constexpr ParticleSetFn kParticleSet = &dPa_control_c::set;
-DEFINE_HOOK(kParticleSet, ParticleSet);
+static constexpr KeyedParticleSetFn kKeyedParticleSet = &dPa_control_c::set;
+DEFINE_HOOK(kKeyedParticleSet, KeyedParticleSet);
 
 static JPAResourceManager* areaParticles;
 static bool lendingTrail;
 
-static HookAction particle_set_pre(ModContext*, void* args, void*, void*) {
-    u16 id = mods::arg<u16>(args, 2);
-    if (trailState != TRAIL_READY || (id != kTrailParticles[0] && id != kTrailParticles[1])) return HOOK_CONTINUE;
+static HookAction particle_set_pre(ModContext*, void* args, void* retval, void*) {
+    u16 id = mods::arg<u16>(args, 3);
+    if (id != kTrailParticles[0] && id != kTrailParticles[1]) return HOOK_CONTINUE;
     JPAEmitterManager* emitters = dPa_control_c::getEmitterManager();
-    JPAResourceManager* area = emitters->pResMgrAry[1];
+    JPAResourceManager* area = emitters ? emitters->pResMgrAry[1] : nullptr;
     if (area && area->checkUserIndexDuplication(id)) return HOOK_CONTINUE;  // the area has its own
+    if (trailState != TRAIL_READY) {
+        if (retval) *static_cast<u32*>(retval) = 0;  // no trail here (yet)
+        return HOOK_SKIP_ORIGINAL;
+    }
     areaParticles = area;
     emitters->pResMgrAry[1] = trailParticles;
     lendingTrail = true;
@@ -4307,16 +4410,19 @@ static void particle_set_post(ModContext*, void*, void* retval, void*) {
     if (!lendingTrail) return;
     dPa_control_c::getEmitterManager()->pResMgrAry[1] = areaParticles;
     lendingTrail = false;
-    JPABaseEmitter* sparkle = retval ? *static_cast<JPABaseEmitter**>(retval) : nullptr;
-    if (sparkle) sparkle->mResMgrID = kTrailManagerSlot;
+    u32 key = retval ? *static_cast<u32*>(retval) : 0;
+    if (JPABaseEmitter* sparkle = key ? dComIfGp_particle_getEmitter(key) : nullptr)
+        sparkle->mResMgrID = kTrailManagerSlot;
 }
 
 static void midna_follow_init() {
     bool ok = pre_hook(MidnaExec, midna_exec_pre) && post_hook(MidnaExec, midna_exec_post) &&
               post_hook(MidnaPos, midna_pos_post) && pre_hook(MidnaAnm, midna_anm_pre) &&
-              post_hook(MidnaNoDraw, midna_draw_post);
+              post_hook(MidnaNoDraw, midna_draw_post) &&
+              pre_hook(MidnaDraw, real_body_for_drawing) && post_hook(MidnaDraw, shadow_form_after_drawing) &&
+              pre_hook(LinkShadowDraw, real_body_for_drawing) && post_hook(LinkShadowDraw, shadow_form_after_drawing);
     if (!ok) mods::log::warn("L3 Midna Follow won't work");
-    bool trailOk = pre_hook(ParticleSet, particle_set_pre) && post_hook(ParticleSet, particle_set_post);
+    bool trailOk = pre_hook(KeyedParticleSet, particle_set_pre) && post_hook(KeyedParticleSet, particle_set_post);
     if (!trailOk) mods::log::warn("Midna's flying trail stays as each area has it");
 }
 
