@@ -34,6 +34,11 @@
 #include "d/actor/d_a_midna.h"
 #include "JSystem/JUtility/JUTGamePad.h"
 #include "JSystem/JKernel/JKRExpHeap.h"
+#include "JSystem/JParticle/JPAEmitterManager.h"
+#include "JSystem/JParticle/JPAResourceManager.h"
+#include "d/d_particle.h"
+#include "m_Do/m_Do_dvd_thread.h"
+#include "m_Do/m_Do_graphic.h"
 #include "d/actor/d_a_kytag08.h"
 #include "d/actor/d_a_nbomb.h"
 #include "d/actor/d_a_obj_iceleaf.h"
@@ -105,6 +110,7 @@ static ConfigVarHandle shopOption;
 static ConfigVarHandle bridgeJump;
 static ConfigVarHandle vDialogueFix;  // Dialogue Correction
 static ConfigVarHandle vMidnaFollow;  // L3 Midna Follow
+static ConfigVarHandle vMidnaTrailFile;  // which area particle file has her flying trail (found once)
 
 // shop + ice leaf (0 if registering failed)
 static ConfigVarHandle vBoost, vAlways, vGoron, vChud, vLeaf;
@@ -3840,8 +3846,10 @@ static bool midnaWanted;     // L3 has called her out (she may still be away for
 static bool midnaMoving;     // flying to catch up, rather than hanging in place
 static bool midnaShadowForced;  // we turned on her shadow-form drawing (only if her body didn't load)
 static s16 midnaFacing;      // where she looks while hanging in place
+static cXyz midnaGoal;       // where she's flying to
 static cXyz midnaSpot;       // the spot we're steering her wait mode to this frame
 static u32 lastExtButtons;
+static void trail_wanted();  // her flying trail, further down
 
 static const f32 kMidnaSide = 90.0f;      // to Link's left
 static const f32 kMidnaBack = 40.0f;      // and a little behind him
@@ -3987,6 +3995,7 @@ static void midna_follow_tick() {
         } else if (midna_allowed(lnk)) {
             midnaWanted = true;
             load_midna_body();
+            trail_wanted();
         }
     }
     // turning into the wolf or switching the setting off ends it for good
@@ -3998,6 +4007,7 @@ static void midna_follow_tick() {
 
 // steps the spot from where she is toward where she's going, at Link's pace
 static void midna_step_toward(daMidna_c* midna, daAlink_c* lnk, const cXyz& goal) {
+    midnaGoal = goal;
     f32 linkPace = (lnk->current.pos - lnk->old.pos).absXZ();
     f32 pace = linkPace > kMidnaMinSpeed ? linkPace : kMidnaMinSpeed;
     cXyz to = goal - midna->current.pos;
@@ -4016,13 +4026,21 @@ static HookAction midna_exec_pre(ModContext*, void* args, void*, void*) {
     }
     if (midnaPhase == MIDNA_HIDDEN) {
         if (!midnaWanted) return HOOK_CONTINUE;
-        // rise up out of Link's shadow
+        // rise up out of Link's shadow, from the same spot at his feet she dives back into
         midnaSpot = lnk->current.pos;
+        midna->current.pos = midna->old.pos = midnaSpot;
+        midna->shape_angle.y = midna->current.angle.y = midnaFacing = lnk->shape_angle.y;
         midna->onTagWaitPosWarp(&midnaSpot);
-        midna->offStateFlg0(daMidna_c::FLG0_UNK_200);
+        midna->onTagNoHairLead();
         midna->mSound.startCreatureSound(Z2SE_MIDNA_APPEAR, 0, -1);
         midnaPhase = MIDNA_RISING;
         midnaMoving = true;
+        midnaGoal = midna_home(lnk);
+        if (ourBody.body) {
+            if (midna->mpModel != ourBody.body) midna->mpModel = nullptr;
+            lend_body(lnk);
+        }
+        return HOOK_CONTINUE;
     } else if (!midnaWanted && midnaPhase != MIDNA_LEAVING && midnaPhase != MIDNA_DIVING) {
         midnaPhase = MIDNA_LEAVING;
         midnaMoving = true;
@@ -4069,6 +4087,8 @@ static HookAction midna_exec_pre(ModContext*, void* args, void*, void*) {
         break;
     }
     midna->onTagWaitPos(&midnaSpot);
+    // no beckoning with her hair-hand ("this way!"): she's just keeping Link company
+    midna->onTagNoHairLead();
     return HOOK_CONTINUE;
 }
 
@@ -4081,14 +4101,16 @@ static void midna_exec_post(ModContext*, void*, void*, void*) {
 static void midna_pos_post(ModContext*, void* args, void*, void*) {
     auto* midna = mods::arg<daMidna_c*>(args, 0);
     if (midnaPhase == MIDNA_HIDDEN || midnaPhase == MIDNA_DIVING) return;
-    if (midnaMoving) {
-        midna->offStateFlg0(daMidna_c::FLG0_UNK_200);
-        midnaFacing = midna->shape_angle.y;  // the game turns her the way she's flying
-        return;
-    }
     auto* lnk = (daAlink_c*)dComIfGp_getPlayer(0);
     if (!lnk) return;
-    cLib_addCalcAngleS(&midnaFacing, lnk->shape_angle.y, 4, 0x1000, 0x100);
+    s16 want = lnk->shape_angle.y;  // hanging in place: look where Link looks
+    if (midnaMoving) {
+        midna->offStateFlg0(daMidna_c::FLG0_UNK_200);
+        // flying: turn toward where she's headed (straight up or down keeps her facing as is)
+        cXyz to = midnaGoal - midna->current.pos;
+        want = to.absXZ() > 10.0f ? cM_atan2s(to.x, to.z) : midnaFacing;
+    }
+    cLib_addCalcAngleS(&midnaFacing, want, 4, 0x1000, 0x100);
     midna->shape_angle.y = midnaFacing;
     midna->current.angle.y = midnaFacing;
 }
@@ -4131,11 +4153,171 @@ static void midna_draw_post(ModContext*, void* args, void*, void*) {
     }
 }
 
+// --- her flying trail, in every area ---
+// The sparkle trail behind her as she flies (particles 0x8397 and 0x8398) lives in the per-area
+// particle files, and only some areas' files have it. The first time it's needed the mod looks
+// through the game's area particle files for one that does (and remembers which), keeps its own
+// copy of it loaded, and lends it to her trail in areas that don't have their own.
+static const u16 kTrailParticles[] = {0x8397, 0x8398};
+static const u8 kTrailManagerSlot = 2;  // after the game's own two (always-loaded, this area)
+
+enum TrailState { TRAIL_IDLE, TRAIL_SEARCHING, TRAIL_LOADING, TRAIL_READY, TRAIL_UNAVAILABLE };
+static TrailState trailState = TRAIL_IDLE;
+static int trailFileNo;
+static mDoDvdThd_toMainRam_c* trailRead;
+static JKRHeap* trailSearchHeap;
+static JKRHeap* trailHeap;
+static JPAResourceManager* trailParticles;
+
+static u16 be16(const u8* p) { return u16(p[0] << 8 | p[1]); }
+static u32 be32(const u8* p) { return u32(p[0]) << 24 | u32(p[1]) << 16 | u32(p[2]) << 8 | p[3]; }
+
+// does this particle file (JPAC) have both trail particles?
+static bool has_trail(const void* file, u32 size) {
+    auto* data = static_cast<const u8*>(file);
+    if (!data || size < 0x10 || std::memcmp(data, "JPAC", 4) != 0) return false;
+    int found = 0;
+    u32 at = 0x10;
+    for (int i = 0, count = be16(data + 8); i < count && at + 8 <= size; i++) {
+        u16 index = be16(data + at);
+        int blocks = be16(data + at + 2);
+        if (index == kTrailParticles[0] || index == kTrailParticles[1]) found++;
+        at += 8;
+        for (int b = 0; b < blocks && at + 8 <= size; b++) at += be32(data + at + 4);
+    }
+    return found >= 2;
+}
+
+static void trail_file_name(char* out, size_t size, int no) {
+    std::snprintf(out, size, "/res/Particle/Pscene%03d.jpc", no);
+}
+
+static JKRHeap* trail_make_heap(u32 size) {
+    JKRHeap* parents[] = {JKRHeap::sRootHeap, mDoExt_getArchiveHeap(), mDoExt_getGameHeap()};
+    for (JKRHeap* parent : parents) {
+        if (JKRHeap* heap = parent ? JKRExpHeap::create(size, parent, false) : nullptr) return heap;
+    }
+    return nullptr;
+}
+
+static void trail_give_up(const char* why) {
+    mods::log::warn("Midna's flying trail stays as the area has it: {}", why);
+    trailState = TRAIL_UNAVAILABLE;
+}
+
+// one file read at a time, spread over frames so the game never waits on it
+static void trail_tick() {
+    if (trailState == TRAIL_IDLE || trailState == TRAIL_READY || trailState == TRAIL_UNAVAILABLE) return;
+    char name[40];
+
+    if (trailState == TRAIL_SEARCHING) {
+        if (!trailSearchHeap && !(trailSearchHeap = trail_make_heap(0x400000))) return trail_give_up("no memory to look");
+        if (!trailRead) {
+            if (trailFileNo > 255) return trail_give_up("no area particle file has it");
+            trail_file_name(name, sizeof(name), trailFileNo);
+            trailRead = mDoDvdThd_toMainRam_c::create(name, 0, trailSearchHeap);
+            if (!trailRead) trailFileNo++;  // no file with that number
+            return;
+        }
+        if (!trailRead->sync()) return;
+        void* data = trailRead->getMemAddress();
+        bool found = data && has_trail(data, trailSearchHeap->getSize(data));
+        trailRead->destroy();
+        trailRead = nullptr;
+        trailSearchHeap->freeAll();
+        if (!found) {
+            trailFileNo++;
+            return;
+        }
+        trailSearchHeap->destroy();
+        trailSearchHeap = nullptr;
+        if (vMidnaTrailFile) svc_config->set_int(mod_ctx, vMidnaTrailFile, trailFileNo);
+        trailState = TRAIL_LOADING;
+        return;
+    }
+
+    // TRAIL_LOADING: our own lasting copy of that file, made into particles the game can use
+    if (!trailHeap && !(trailHeap = trail_make_heap(0x400000))) return trail_give_up("no memory to keep it");
+    if (!trailRead) {
+        trail_file_name(name, sizeof(name), trailFileNo);
+        if (!(trailRead = mDoDvdThd_toMainRam_c::create(name, 0, trailHeap))) {
+            trailFileNo = 0;  // the remembered file is gone; look again
+            trailState = TRAIL_SEARCHING;
+        }
+        return;
+    }
+    if (!trailRead->sync()) return;
+    void* data = trailRead->getMemAddress();
+    trailRead->destroy();
+    trailRead = nullptr;
+    if (!data || !has_trail(data, trailHeap->getSize(data))) {
+        trailFileNo = 0;
+        trailState = TRAIL_SEARCHING;
+        return;
+    }
+
+    JPAEmitterManager* emitters = dPa_control_c::getEmitterManager();
+    void* place = trailHeap->alloc(sizeof(JPAResourceManager), 4);
+    if (!emitters || !place) return trail_give_up("couldn't set it up");
+    trailParticles = new (place) JPAResourceManager(data, trailHeap);
+    trailParticles->swapTexture(mDoGph_gInf_c::getFrameBufferTimg(), "dummy");
+
+    // the game only made room for two particle sets; give it a third slot for ours
+    if (emitters->ridMax <= kTrailManagerSlot) {
+        auto** slots = (JPAResourceManager**)trailHeap->alloc(sizeof(JPAResourceManager*) * (kTrailManagerSlot + 1), 4);
+        if (!slots) return trail_give_up("couldn't set it up");
+        for (int i = 0; i <= kTrailManagerSlot; i++) slots[i] = i < emitters->ridMax ? emitters->pResMgrAry[i] : nullptr;
+        emitters->pResMgrAry = slots;
+        emitters->ridMax = kTrailManagerSlot + 1;
+    }
+    emitters->pResMgrAry[kTrailManagerSlot] = trailParticles;
+    trailState = TRAIL_READY;
+}
+
+static void trail_wanted() {
+    if (trailState != TRAIL_IDLE) return;
+    int remembered = vMidnaTrailFile ? cfgInt(vMidnaTrailFile, -1) : -1;
+    trailFileNo = remembered >= 0 ? remembered : 0;
+    trailState = remembered >= 0 ? TRAIL_LOADING : TRAIL_SEARCHING;
+}
+
+// Midna asks for a trail particle the area doesn't have: hand the game ours for that one call,
+// then point the new sparkle at our set so it keeps drawing from it
+using ParticleSetFn = JPABaseEmitter* (dPa_control_c::*)(u8, u16, cXyz const*, dKy_tevstr_c const*,
+    csXyz const*, cXyz const*, u8, dPa_levelEcallBack*, s8, GXColor const*, GXColor const*, cXyz const*, f32);
+static constexpr ParticleSetFn kParticleSet = &dPa_control_c::set;
+DEFINE_HOOK(kParticleSet, ParticleSet);
+
+static JPAResourceManager* areaParticles;
+static bool lendingTrail;
+
+static HookAction particle_set_pre(ModContext*, void* args, void*, void*) {
+    u16 id = mods::arg<u16>(args, 2);
+    if (trailState != TRAIL_READY || (id != kTrailParticles[0] && id != kTrailParticles[1])) return HOOK_CONTINUE;
+    JPAEmitterManager* emitters = dPa_control_c::getEmitterManager();
+    JPAResourceManager* area = emitters->pResMgrAry[1];
+    if (area && area->checkUserIndexDuplication(id)) return HOOK_CONTINUE;  // the area has its own
+    areaParticles = area;
+    emitters->pResMgrAry[1] = trailParticles;
+    lendingTrail = true;
+    return HOOK_CONTINUE;
+}
+
+static void particle_set_post(ModContext*, void*, void* retval, void*) {
+    if (!lendingTrail) return;
+    dPa_control_c::getEmitterManager()->pResMgrAry[1] = areaParticles;
+    lendingTrail = false;
+    JPABaseEmitter* sparkle = retval ? *static_cast<JPABaseEmitter**>(retval) : nullptr;
+    if (sparkle) sparkle->mResMgrID = kTrailManagerSlot;
+}
+
 static void midna_follow_init() {
     bool ok = pre_hook(MidnaExec, midna_exec_pre) && post_hook(MidnaExec, midna_exec_post) &&
               post_hook(MidnaPos, midna_pos_post) && pre_hook(MidnaAnm, midna_anm_pre) &&
               post_hook(MidnaNoDraw, midna_draw_post);
     if (!ok) mods::log::warn("L3 Midna Follow won't work");
+    bool trailOk = pre_hook(ParticleSet, particle_set_pre) && post_hook(ParticleSet, particle_set_post);
+    if (!trailOk) mods::log::warn("Midna's flying trail stays as each area has it");
 }
 
 // ======================== Dialogue Correction ========================
@@ -4567,6 +4749,7 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
 
     // --- Midna: L3 Midna Follow ---
     add_bool_option("midnaFollow", true, &vMidnaFollow);
+    if (!add_int_option("midnaTrailFile", -1, &vMidnaTrailFile)) vMidnaTrailFile = 0;
     midna_follow_init();
 
     // --- update check ---
@@ -4586,6 +4769,7 @@ MOD_EXPORT ModResult mod_update(ModError*) {
     fire_arrow_tick();
     dialogue_tick();
     midna_follow_tick();
+    trail_tick();
     return MOD_OK;
 }
 
