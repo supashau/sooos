@@ -3976,7 +3976,7 @@ DEFINE_HOOK(&daMidna_c::checkMidnaPosState, MidnaPos);
 DEFINE_HOOK(&daMidna_c::setAnm, MidnaAnm);
 DEFINE_HOOK(&daMidna_c::setMidnaNoDrawFlg, MidnaNoDraw);
 
-enum MidnaPhase { MIDNA_HIDDEN, MIDNA_RISING, MIDNA_FOLLOWING, MIDNA_TALKING, MIDNA_LEAVING, MIDNA_DIVING };
+enum MidnaPhase { MIDNA_HIDDEN, MIDNA_RISING, MIDNA_FOLLOWING, MIDNA_LEAVING, MIDNA_DIVING };
 static MidnaPhase midnaPhase = MIDNA_HIDDEN;
 static bool midnaWanted;     // L3 has called her out (she may still be away for a cutscene)
 static bool midnaMoving;     // flying to catch up, rather than hanging in place
@@ -3985,11 +3985,6 @@ static bool midnaShowsReal;     // her real body is what's actually drawn
 static s16 midnaFacing;      // where she looks while hanging in place
 static cXyz midnaGoal;       // where she's flying to
 static cXyz midnaSpot;       // the spot we're steering her wait mode to this frame
-static cXyz midnaTalkSpot;   // where she was when Link started talking to her
-static bool midnaTucking;    // picked to transform Link: she's on her way back into his shadow
-static int tuckFrames;       // how long she's been at it (she's never left hanging past a limit)
-static int sinceTalk = 1000; // frames since a talk with her ended
-static int talkStarting;     // frames a talk she was just called for has to get going
 static u32 lastExtButtons;
 static void trail_wanted();  // her flying trail, further down
 
@@ -4179,7 +4174,6 @@ static void midna_hide_now(daMidna_c* midna) {
     midnaShadowForced = false;
     midnaPhase = MIDNA_HIDDEN;
     midnaMoving = false;
-    midnaTucking = false;
 }
 
 static void hook_midna_trail(bool out);  // with her trail, further down
@@ -4237,41 +4231,7 @@ static HookAction midna_exec_pre(ModContext*, void* args, void*, void*) {
         if (ourBody.body || midnaBodyTried) free_midna_body();  // and a body that failed gets another try
     }
 
-    // Talking to her while she's out: she stays where she is, and she and Link face each other.
-    // When the talk is over she just carries on following.
-    bool talkingToHer = midnaPhase != MIDNA_HIDDEN && dComIfGp_event_runCheck() &&
-                        fopAcM_getTalkEventPartner(lnk) == midna;
-    if (talkingToHer && midnaPhase != MIDNA_TALKING && !midnaTucking) {
-        midnaPhase = MIDNA_TALKING;
-        midnaMoving = false;
-        midnaTalkSpot = midna->current.pos;
-    } else if (midnaPhase == MIDNA_TALKING && !talkingToHer) {
-        if (talkStarting > 0) {
-            talkStarting--;  // called, but the talk itself hasn't begun yet
-        } else {
-            midnaPhase = MIDNA_FOLLOWING;
-            sinceTalk = 0;
-        }
-    }
-    if (talkingToHer) talkStarting = 0;
-    if (sinceTalk < 1000) sinceTalk++;
-
-    // "Transform" picked from her talk: she zooms back to his feet and dives into his shadow
-    // while he changes, instead of just vanishing
-    bool fromTalk = midnaPhase == MIDNA_TALKING || sinceTalk < 30;
-    if (!midnaTucking && midnaPhase != MIDNA_HIDDEN && fromTalk && (lnk->checkMetamorphose() || midna->mDemoMode == 0xF)) {
-        midnaTucking = true;
-        tuckFrames = 0;
-        midnaWanted = false;
-        midnaPhase = MIDNA_LEAVING;
-        midnaMoving = true;
-    }
-    if (midnaTucking && ++tuckFrames > 120) {
-        midna_hide_now(midna);
-        return HOOK_CONTINUE;
-    }
-
-    if (!midnaTucking && midnaPhase != MIDNA_TALKING && (!midna_allowed(lnk) || midna->mDemoMode != 0)) {
+    if (!midna_allowed(lnk) || midna->mDemoMode != 0) {
         midna_hide_now(midna);  // she comes back up after the cutscene if she's still wanted
         return HOOK_CONTINUE;
     }
@@ -4293,7 +4253,7 @@ static HookAction midna_exec_pre(ModContext*, void* args, void*, void*) {
             lend_body(lnk);
         }
         return HOOK_CONTINUE;
-    } else if (!midnaWanted && midnaPhase != MIDNA_LEAVING && midnaPhase != MIDNA_DIVING && midnaPhase != MIDNA_TALKING) {
+    } else if (!midnaWanted && midnaPhase != MIDNA_LEAVING && midnaPhase != MIDNA_DIVING) {
         midnaPhase = MIDNA_LEAVING;
         midnaMoving = true;
     }
@@ -4326,9 +4286,6 @@ static HookAction midna_exec_pre(ModContext*, void* args, void*, void*) {
             midnaSpot = midna->current.pos;
         }
         break;
-    case MIDNA_TALKING:
-        midnaSpot = midnaTalkSpot;
-        break;
     case MIDNA_LEAVING: {
         // going back she zooms in, much faster than Link, so she never trails after him to get there
         cXyz feet = lnk->current.pos;
@@ -4359,9 +4316,6 @@ static void midna_exec_post(ModContext*, void* args, void*, void*) {
     auto* lnk = (daAlink_c*)dComIfGp_getPlayer(0);
     if (lnk) take_body_back(lnk);
     auto* me = mods::arg<daMidna_c*>(args, 0);
-    // In a talk with her she counts as riding with Link, the way she always is for a talk: her
-    // choices (warp, transform) and the game's talk camera for her both go by that.
-    if (lnk && midnaPhase == MIDNA_TALKING && !lnk->checkWolf()) lnk->onMidnaRide();
     // Once she's back in his shadow outside a cutscene, nothing of ours may leave her shadow form
     // showing (it would hang in the air where she'd ride a wolf).
     if (justHidden > 0) {
@@ -4371,87 +4325,7 @@ static void midna_exec_post(ModContext*, void* args, void*, void*) {
             me->offStateFlg1(daMidna_c::FLG1_SHADOW_MODEL_DRAW_DEMO_FORCE);
     }
     show_shadow_state_outside(me);
-    // She only accepts being talked to while she rides in Link's shadow (the game says so at the
-    // end of her update). Out beside him she's just as available.
-    bool out = midnaPhase == MIDNA_FOLLOWING || midnaPhase == MIDNA_RISING || midnaPhase == MIDNA_TALKING;
-    if (out) mods::arg<daMidna_c*>(args, 0)->eventInfo.onCondition(dEvtCnd_CANTALK_e);
 }
-
-// Link turns to face her for the talk
-static void link_faces_midna(ModContext*, void* args, void*, void*) {
-    if (midnaPhase != MIDNA_TALKING) return;
-    auto* lnk = mods::arg<daAlink_c*>(args, 0);
-    daMidna_c* midna = daPy_py_c::getMidnaActor();
-    if (!midna) return;
-    cXyz to = midna->current.pos - lnk->current.pos;
-    if (to.absXZ() < 1.0f) return;
-    s16 face = lnk->shape_angle.y;
-    cLib_addCalcAngleS(&face, cM_atan2s(to.x, to.z), 4, 0x1000, 0x100);
-    lnk->shape_angle.y = lnk->current.angle.y = face;
-}
-
-// The Midna button only works while she rides in his shadow; while she's out beside him it
-// calls her the same way, for just the check that asks.
-static bool rideLent;
-
-static HookAction call_her_while_out(ModContext*, void* args, void*, void*) {
-    auto* lnk = mods::arg<daAlink_c*>(args, 0);
-    bool out = midnaPhase == MIDNA_FOLLOWING || midnaPhase == MIDNA_RISING || midnaPhase == MIDNA_TALKING;
-    if (out && !lnk->checkWolf() && !lnk->checkMidnaRide()) {
-        lnk->onMidnaRide();
-        rideLent = true;
-    }
-    return HOOK_CONTINUE;
-}
-
-static void call_her_done(ModContext*, void* args, void*, void*) {
-    if (!rideLent) return;
-    rideLent = false;
-    mods::arg<daAlink_c*>(args, 0)->offMidnaRide();
-}
-
-// Where she shows up for a normal talk (out of his shadow, in front of him, or to his side if
-// there's a wall), the same spot the game works out for that. Going there for the talk means the
-// game's own talk camera frames the two of them just as it always does.
-static cXyz talk_spot(daAlink_c* lnk) {
-    s16 behind = lnk->shape_angle.y + 0x8000;
-    f32 s = cM_ssin(behind), c = cM_scos(behind);
-    cXyz from(lnk->current.pos.x, lnk->current.pos.y + 150.0f, lnk->current.pos.z);
-    cXyz ahead(from.x + 150.0f * cM_ssin(lnk->shape_angle.y), from.y, from.z + 150.0f * cM_scos(lnk->shape_angle.y));
-    cXyz spot = lnk->current.pos;
-    if (fopAcM_lc_c::lineCheck(&from, &ahead, lnk)) {
-        spot.x += 30.0f * s - 65.0f * c;
-        spot.z += 30.0f * c + 65.0f * s;
-    } else {
-        spot.x -= 120.0f * s;
-        spot.z -= 120.0f * c;
-    }
-    spot.y += kMidnaHeight;
-    return spot;
-}
-
-// the Midna button just called her for a talk: she's at the talk spot before the talk begins
-static void call_her_for_talk(ModContext* ctx, void* args, void* retval, void* user) {
-    bool wasOut = rideLent;
-    call_her_done(ctx, args, retval, user);
-    if (!wasOut || !retval || *static_cast<int*>(retval) == 0 || dComIfGp_att_getZHint() != nullptr) return;
-    auto* lnk = mods::arg<daAlink_c*>(args, 0);
-    daMidna_c* midna = daPy_py_c::getMidnaActor();
-    if (!midna || midnaPhase == MIDNA_TALKING || midnaPhase == MIDNA_HIDDEN) return;
-    midnaTalkSpot = midnaSpot = talk_spot(lnk);
-    midna->current.pos = midna->old.pos = midnaSpot;
-    midna->onTagWaitPosWarp(&midnaSpot);
-    midnaPhase = MIDNA_TALKING;
-    midnaMoving = false;
-    talkStarting = 30;
-}
-
-// Midna's choices (warp included) depend on her riding with Link; while she's out beside him
-// they're the same as always
-DEFINE_HOOK(&daAlink_c::checkAcceptWarp, LinkAcceptWarp);
-
-DEFINE_HOOK(&daAlink_c::orderTalk, LinkOrderTalk);
-DEFINE_HOOK(&daAlink_c::orderZTalk, LinkOrderZTalk);
 
 // The game moves her toward her wait spot at no more than 30 units a frame, slower than a sprint
 // (or a mod's speed). Her pace is ours to set, so she's put on this frame's spot before it moves
@@ -4459,9 +4333,6 @@ DEFINE_HOOK(&daAlink_c::orderZTalk, LinkOrderZTalk);
 static HookAction midna_pos_pre(ModContext*, void* args, void*, void*) {
     auto* midna = mods::arg<daMidna_c*>(args, 0);
     if (midnaPhase == MIDNA_HIDDEN) return HOOK_CONTINUE;
-    // a talk with her ends the game's wait mode; we keep her in it, floating where she is
-    bool ours = midnaPhase == MIDNA_TALKING || midnaTucking;
-    if (ours && !midna->checkStateFlg0(daMidna_c::FLG0_TAG_WAIT)) midna->onTagWaitPos(&midnaSpot);
     if (!midna->checkStateFlg0(daMidna_c::FLG0_TAG_WAIT)) return HOOK_CONTINUE;
     midna->current.pos = midnaSpot;
     return HOOK_CONTINUE;
@@ -4475,11 +4346,7 @@ static void midna_pos_post(ModContext*, void* args, void*, void*) {
     auto* lnk = (daAlink_c*)dComIfGp_getPlayer(0);
     if (!lnk) return;
     s16 want = lnk->shape_angle.y;  // hanging in place: look where Link looks
-    if (midnaPhase == MIDNA_TALKING) {
-        // in a talk: turned to Link, looking him in the eye
-        want = cM_atan2s(lnk->current.pos.x - midna->current.pos.x, lnk->current.pos.z - midna->current.pos.z);
-        midna->setForceNeckAimPos(lnk->eyePos);
-    } else if (midnaMoving) {
+    if (midnaMoving) {
         midna->offStateFlg0(daMidna_c::FLG0_UNK_200);
         // flying: turn toward where she's headed (straight up or down keeps her facing as is)
         cXyz to = midnaGoal - midna->current.pos;
@@ -4734,15 +4601,6 @@ static void midna_follow_init() {
               pre_hook(MidnaDraw, real_body_for_drawing) && post_hook(MidnaDraw, shadow_form_after_drawing) &&
               pre_hook(LinkShadowDraw, real_body_for_drawing) && post_hook(LinkShadowDraw, shadow_form_after_drawing);
     if (!ok) mods::log::warn("L3 Midna Follow won't work");
-    // ahead of other mods on the Midna button, so one that moves her button still finds her callable
-    HookOptions first = HOOK_OPTIONS_INIT;
-    first.priority = 100;
-    bool talkOk = hooked(mods::hook::add_pre<LinkOrderTalk>(call_her_while_out, &first), "pre") &&
-                  post_hook(LinkOrderTalk, call_her_for_talk) &&
-                  hooked(mods::hook::add_pre<LinkOrderZTalk>(call_her_while_out, &first), "pre") &&
-                  post_hook(LinkOrderZTalk, call_her_for_talk) &&
-                  pre_hook(LinkAcceptWarp, call_her_while_out) && post_hook(LinkAcceptWarp, call_her_done);
-    if (!talkOk) mods::log::warn("Midna can't be talked to while she's out following");
 }
 
 // Every particle the game makes goes through that call, so the trail's hooks are only on it while
@@ -4896,16 +4754,24 @@ static void load_ordon_cloth_icon() {
 
 static ResTIMG* ordon_cloth_texture() { return ordonClothSwap ? &ordonClothTex.header : nullptr; }
 
+// one piece of the game's slot (its frame, its ring, its icons), and how far it moves to land on
+// ours, in its own parent's units
+struct SlotPiece {
+    J2DPane* pane;
+    f32 dx, dy;
+};
+
+static const int kMaxSlotPieces = 12;
+
 struct GearSlot {
     u64 tag;                // our cell's tag, what getItemTag hands out
     J2DPane* anchor;        // our cell: an empty pane where the slot sits, for the cursor
-    J2DPane* home;          // the game's first slot in the row, drawn again at our spot
-    f32 dx, dy;             // from the game's slot to ours, in its own parent's units
-    J2DPane* ring;          // the game's ring and icons inside (or beside) that slot
-    J2DPane* keep;
-    J2DPane* drop;
-    J2DPane* loose[2];      // ring or icon that sits beside the slot rather than inside it
-    J2DPicture* ownIcon;    // the Ordon Clothes picture (the game has none for that slot)
+    J2DPane* home;          // the game's first slot in the row (the icons), drawn again at our spot
+    J2DPicture* icon;       // the icon that shows in ours
+    J2DPane* drop;          // an icon hidden in ours (0 = none)
+    J2DPane* ring;          // the yellow/grey ring that says "worn"
+    SlotPiece pieces[kMaxSlotPieces];  // everything that makes up the game's slot, in drawing order
+    int pieceCount;
 };
 
 static GearSlot gearSlot[GEAR_ROWS];
@@ -4963,6 +4829,76 @@ static void log_gear_layout(dMenu_Collect2D_c* m) {
     }
 }
 
+// where a pane sits on screen, and how big it is there
+struct ScreenBox {
+    f32 x, y, w, h;
+};
+
+static ScreenBox screen_box(CPaneMgr* measure, J2DPane* pane) {
+    Mtx scratch;
+    Vec a = measure->getGlobalVtx(pane, &scratch, 0, false, 0);
+    Vec b = measure->getGlobalVtx(pane, &scratch, 3, false, 0);
+    return {(a.x + b.x) * 0.5f, (a.y + b.y) * 0.5f, std::fabs(b.x - a.x), std::fabs(b.y - a.y)};
+}
+
+static bool is_our_pane(J2DPane* pane) { return (pane->mInfoTag >> 40) == (kGearTagBase >> 40); }
+
+// A pane that belongs to one slot: it and everything inside it sit on that slot and are no bigger
+// than one. A pane that holds more than the slot (a whole row, the whole screen) doesn't.
+static bool stays_in_slot(CPaneMgr* measure, J2DPane* pane, const Vec& middle, f32 step) {
+    if (is_our_pane(pane)) return false;
+    ScreenBox box = screen_box(measure, pane);
+    f32 dx = box.x - middle.x, dy = box.y - middle.y;
+    f32 near = 0.3f * step;
+    if (dx * dx + dy * dy > near * near || box.w > 1.3f * step || box.h > 1.3f * step) return false;
+    for (J2DPane* kid = pane->getFirstChildPane(); kid; kid = kid->getNextChildPane())
+        if (!stays_in_slot(measure, kid, middle, step)) return false;
+    return true;
+}
+
+static bool holds(J2DPane* outer, J2DPane* inner) {
+    for (J2DPane* p = inner; p; p = p->getParentPane())
+        if (p == outer) return true;
+    return false;
+}
+
+struct SlotSearch {
+    CPaneMgr* measure;
+    Vec middle;
+    f32 step;
+    J2DPane* unit;  // the biggest pane around the game's slot that's still only that slot
+    GearSlot* slot;
+};
+
+// every pane of the game's slot, front to back in the order the screen draws them
+static void collect_pieces(SlotSearch& find, J2DPane* pane) {
+    GearSlot& slot = *find.slot;
+    if (slot.pieceCount >= kMaxSlotPieces || is_our_pane(pane)) return;
+    bool whole = pane == find.unit || (!holds(pane, find.unit) && stays_in_slot(find.measure, pane, find.middle, find.step));
+    if (whole) {
+        slot.pieces[slot.pieceCount++].pane = pane;
+        return;
+    }
+    for (J2DPane* kid = pane->getFirstChildPane(); kid; kid = kid->getNextChildPane()) collect_pieces(find, kid);
+}
+
+// a move on screen, in the units of a pane's parent (it may be scaled, for widescreen say)
+static void screen_to_local(CPaneMgr* measure, J2DPane* pane, f32 x, f32 y, f32* outX, f32* outY) {
+    *outX = x, *outY = y;
+    J2DPane* parent = pane->getParentPane();
+    if (!parent) return;
+    Mtx to;
+    measure->getGlobalVtx(parent, &to, 0, false, 0);
+    f32 a = to[0][0], b = to[0][1], c = to[1][0], d = to[1][1];
+    f32 det = a * d - b * c;
+    if (std::fabs(det) < 1e-6f) return;
+    *outX = (d * x - b * y) / det;
+    *outY = (a * y - c * x) / det;
+}
+
+// Our slot is a copy of the game's first slot in the row (its frame, ring and icons, whatever the
+// screen or a texture pack makes them), one slot's step left of the leftmost cell in use. It's our
+// own: whatever another mod puts in the row stays as it is beside it.
 static void build_gear_slot(dMenu_Collect2D_c* m, int row, CPaneMgr* measure) {
     const GearRowInfo& info = kGearRows[row];
     GearSlot& slot = gearSlot[row];
@@ -4989,16 +4925,22 @@ static void build_gear_slot(dMenu_Collect2D_c* m, int row, CPaneMgr* measure) {
     Vec leftAt = screen_middle(measure, leftPane);
     f32 stepX = nextAt.x - homeAt.x, stepY = nextAt.y - homeAt.y;
     f32 targetX = leftAt.x - stepX * (left - gearCol), targetY = leftAt.y - stepY * (left - gearCol);
-    // screen units back into the slot's own (its parent may be scaled for widescreen)
-    f32 localStepX = next->getTranslateX() - home->getTranslateX();
-    f32 localStepY = next->getTranslateY() - home->getTranslateY();
-    f32 sx = (stepX != 0.0f && next->getParentPane() == parent) ? localStepX / stepX : 1.0f;
-    f32 sy = (stepY != 0.0f && next->getParentPane() == parent) ? localStepY / stepY : sx;
-    slot.dx = (targetX - homeAt.x) * sx;
-    slot.dy = (targetY - homeAt.y) * sy;
-    mods::log::info("gear row {}: leftmost cell {} ({}), game slot at {:.0f},{:.0f} shown {} (holder shown {}), ours at {:.0f},{:.0f}",
-                    row, left, tag_text(leftPane->mInfoTag), homeAt.x, homeAt.y, home->isVisible(), parent->isVisible(),
-                    targetX, targetY);
+    f32 moveX = targetX - homeAt.x, moveY = targetY - homeAt.y;
+    mods::log::info("gear row {}: leftmost cell {} ({}), game slot at {:.0f},{:.0f}, ours at {:.0f},{:.0f}", row,
+                    left, tag_text(leftPane->mInfoTag), homeAt.x, homeAt.y, targetX, targetY);
+
+    // the pieces of the game's slot, wherever they sit in the screen
+    SlotSearch find{measure, homeAt, std::sqrt(stepX * stepX + stepY * stepY), home, &slot};
+    while (find.unit->getParentPane() && stays_in_slot(measure, find.unit->getParentPane(), homeAt, find.step))
+        find.unit = find.unit->getParentPane();
+    collect_pieces(find, scr);
+    std::string names;
+    for (int i = 0; i < slot.pieceCount; i++) {
+        SlotPiece& piece = slot.pieces[i];
+        screen_to_local(measure, piece.pane, moveX, moveY, &piece.dx, &piece.dy);
+        names += tag_text(piece.pane->mInfoTag) + " ";
+    }
+    mods::log::info("gear row {} slot is drawn from: {}", row, names);
 
     // our cell: an empty pane the size of the game's slot, where ours is drawn
     slot.tag = gear_tag(row, 0xFFFF);
@@ -5010,49 +4952,25 @@ static void build_gear_slot(dMenu_Collect2D_c* m, int row, CPaneMgr* measure) {
     slot.anchor->mBasePosition = home->mBasePosition;
     slot.anchor->mRotateOffsetX = home->mRotateOffsetX;
     slot.anchor->mRotateOffsetY = home->mRotateOffsetY;
-    slot.anchor->translate(home->getTranslateX() + slot.dx, home->getTranslateY() + slot.dy);
+    f32 dx, dy;
+    screen_to_local(measure, home, moveX, moveY, &dx, &dy);
+    slot.anchor->translate(home->getTranslateX() + dx, home->getTranslateY() + dy);
     slot.home = home;
 
-    // the pieces of the game's slot that change for ours: the ring, and which icon shows
-    auto find = [&](u64 tag) -> J2DPane* {
-        if (!tag) return nullptr;
-        if (J2DPane* inside = home->search(tag)) return inside;
-        J2DPane* beside = scr->search(tag);
-        return beside && beside->getParentPane() == parent ? beside : nullptr;
-    };
-    slot.ring = find(info.ring);
-    slot.keep = find(info.keep);
-    slot.drop = find(info.drop);
-    int loose = 0;
-    for (J2DPane* piece : {slot.ring, slot.keep})
-        if (piece && piece->getParentPane() == parent && loose < 2) slot.loose[loose++] = piece;
-
-    if (row == GEAR_CLOTHES && ordon_cloth_texture()) {
-        // our picture sits over the slot's own icon (the Hero's Clothes), only while ours is drawn
-        ResTIMG* tex = ordon_cloth_texture();
-        J2DPane* icon = slot.keep;
-        if (!icon) {
-            // no icon by the expected name: the slot's biggest picture that isn't the ring
-            f32 best = 0.0f;
-            for (J2DPane* kid = home->getFirstChildPane(); kid; kid = kid->getNextChildPane()) {
-                f32 area = kid->getWidth() * kid->getHeight();
-                if (kid->getTypeID() == 18 && kid != slot.ring && area > best) best = area, icon = kid;
-            }
-            slot.keep = icon;
+    slot.ring = scr->search(info.ring);
+    if (slot.ring && slot.ring->getTypeID() != 18) slot.ring = nullptr;
+    if (!slot.ring) mods::log::info("gear row {} has no ring, it won't light up when worn", row);
+    slot.drop = info.drop ? home->search(info.drop) : nullptr;
+    J2DPane* icon = home->search(info.keep);
+    if (!icon) {
+        // no icon by the expected name: the slot's biggest picture
+        f32 best = 0.0f;
+        for (J2DPane* kid = home->getFirstChildPane(); kid; kid = kid->getNextChildPane()) {
+            f32 area = kid->getWidth() * kid->getHeight();
+            if (kid->getTypeID() == 18 && area > best) best = area, icon = kid;
         }
-        if (tex && icon && icon->getParentPane()) {
-            slot.ownIcon = JKR_NEW J2DPicture(gear_tag(row, 1), icon->getBounds(), tex, nullptr);
-            if (slot.ownIcon) {
-                icon->getParentPane()->appendChild(slot.ownIcon);
-                slot.ownIcon->mBounds = icon->getBounds();
-                slot.ownIcon->mBasePosition = icon->mBasePosition;
-                slot.ownIcon->translate(icon->getTranslateX(), icon->getTranslateY());
-                slot.ownIcon->hide();
-            }
-        }
-        if (!slot.ownIcon) mods::log::warn("no Ordon Clothes picture for the collection screen");
     }
-    if (!slot.ring) mods::log::info("gear row {} has no ring of its own, it won't light up when worn", row);
+    slot.icon = icon && icon->getTypeID() == 18 ? static_cast<J2DPicture*>(icon) : nullptr;
 }
 
 static bool clothes_off() { return rdBlob("gearClothesOff"); }
@@ -5222,12 +5140,14 @@ static void gear_screen_post(ModContext*, void* args, void*, void*) {
     gear_build(mods::arg<dMenu_Collect2D_c*>(args, 0));
 }
 
-static void gear_tag_post(ModContext*, void* args, void* retval, void*) {
-    if (gearAsking || !retval) return;
+// our cells answer for themselves, so the game's grid code (and any mod's) can step onto them
+static HookAction gear_tag_pre(ModContext*, void* args, void* retval, void*) {
+    if (gearAsking || !retval) return HOOK_CONTINUE;
     auto* m = mods::arg<dMenu_Collect2D_c*>(args, 0);
     int x = mods::arg<int>(args, 1), y = mods::arg<int>(args, 2);
-    if (m != gearMenu || x != gearCol || y < 0 || y >= GEAR_ROWS || !gearSlot[y].anchor) return;
+    if (m != gearMenu || x != gearCol || y < 0 || y >= GEAR_ROWS || !gearSlot[y].anchor) return HOOK_CONTINUE;
     *static_cast<u64*>(retval) = gearSlot[y].tag;
+    return HOOK_SKIP_ORIGINAL;
 }
 
 static void gear_rings_post(ModContext*, void* args, void*, void*) {
@@ -5318,56 +5238,58 @@ static bool ordon_worn(int row) {
 static void draw_slot(dMenu_Collect2D_c* m, int row, J2DGrafContext* graf) {
     GearSlot& slot = gearSlot[row];
     J2DPane* home = slot.home;
-    if (!home || !m->field_0x22d[gearCol][row]) return;
+    if (!home || !slot.pieceCount) return;
+    bool owned = gear_owned(row);
 
     // as the game's slot is now
-    f32 homeX = home->getTranslateX(), homeY = home->getTranslateY();
     bool homeShown = home->isVisible();
-    bool keepShown = slot.keep && slot.keep->isVisible(), dropShown = slot.drop && slot.drop->isVisible();
+    f32 homeScaleX = home->getScaleX(), homeScaleY = home->getScaleY();
+    bool iconShown = slot.icon && slot.icon->isVisible(), dropShown = slot.drop && slot.drop->isVisible();
     JUtility::TColor ringBlack, ringWhite;
-    auto* ring = slot.ring && slot.ring->getTypeID() == 18 ? static_cast<J2DPicture*>(slot.ring) : nullptr;
+    auto* ring = static_cast<J2DPicture*>(slot.ring);
     if (ring) ringBlack = ring->getBlack(), ringWhite = ring->getWhite();
-    f32 looseX[2], looseY[2];
-    for (int i = 0; i < 2; i++)
-        if (slot.loose[i]) looseX[i] = slot.loose[i]->getTranslateX(), looseY[i] = slot.loose[i]->getTranslateY();
+    struct Was {
+        f32 x, y;
+        u8 alpha;
+        bool influenced;
+    } was[kMaxSlotPieces];
 
-    // ours, for one drawing
-    // Another mod may hide the game's slot (and what holds it) to draw its own; ours is drawn at
-    // the menu's own fade either way, not the hidden parent's.
-    bool influenced = home->mIsInfluencedAlpha;
-    u8 alpha = home->getAlpha();
+    // ours, for one drawing. Another mod may hide what holds the game's slot to draw its own;
+    // ours fades with the menu either way, not with a hidden holder.
     J2DPane* next = m->mpScreen->search(kGearRows[row].next);
     u8 fade = next && next->isVisible() ? next->mColorAlpha : m->mpScreen->mColorAlpha;
-    home->mIsInfluencedAlpha = false;
-    home->setAlpha(fade);
-    home->translate(homeX + slot.dx, homeY + slot.dy);
-    home->show();
-    if (slot.ownIcon) {
-        set_shown(slot.keep, false);
-        slot.ownIcon->show();
-    } else {
-        set_shown(slot.keep, true);
+    for (int i = 0; i < slot.pieceCount; i++) {
+        SlotPiece& piece = slot.pieces[i];
+        J2DPane* p = piece.pane;
+        was[i] = {p->getTranslateX(), p->getTranslateY(), p->getAlpha(), p->mIsInfluencedAlpha};
+        p->mIsInfluencedAlpha = false;
+        p->setAlpha((u8)(was[i].alpha * fade / 255));
+        p->translate(was[i].x + piece.dx, was[i].y + piece.dy);
     }
+    set_shown(home, owned);
+    home->scale(slot.anchor->getScaleX(), slot.anchor->getScaleY());  // bigger while picked, like the game's
+    set_shown(slot.icon, true);
     set_shown(slot.drop, false);
-    paint_ring(slot.ring, ordon_worn(row));
-    for (int i = 0; i < 2; i++)
-        if (slot.loose[i]) slot.loose[i]->translate(looseX[i] + slot.dx, looseY[i] + slot.dy);
+    const ResTIMG* gameIcon = nullptr;
+    if (row == GEAR_CLOTHES && slot.icon && ordon_cloth_texture())
+        gameIcon = slot.icon->changeTexture(ordon_cloth_texture(), 0);
+    paint_ring(slot.ring, owned && ordon_worn(row));
 
-    home->draw(0.0f, 0.0f, graf, false, true);
-    for (int i = 0; i < 2; i++)
-        if (slot.loose[i] && slot.loose[i] != home) slot.loose[i]->draw(0.0f, 0.0f, graf, false, true);
+    for (int i = 0; i < slot.pieceCount; i++) slot.pieces[i].pane->draw(0.0f, 0.0f, graf, false, true);
 
     // and back
-    home->mIsInfluencedAlpha = influenced;
-    home->setAlpha(alpha);
-    home->translate(homeX, homeY);
+    for (int i = 0; i < slot.pieceCount; i++) {
+        J2DPane* p = slot.pieces[i].pane;
+        p->translate(was[i].x, was[i].y);
+        p->setAlpha(was[i].alpha);
+        p->mIsInfluencedAlpha = was[i].influenced;
+    }
+    home->scale(homeScaleX, homeScaleY);
     set_shown(home, homeShown);
-    set_shown(slot.keep, keepShown);
+    set_shown(slot.icon, iconShown);
     set_shown(slot.drop, dropShown);
-    if (slot.ownIcon) slot.ownIcon->hide();
+    if (gameIcon) slot.icon->changeTexture(gameIcon, 0);
     if (ring) ring->setBlackWhite(ringBlack, ringWhite);
-    for (int i = 0; i < 2; i++)
-        if (slot.loose[i]) slot.loose[i]->translate(looseX[i], looseY[i]);
 }
 
 // the collection screen draws its cursor right after the screen itself: ours go in just before it
@@ -5384,8 +5306,8 @@ static HookAction gear_draw(ModContext*, void* args, void*, void*) {
         loggedFor = m;
         for (int row = 0; row < GEAR_ROWS; row++)
             if (gearSlot[row].anchor)
-                mods::log::info("drawing Ordon gear slot {} (owned {}), moved {:.0f},{:.0f}", row,
-                                (int)m->field_0x22d[gearCol][row], gearSlot[row].dx, gearSlot[row].dy);
+                mods::log::info("drawing Ordon gear slot {} (owned {}) from {} pieces", row, (int)gear_owned(row),
+                                gearSlot[row].pieceCount);
     }
     for (int row = 0; row < GEAR_ROWS; row++)
         if (gearSlot[row].anchor) draw_slot(m, row, graf);
@@ -5581,6 +5503,7 @@ static void after_press(dMenu_Collect2D_c* m) {
 static HookAction gear_wait_pre(ModContext*, void* args, void*, void*) {
     auto* m = mods::arg<dMenu_Collect2D_c*>(args, 0);
     gear_build(m);
+    if (gear_built_for(m)) fill_gear_column(m);  // every frame, in case another mod reset the grid
     waitX = m->mCursorX;
     waitY = m->mCursorY;
     wornBefore = worn_now();
@@ -5785,10 +5708,11 @@ static void gear_init() {
     // any one of these is enough to get the slots onto the screen
     int seen = post_hook(CollectScreenSet, gear_screen_post) + post_hook(CollectCreate, gear_screen_post);
     if (!seen) mods::log::info("the Ordon gear slots are added on the menu's first frame instead");
-    if (!post_hook(CollectItemTag, gear_tag_post)) mods::log::info("the game's grid code won't know the Ordon slots");
     // ahead of other mods' hooks on the menu, so a mod that takes over the grid can't swallow ours
     HookOptions first = HOOK_OPTIONS_INIT;
     first.priority = 100;
+    if (!hooked(mods::hook::add_pre<CollectItemTag>(gear_tag_pre, &first), "pre"))
+        mods::log::info("the game's grid code won't know the Ordon slots (the mod moves the cursor onto them itself)");
     bool pressOk = hooked(mods::hook::add_pre<CollectWait>(gear_wait_pre, &first), "pre") &&
                    post_hook(CollectWait, gear_wait_post) &&
                    hooked(mods::hook::add_pre<CollectClick>(gear_click_pre, &first), "pre");
@@ -6044,7 +5968,6 @@ static void link_update_post(ModContext* ctx, void* args, void* ret, void* user)
     lantern_swing_burns(lnk);           // Deal Burn with Lantern
     burn_enemies();                     // fire arrows / lantern: whoever's burning
     gear_exec_post(ctx, args, ret, user);  // Gear: a sword taken off in the menu is put away
-    link_faces_midna(ctx, args, ret, user);  // Midna: turning to her for a talk
 }
 
 static bool add_bool_option(const char* key, bool def, ConfigVarHandle* out) {
