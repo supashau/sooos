@@ -2235,11 +2235,14 @@ static void shop_shutdown() {
 // The flourish is only an option on the A "Put away" press while the kill timer
 // (mSwordFlourishTimer) is still running, and the wooden sword is never allowed. Nothing else reads
 // that timer, so:
-//   On:      the timer is kept full, and the game's own put-away flourishes every time
+//   On:      every "Put away" with a sword in hand is a flourish, any sword
 //   Off:     the timer is kept at zero
-//   Wooden:  the game handles the real swords as normal
-// The game never lets the Wooden Sword flourish, so for the stick (On, or Wooden after a kill) the
-// flourish is started here instead, right before Link updates.
+//   Wooden:  the game handles the real swords as normal, and the stick flourishes after a kill
+//   Default: the game's own rules
+// The game only looks at the timer from some of Link's actions (not right after a swing, for one),
+// so a full timer alone left On missing some presses, and it never covers the stick. So for On (and
+// the stick under Wooden) the flourish is started here, right before Link updates, and that A press
+// is then kept from the game so it can't also put the sword away plainly in the same frame.
 
 // the game's own put-away gate, minus the timer and the wooden sword
 static bool could_put_away(daAlink_c* lnk) {
@@ -2249,17 +2252,31 @@ static bool could_put_away(daAlink_c* lnk) {
     return !lnk->checkCanoeRide() && !lnk->checkEventRun();
 }
 
+static bool flourishTookA;  // this frame's A started a flourish; the game doesn't get to see it
+
 // runs before Link's own update every frame
 static void flourish_before(daAlink_c* lnk) {
+    flourishTookA = false;
     int mode = cfgInt(flourishOption, FLOURISH_DEFAULT);
     if (mode == FLOURISH_OFF) lnk->mSwordFlourishTimer = 0;
     if (mode == FLOURISH_ON) lnk->mSwordFlourishTimer = lnk->mpHIO->mCut.m.mFlourishTime;
     if (mode != FLOURISH_ON && mode != FLOURISH_WOODEN) return;
 
-    // the stick: the game ticks the timer down once before it checks, hence > 1
-    if (!daPy_py_c::checkWoodSwordEquip()) return;
-    if (mode == FLOURISH_WOODEN && lnk->mSwordFlourishTimer <= 1) return;
-    if (could_put_away(lnk)) lnk->procSwordUnequipSpInit();
+    // Wooden leaves the real swords to the game; the stick needs a kill (the game ticks the timer
+    // down once before it checks, hence > 1)
+    if (mode == FLOURISH_WOODEN && (!daPy_py_c::checkWoodSwordEquip() || lnk->mSwordFlourishTimer <= 1)) return;
+    if (lnk->mProcID == daAlink_c::PROC_SWORD_UNEQUIP_SP || !could_put_away(lnk)) return;
+    if (!lnk->mLinkAcch.ChkGroundHit() || lnk->checkNoResetFlg0(daAlink_c::FLG0_WATER_IN_MOVE)) return;
+    if (lnk->procSwordUnequipSpInit()) flourishTookA = true;
+}
+
+// Link reads his buttons early in his update (setStickData); the A that started the flourish is
+// taken off there
+
+static void flourish_keeps_a(ModContext*, void* args, void*, void*) {
+    if (!flourishTookA) return;
+    auto* lnk = mods::arg<daAlink_c*>(args, 0);
+    lnk->mItemTrigger &= ~daAlink_c::BTN_A;
 }
 
 // and after it, so a kill this frame can't sneak one past Off
@@ -3519,6 +3536,12 @@ static int start_jab(daAlink_c* lnk) {
     return r;
 }
 
+// Spin attack while unarmed also covers the quick spin: the stick swung round in a circle (the
+// game's own test for it), then B
+static bool quick_spin_wanted(daAlink_c* lnk) {
+    return cfgOn(vSwing, true) && cfgOn(vSpin, false) && lnk->checkCutTurnInput();
+}
+
 static void item_action_post(ModContext*, void* args, void* retval, void*) {
     if (!retval || *static_cast<int*>(retval) != 0) return;
     daAlink_c* lnk = mods::arg<daAlink_c*>(args, 0);
@@ -3560,6 +3583,15 @@ static void item_action_post(ModContext*, void* args, void* retval, void*) {
     if (!lnk->swordTrigger()) return;
 
     if (lnk->mEquipItem != dItemNo_NONE_e) lnk->deleteEquipItem(TRUE, FALSE);
+
+    // a circle on the stick and then B is the quick spin, the way it is with a sword
+    if (quick_spin_wanted(lnk)) {
+        lnk->mEquipItem = 0x103;
+        swinging = true;
+        comboStep = 0;
+        *static_cast<int*>(retval) = lnk->procCutTurnInit(1, 2);
+        return;
+    }
 
     // mid swing, so this is the next hit
     comboStep = swinging ? comboStep + 1 : 0;
@@ -3663,8 +3695,14 @@ static HookAction cut_action_pre(ModContext*, void* args, void* retval, void*) {
     daAlink_c* lnk = mods::arg<daAlink_c*>(args, 0);
     if (!swinging || lnk->checkWolf()) return HOOK_CONTINUE;
     lnk->resetCombo(TRUE);
-    comboStep++;
-    int r = start_jab(lnk);
+    int r;
+    if (quick_spin_wanted(lnk)) {
+        comboStep = 0;
+        r = lnk->procCutTurnInit(1, 2);
+    } else {
+        comboStep++;
+        r = start_jab(lnk);
+    }
     if (retval) *static_cast<int*>(retval) = r;
     return HOOK_SKIP_ORIGINAL;
 }
@@ -4540,6 +4578,227 @@ static void dialogue_tick() {
     }
 }
 
+// ======================== Bonus Items (Experimental) ========================
+// A rebuild of the Bonus Inventory Wheel idea: extra items Link can put on from a menu, opened by
+// clicking the right stick (R3) as human Link. Each item can be switched off on the Experimental
+// page, which also takes it off. (D-pad Down stays the game's own item wheel.)
+//
+// - Hover Boots: walking off a ledge, Link floats level for a moment before he drops.
+// - Lens of Truth: wolf senses as human Link (Poes, ghost rats, scents and dig spots show).
+// - Stone Mask: enemies can't see Link, as if he weren't there.
+// - Ocarina: sets the time of day, and the rain, on the spot.
+
+static ConfigVarHandle vBonusMenu, vHoverBoots, vLensOfTruth, vStoneMask, vOcarina;
+static bool add_bool_option(const char* key, bool def, ConfigVarHandle* out);  // with the settings, below
+
+static bool hoverOn, lensOn, maskOn;  // what Link has on right now (from the menu)
+static u32 bonusLastExt;
+
+static bool bonus_has(ConfigVarHandle item) { return cfgOn(vBonusMenu, false) && cfgOn(item, true); }
+
+// --- Hover Boots ---
+static const int kHoverFrames = 40;  // about a second and a third of floating
+static int hoverFor;
+static f32 hoverHeight;
+
+static void hover_boots(daAlink_c* lnk) {
+    if (!hoverOn || !bonus_has(vHoverBoots) || lnk->checkWolf()) return;
+    if (lnk->mLinkAcch.ChkGroundHit()) {
+        hoverFor = 0;
+        hoverHeight = lnk->current.pos.y;
+        return;
+    }
+    // only the drop from walking off an edge, not jumps, climbs, swims or being knocked back
+    if (lnk->mProcID != daAlink_c::PROC_FALL || hoverFor >= kHoverFrames || lnk->speed.y > 0.0f) return;
+    hoverFor++;
+    lnk->speed.y = 0.0f;
+    lnk->current.pos.y = hoverHeight;
+}
+
+// --- Lens of Truth ---
+// The game keeps the wolf's senses up once they're on, whatever form Link is in; human Link just
+// never has a way to turn them on.
+static bool lensWasOn;
+
+static void lens_of_truth(daAlink_c* lnk) {
+    bool want = lensOn && bonus_has(vLensOfTruth) && !lnk->checkWolf();
+    if (want && !lnk->checkWolfEyeUp()) lnk->onWolfEyeUp();
+    if (!want && lensWasOn && !lnk->checkWolf()) lnk->offWolfEyeUp();
+    lensWasOn = want;
+}
+
+static void bonus_exec_post(ModContext*, void* args, void*, void*) {
+    auto* lnk = mods::arg<daAlink_c*>(args, 0);
+    hover_boots(lnk);
+    lens_of_truth(lnk);
+}
+
+// --- Stone Mask ---
+// Enemies size Link up through a handful of the game's "how far / which way is that actor" helpers;
+// while the mask is on, an enemy asking about Link gets "far away, behind you".
+DEFINE_HOOK(&fopAcM_searchActorDistance, ActorDistance);
+DEFINE_HOOK(&fopAcM_searchActorDistance2, ActorDistance2);
+DEFINE_HOOK(&fopAcM_searchActorDistanceXZ, ActorDistanceXZ);
+DEFINE_HOOK(&fopAcM_searchActorDistanceXZ2, ActorDistanceXZ2);
+DEFINE_HOOK(&fopAcM_seenActorAngleY, SeenAngle);
+
+static const f32 kUnseenDistance = 100000.0f;
+
+static bool enemy_looking_for_link(void* args) {
+    if (!maskOn || !bonus_has(vStoneMask)) return false;
+    auto* looker = mods::arg<const fopAc_ac_c*>(args, 0);
+    auto* target = mods::arg<const fopAc_ac_c*>(args, 1);
+    fopAc_ac_c* link = dComIfGp_getPlayer(0);
+    return looker && link && target == link && fopAcM_GetGroup(looker) == fopAc_ENEMY_e && !daPy_py_c::checkNowWolf();
+}
+
+static void unseen_distance(ModContext*, void* args, void* retval, void*) {
+    if (retval && enemy_looking_for_link(args)) *static_cast<f32*>(retval) = kUnseenDistance;
+}
+
+static void unseen_distance_squared(ModContext*, void* args, void* retval, void*) {
+    if (retval && enemy_looking_for_link(args)) *static_cast<f32*>(retval) = kUnseenDistance * kUnseenDistance;
+}
+
+static void unseen_angle(ModContext*, void* args, void* retval, void*) {
+    if (retval && enemy_looking_for_link(args)) *static_cast<s32*>(retval) = 0x7FFF;  // right behind them
+}
+
+// --- Ocarina: time and rain ---
+// the game's day runs 0 to 360, 15 to the hour
+static const f32 kTimes[4] = {90.0f, 180.0f, 270.0f, 0.0f};
+static const char* const kTimeNames[4] = {"Dawn (6:00)", "Noon (12:00)", "Dusk (18:00)", "Midnight (0:00)"};
+
+static void set_time_of_day(ModContext*, void* which) {
+    if (!bonus_has(vOcarina)) return;
+    dKy_instant_timechg(kTimes[reinterpret_cast<intptr_t>(which)]);
+}
+
+static void set_rain(bool on) {
+    if (on) {
+        dKy_instant_rainchg();
+    } else {
+        dKyw_rain_set(0);
+        g_env_light.mColpatWeather = 0;
+        g_env_light.wether_pat0 = 0;
+        g_env_light.wether_pat1 = 0;
+    }
+}
+
+static void rain_on(ModContext*, void*) { if (bonus_has(vOcarina)) set_rain(true); }
+static void rain_off(ModContext*, void*) { if (bonus_has(vOcarina)) set_rain(false); }
+
+// --- the menu ---
+struct BonusItem {
+    const char* name;
+    ConfigVarHandle* allowed;
+    bool* worn;
+};
+static const BonusItem kBonusItems[] = {
+    {"Hover Boots", &vHoverBoots, &hoverOn},
+    {"Lens of Truth", &vLensOfTruth, &lensOn},
+    {"Stone Mask", &vStoneMask, &maskOn},
+};
+
+static void worn_get(ModContext*, void* item, UiControlValue* out) {
+    out->bool_value = *static_cast<const BonusItem*>(item)->worn;
+}
+
+static void worn_set(ModContext*, void* item, const UiControlValue* value) {
+    auto* it = static_cast<const BonusItem*>(item);
+    *it->worn = value->bool_value && bonus_has(*it->allowed);
+}
+
+static bool item_unavailable(ModContext*, void* item) {
+    return !bonus_has(*static_cast<const BonusItem*>(item)->allowed);
+}
+
+static bool ocarina_unavailable(ModContext*, void*) { return !bonus_has(vOcarina); }
+
+static ModResult bonus_items_tab(ModContext*, UiWindowHandle, UiElementHandle pane, UiElementHandle, void*, ModError*) {
+    for (const BonusItem& item : kBonusItems) {
+        UiControlDesc row = UI_CONTROL_DESC_INIT;
+        row.kind = UI_CONTROL_TOGGLE;
+        row.label = item.name;
+        row.binding = UI_BINDING_CALLBACKS;
+        row.get = worn_get;
+        row.set = worn_set;
+        row.is_disabled = item_unavailable;
+        row.user_data = const_cast<BonusItem*>(&item);
+        svc_ui->pane_add_control(mod_ctx, pane, &row, nullptr);
+    }
+    return MOD_OK;
+}
+
+static ModResult ocarina_tab(ModContext*, UiWindowHandle, UiElementHandle pane, UiElementHandle, void*, ModError*) {
+    svc_ui->pane_add_section(mod_ctx, pane, "Time of Day");
+    for (int t = 0; t < 4; t++) {
+        UiControlDesc b = UI_CONTROL_DESC_INIT;
+        b.kind = UI_CONTROL_BUTTON;
+        b.label = kTimeNames[t];
+        b.on_pressed = set_time_of_day;
+        b.is_disabled = ocarina_unavailable;
+        b.user_data = reinterpret_cast<void*>(static_cast<intptr_t>(t));
+        svc_ui->pane_add_control(mod_ctx, pane, &b, nullptr);
+    }
+    svc_ui->pane_add_section(mod_ctx, pane, "Weather");
+    UiControlDesc rain = UI_CONTROL_DESC_INIT;
+    rain.kind = UI_CONTROL_BUTTON;
+    rain.label = "Bring Rain";
+    rain.on_pressed = rain_on;
+    rain.is_disabled = ocarina_unavailable;
+    svc_ui->pane_add_control(mod_ctx, pane, &rain, nullptr);
+    UiControlDesc clear = rain;
+    clear.label = "Clear Skies";
+    clear.on_pressed = rain_off;
+    svc_ui->pane_add_control(mod_ctx, pane, &clear, nullptr);
+    return MOD_OK;
+}
+
+static UiWindowHandle bonusWindow;
+static void bonus_closed(ModContext*, UiWindowHandle, void*) { bonusWindow = 0; }
+
+static void open_bonus_menu() {
+    if (bonusWindow) return;
+    UiTabDesc tabs[2] = {UI_TAB_DESC_INIT, UI_TAB_DESC_INIT};
+    tabs[0].title = "Bonus Items";
+    tabs[0].build = bonus_items_tab;
+    tabs[1].title = "Ocarina";
+    tabs[1].build = ocarina_tab;
+    UiWindowDesc win = UI_WINDOW_DESC_INIT;
+    win.tabs = tabs;
+    win.tab_count = 2;
+    win.on_closed = bonus_closed;
+    if (svc_ui->window_push(mod_ctx, &win, &bonusWindow) != MOD_OK) bonusWindow = 0;
+}
+
+static void bonus_tick() {
+    u32 now = JUTGamePad::mPadStatus[PAD_1].extButton;
+    bool pressed = (now & PAD_BUTTON_RIGHT_STICK) && !(bonusLastExt & PAD_BUTTON_RIGHT_STICK);
+    bonusLastExt = now;
+
+    // anything switched off on the Experimental page comes off
+    for (const BonusItem& item : kBonusItems)
+        if (!bonus_has(*item.allowed)) *item.worn = false;
+
+    auto* lnk = (daAlink_c*)dComIfGp_getPlayer(0);
+    if (!pressed || !cfgOn(vBonusMenu, false) || !lnk || lnk->checkWolf() || dComIfGp_event_runCheck()) return;
+    open_bonus_menu();
+}
+
+static void bonus_init() {
+    add_bool_option("bonusMenu", false, &vBonusMenu);
+    add_bool_option("bonusHoverBoots", true, &vHoverBoots);
+    add_bool_option("bonusLensOfTruth", true, &vLensOfTruth);
+    add_bool_option("bonusStoneMask", true, &vStoneMask);
+    add_bool_option("bonusOcarina", true, &vOcarina);
+    if (!post_hook(Exec, bonus_exec_post)) mods::log::warn("Hover Boots and Lens of Truth won't work");
+    bool maskOk = post_hook(ActorDistance, unseen_distance) && post_hook(ActorDistance2, unseen_distance_squared) &&
+                  post_hook(ActorDistanceXZ, unseen_distance) && post_hook(ActorDistanceXZ2, unseen_distance_squared) &&
+                  post_hook(SeenAngle, unseen_angle);
+    if (!maskOk) mods::log::warn("the Stone Mask won't hide Link from every enemy");
+}
+
 // ======================== Geo's Hyrulean Settings ========================
 
 // greyed-out rules for rows that depend on another toggle
@@ -4650,10 +4909,23 @@ static void item_rows() {
     toggle("Deal Burn Damage", vFireDamage, fire_arrows_off);
 }
 
-static const char* const tabTitles[3] = {"Quality of Life", "Combat", "Items"};
-static void (*const tabRows[3])() = {quality_rows, combat_rows, item_rows};
+static bool bonus_menu_off(ModContext*, void*) { return !cfgOn(vBonusMenu, false); }
 
-// one builder for all three tabs, user_data is the tab number
+static void experimental_rows() {
+    heading("Bonus Items");
+    note("Extra items to put on from a menu: click the right stick (R3) as human Link to open it.");
+    toggle("Bonus Items Menu (R3)", vBonusMenu);
+    toggle("Hover Boots", vHoverBoots, bonus_menu_off);
+    toggle("Lens of Truth", vLensOfTruth, bonus_menu_off);
+    toggle("Stone Mask", vStoneMask, bonus_menu_off);
+    toggle("Ocarina (Time and Rain)", vOcarina, bonus_menu_off);
+}
+
+static const int kTabCount = 4;
+static const char* const tabTitles[kTabCount] = {"Quality of Life", "Combat", "Items", "Experimental"};
+static void (*const tabRows[kTabCount])() = {quality_rows, combat_rows, item_rows, experimental_rows};
+
+// one builder for every tab, user_data is the tab number
 static ModResult fill_tab(ModContext*, UiWindowHandle, UiElementHandle pane, UiElementHandle, void* which, ModError*) {
     page = pane;
     tabRows[reinterpret_cast<intptr_t>(which)]();
@@ -4670,8 +4942,8 @@ static void settings_closed(ModContext*, UiWindowHandle, void*) {
 static void open_settings(ModContext*, void*) {
     if (settingsWindow) return;
 
-    UiTabDesc tabs[3];
-    for (int t = 0; t < 3; t++) {
+    UiTabDesc tabs[kTabCount];
+    for (int t = 0; t < kTabCount; t++) {
         tabs[t] = UI_TAB_DESC_INIT;
         tabs[t].title = tabTitles[t];
         tabs[t].build = fill_tab;
@@ -4680,7 +4952,7 @@ static void open_settings(ModContext*, void*) {
 
     UiWindowDesc win = UI_WINDOW_DESC_INIT;
     win.tabs = tabs;
-    win.tab_count = 3;
+    win.tab_count = kTabCount;
     win.on_closed = settings_closed;
     if (svc_ui->window_push(mod_ctx, &win, &settingsWindow) == MOD_OK) return;
     mods::log::warn("settings window wouldn't open");
@@ -4877,7 +5149,8 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     add_bool_option("mortalDrawHandAnim", true, &vHandPose);
     if (!post_hook(SetMatrix, hand_pose_post)) mods::log::warn("Mortal Draw Hand Anim stays on");
     // rides along on Link's update, next to the Ice Leaf's own hooks there
-    bool flourishOk = pre_hook(Exec, flourish_exec_pre) && post_hook(Exec, flourish_exec_post);
+    bool flourishOk = pre_hook(Exec, flourish_exec_pre) && post_hook(Exec, flourish_exec_post) &&
+                      post_hook(Stick, flourish_keeps_a);
     if (!flourishOk) mods::log::warn("sword flourish stays at the game's normal behaviour");
 
     // --- Item Combinations ---
@@ -4924,6 +5197,9 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     add_bool_option("dialogueCorrection", true, &vDialogueFix);
     dialogue_tick();
 
+    // --- Experimental: Bonus Items ---
+    bonus_init();
+
     // --- Midna: L3 Midna Follow ---
     add_bool_option("midnaFollow", true, &vMidnaFollow);
     if (!add_int_option("midnaTrailFile", -1, &vMidnaTrailFile)) vMidnaTrailFile = 0;
@@ -4947,6 +5223,7 @@ MOD_EXPORT ModResult mod_update(ModError*) {
     dialogue_tick();
     midna_follow_tick();
     trail_tick();
+    bonus_tick();
     return MOD_OK;
 }
 
