@@ -5157,6 +5157,7 @@ static void gear_rings_post(ModContext*, void* args, void*, void*) {
 // --- the cursor on our cells ---
 
 static u8 waitX, waitY;  // where the cursor was when this frame of the menu started
+static s16 waitStickX, waitStickY;  // and the stick's repeat timers then
 
 static bool is_ours(int x, int y) { return x == gearCol && y >= 0 && y < GEAR_ROWS && gearSlot[y].anchor; }
 
@@ -5188,27 +5189,39 @@ static void move_cursor(dMenu_Collect2D_c* m, int x, int y) {
     m->setItemNameString(x, y);
 }
 
+// The stick's repeat timer for a direction restarts each time the menu takes a step that way,
+// so a timer that's been restarted this frame means the menu just handled a step, whether or not
+// the cursor got anywhere. (Watching the stick's own "just pressed" bits doesn't work: other code
+// reads the stick earlier in the frame and they're gone by the time we look.)
+static bool stick_stepped(s16 before, s16 now) { return now > 0 && now >= before; }
+
 // Left into our column from the cell beside it, right back out, and up/down between our own
 // slots. Only fills in what the grid code didn't do itself this frame.
 static void gear_cursor(dMenu_Collect2D_c* m) {
     STControl* stick = m->mpStick;
     if (!stick) return;
-    u8 fresh = stick->mDirectionTrig & ~stick->field_0x0d;
-    if (!fresh) return;
+    bool sideways = stick_stepped(waitStickX, stick->field_0x0e);
+    bool upDown = stick_stepped(waitStickY, stick->field_0x10);
+    if (!sideways && !upDown) return;
+    u8 dir = stick->mDirectionTrig;
     int x0 = waitX, y0 = waitY;
     bool moved = m->mCursorX != x0 || m->mCursorY != y0;
     int toX = -1, toY = -1;
 
-    if ((fresh & STControl::TRIG_LEFT) && !moved && x0 > gearCol && is_ours(gearCol, y0)) {
-        toX = gearCol, toY = y0;
-    } else if ((fresh & STControl::TRIG_RIGHT) && !moved && is_ours(x0, y0)) {
+    if (sideways && (dir & STControl::TRIG_LEFT) && !moved && x0 > gearCol && is_ours(gearCol, y0)) {
+        // nothing in use between the cursor and our slot
+        bool clear = true;
+        for (int x = gearCol + 1; x < x0 && clear; x++) clear = !cell_tag(m, x, y0);
+        if (clear) toX = gearCol, toY = y0;
+    } else if (sideways && (dir & STControl::TRIG_RIGHT) && !moved && is_ours(x0, y0)) {
         for (int x = x0 + 1; x <= 6 && toX < 0; x++)
-            if (m->mpSelPm[x][y0]) toX = x, toY = y0;
-    } else if ((fresh & (STControl::TRIG_UP | STControl::TRIG_DOWN)) && is_ours(x0, y0)) {
-        int step = (fresh & STControl::TRIG_UP) ? -1 : 1;
+            if (m->mpSelPm[x][y0] && cell_tag(m, x, y0)) toX = x, toY = y0;
+    } else if (upDown && is_ours(x0, y0) && (dir & (STControl::TRIG_UP | STControl::TRIG_DOWN))) {
+        // from one of ours, up and down go to our other slots first, whatever the grid code did
+        int step = (dir & STControl::TRIG_UP) ? -1 : 1;
         for (int y = y0 + step; y >= 0 && y < GEAR_ROWS && toX < 0; y += step)
             if (is_ours(gearCol, y)) toX = gearCol, toY = y;
-        // past our last slot downward the game's own move into the items stands
+        // past our last slot the game's own move stands
     }
     if (toX < 0 || (toX == m->mCursorX && toY == m->mCursorY)) return;
     move_cursor(m, toX, toY);
@@ -5378,6 +5391,13 @@ static void put_on(dMenu_Collect2D_c* m, int row, u8 item) {
     gear_changed(m, row);
 }
 
+// Swapping Link's whole outfit (the sumo outfit is a different model) only where the game itself
+// would: on his own two feet, out of the water, not riding anything, outside cutscenes.
+static bool outfit_change_ok(daAlink_c* lnk) {
+    return lnk && !lnk->checkWolf() && !lnk->checkRide() && !lnk->checkModeFlg(daAlink_c::MODE_SWIMMING) &&
+           !lnk->checkMetamorphose() && !dComIfGp_event_runCheck();
+}
+
 static bool take_off(dMenu_Collect2D_c* m, int row) {
     daPy_py_c* pl = daPy_getPlayerActorClass();
     auto* lnk = (daAlink_c*)dComIfGp_getPlayer(0);
@@ -5391,8 +5411,8 @@ static bool take_off(dMenu_Collect2D_c* m, int row) {
         if (lnk) lnk->setShieldChange();
         break;
     default:
-        if (!pl || !sumo_ready()) {
-            mDoAud_seStart(Z2SE_SY_CURSOR_CANCEL, nullptr, 0, 0);  // the outfit is still loading
+        if (!pl || !outfit_change_ok(lnk) || !sumo_ready()) {
+            mDoAud_seStart(Z2SE_SY_CURSOR_CANCEL, nullptr, 0, 0);  // not here, or the outfit is still loading
             return true;
         }
         wrBlob("gearClothesOff", 1);
@@ -5404,10 +5424,10 @@ static bool take_off(dMenu_Collect2D_c* m, int row) {
 }
 
 // --- A on a gear cell ---
-// Our own slots are handled here outright. Every other gear cell is left to the game (or to a mod
-// that has rearranged the grid); afterwards, if A changed nothing and the cell under the cursor
-// is the one lit as worn, that's "take it off". Which cell is lit is read off the screen itself
-// (the yellow ring), so it doesn't matter whose cell it is or where it sits.
+// A on a gear cell is left to the game (or to whichever mod owns the cell). Afterwards, if it
+// changed nothing and the cell holds what Link is wearing, it's "take it off". If anything did
+// change (the item went on, or another mod with its own way of taking gear off already did it),
+// that stands and we do nothing. Our own slots are handled here outright.
 
 struct GearWorn {
     u8 sword, shield, clothes;
@@ -5421,6 +5441,14 @@ static GearWorn worn_now() {
 static GearWorn wornBefore;
 static bool aPressed;
 
+// With no sword the game holds Link's sword-change timer up for good (it's how it keeps a
+// swordless Link from swinging), and the menu won't move or change anything while that timer
+// runs. In the menu it means nothing, so it's let go there.
+static void free_menu_from_sword_timer() {
+    daAlink_c* lnk = daAlink_getAlinkActorClass();
+    if (lnk && dComIfGs_getSelectEquipSword() == dItemNo_NONE_e) lnk->mSwordChangeWaitTimer = 0;
+}
+
 static bool gear_busy() {
     daPy_py_c* pl = daPy_getPlayerActorClass();
     return !pl || pl->getSwordChangeWaitTimer() || pl->getShieldChangeWaitTimer() || pl->getClothesChangeWaitTimer();
@@ -5429,7 +5457,7 @@ static bool gear_busy() {
 // A on one of our slots
 static bool press_ours(dMenu_Collect2D_c* m) {
     int x = m->mCursorX, y = m->mCursorY;
-    if (!gear_built_for(m) || !is_ours(x, y) || m->mIsWolf || !m->field_0x22d[x][y]) return false;
+    if (!gear_built_for(m) || !is_ours(x, y) || m->mIsWolf || !gear_owned(y)) return false;
     if (gear_busy()) return true;  // still changing, try again in a moment
     u8 item = kGearRows[y].item;
     if (gear_worn(y, item)) {
@@ -5440,72 +5468,56 @@ static bool press_ours(dMenu_Collect2D_c* m) {
     return true;
 }
 
-static bool is_lit_ring(J2DPane* pane) {
-    if (pane->getTypeID() != 18) return false;
-    JUtility::TColor white = static_cast<J2DPicture*>(pane)->getWhite();
-    return white.r == 255 && white.g == 255 && white.b == 0;
-}
-
-// a lit (yellow) ring drawn over the middle of this cell, anywhere in the screen
-static bool lit_ring_over(J2DPane* pane, CPaneMgr* measure, const Vec& middle, f32 reach) {
-    if (!pane->isVisible()) return false;
-    if (is_lit_ring(pane)) {
-        Vec at = measure->getGlobalVtxCenter(pane, false, 0);
-        f32 dx = at.x - middle.x, dy = at.y - middle.y;
-        if (dx * dx + dy * dy <= reach * reach) return true;
+// what A on one of the game's own gear cells puts on, by the game's own rules (NONE: not one of
+// the game's cells, or the cells have been rearranged by another mod)
+static u8 game_cell_item(int x, int y) {
+    if (!gameLayout) return dItemNo_NONE_e;
+    switch (y) {
+    case GEAR_SWORD:
+        if (x == 3) return dComIfGs_isItemFirstBit(dItemNo_SWORD_e) ? dItemNo_SWORD_e : dItemNo_WOOD_STICK_e;
+        if (x == 4) return dComIfGs_isItemFirstBit(dItemNo_LIGHT_SWORD_e) ? dItemNo_LIGHT_SWORD_e : dItemNo_MASTER_SWORD_e;
+        break;
+    case GEAR_SHIELD:
+        if (x == 3) return dComIfGs_isItemFirstBit(dItemNo_SHIELD_e) ? dItemNo_SHIELD_e : dItemNo_WOOD_SHIELD_e;
+        if (x == 4) return dItemNo_HYLIA_SHIELD_e;
+        break;
+    case GEAR_CLOTHES: {
+        static const u8 wear[3] = {dItemNo_WEAR_KOKIRI_e, dItemNo_WEAR_ZORA_e, dItemNo_ARMOR_e};
+        if (x >= 3 && x <= 5) return wear[x - 3];
+        break;
     }
-    for (J2DPane* kid = pane->getFirstChildPane(); kid; kid = kid->getNextChildPane())
-        if (lit_ring_over(kid, measure, middle, reach)) return true;
-    return false;
-}
-
-static bool cell_lit(dMenu_Collect2D_c* m, int x, int y) {
-    CPaneMgr* cell = m->mpSelPm[x][y];
-    J2DPane* pane = cell ? cell->getPanePtr() : nullptr;
-    if (!pane) {
-        u64 tag = m->getItemTag(x, y, true);
-        pane = tag ? m->mpScreen->search(tag) : nullptr;
     }
-    CPaneMgr* measure = cell ? cell : m->mpSelPm[3][0];
-    if (!pane || !measure || !m->mpScreen) return false;
-    Mtx scratch;
-    Vec corner0 = measure->getGlobalVtx(pane, &scratch, 0, false, 0);
-    Vec corner3 = measure->getGlobalVtx(pane, &scratch, 3, false, 0);
-    Vec middle = {(corner0.x + corner3.x) * 0.5f, (corner0.y + corner3.y) * 0.5f, 0.0f};
-    f32 w = corner3.x - corner0.x, h = corner3.y - corner0.y;
-    f32 reach = 0.4f * std::sqrt(w * w + h * h);  // inside the cell
-    return lit_ring_over(m->mpScreen, measure, middle, reach);
+    return dItemNo_NONE_e;
 }
 
 static void after_press(dMenu_Collect2D_c* m) {
     int x = m->mCursorX, y = m->mCursorY;
-    if (y < 0 || y >= GEAR_ROWS || m->mIsWolf || !m->mpScreen || (gear_built_for(m) && is_ours(x, y))) return;
+    if (x > 6 || y < 0 || y >= GEAR_ROWS || m->mIsWolf || (gear_built_for(m) && is_ours(x, y))) return;
     GearWorn now = worn_now();
-    bool changed = now.sword != wornBefore.sword || now.shield != wornBefore.shield || now.clothes != wornBefore.clothes;
-    if (changed) {
+    if (now.sword != wornBefore.sword || now.shield != wornBefore.shield || now.clothes != wornBefore.clothes ||
+        now.bare != wornBefore.bare) {
         // new clothes picked while in the sumo outfit: the game's change has put him back in clothes
-        if (now.clothes != wornBefore.clothes && wornBefore.bare) wrBlob("gearClothesOff", 0);
+        if (now.clothes != wornBefore.clothes && wornBefore.bare && now.bare) wrBlob("gearClothesOff", 0);
         return;
     }
-    if (gear_busy()) return;
-    bool lit = cell_lit(m, x, y);
-    if (y == GEAR_CLOTHES && wornBefore.bare) {
+    u8 item = game_cell_item(x, y);
+    if (!item || !m->field_0x22d[x][y] || gear_busy()) return;
+    if (y == GEAR_CLOTHES && now.bare) {
         // back into the clothes he had on (the game thinks they still are, so it did nothing)
-        static const u8 wear[3] = {dItemNo_WEAR_KOKIRI_e, dItemNo_WEAR_ZORA_e, dItemNo_ARMOR_e};
-        bool gameCell = gameLayout && x >= 3 && x <= 5 && m->field_0x22d[x][y] && now.clothes == wear[x - 3];
-        bool thatOne = gameLayout ? gameCell : lit;
-        if (thatOne) put_on(m, y, now.clothes);
+        if (now.clothes == item) put_on(m, y, item);
         return;
     }
-    if (lit && unequip_on()) take_off(m, y);
+    if (unequip_on() && gear_worn(y, item)) take_off(m, y);
 }
 
 static HookAction gear_wait_pre(ModContext*, void* args, void*, void*) {
     auto* m = mods::arg<dMenu_Collect2D_c*>(args, 0);
     gear_build(m);
     if (gear_built_for(m)) fill_gear_column(m);  // every frame, in case another mod reset the grid
+    free_menu_from_sword_timer();
     waitX = m->mCursorX;
     waitY = m->mCursorY;
+    if (m->mpStick) waitStickX = m->mpStick->field_0x0e, waitStickY = m->mpStick->field_0x10;
     wornBefore = worn_now();
     aPressed = dMw_A_TRIGGER();
     if (aPressed && press_ours(m)) {
@@ -5664,7 +5676,7 @@ static void clothes_tick(daAlink_c* lnk) {
         sumoSeen = false;
         return;
     }
-    if (dComIfGp_event_runCheck()) return;
+    if (!outfit_change_ok(lnk)) return;  // once he's somewhere it can be done
     if (sumo_ready()) lnk->setClothesChange(1);
 }
 
@@ -5678,11 +5690,11 @@ static void gear_tick() {
     gearLink = fopAcM_GetID(lnk);
 }
 
-// a sword taken off in the menu while it was out goes away when play picks up again
-static void gear_exec_post(ModContext*, void* args, void*, void*) {
+// A sword taken off in the menu while it was out goes away when play picks up again, before
+// Link's first update, so he never acts on a sword he no longer has.
+static void gear_exec_pre(daAlink_c* lnk) {
     if (!swordPutAway) return;
     swordPutAway = false;
-    auto* lnk = mods::arg<daAlink_c*>(args, 0);
     if (dComIfGs_getSelectEquipSword() == dItemNo_NONE_e && lnk->mEquipItem == 0x103) lnk->deleteEquipItem(FALSE, FALSE);
 }
 
@@ -5957,6 +5969,7 @@ static HookAction link_update_pre(ModContext* ctx, void* args, void* ret, void* 
     exec_pre(ctx, args, ret, user);         // Ice Leaf: summoning, riding, putting it away
     manual_bash_pre(ctx, args, ret, user);  // Manual Shielding: B bash before B can draw the sword
     flourish_before(lnk);                   // Sword Flourish: the kill timer, by setting
+    gear_exec_pre(lnk);                     // Gear: a sword taken off in the menu is put away
     return HOOK_CONTINUE;
 }
 
@@ -5967,7 +5980,6 @@ static void link_update_post(ModContext* ctx, void* args, void* ret, void* user)
     hang_bomb(lnk);                     // Gale-Bomb: a bomb on the boomerang the frame it's thrown
     lantern_swing_burns(lnk);           // Deal Burn with Lantern
     burn_enemies();                     // fire arrows / lantern: whoever's burning
-    gear_exec_post(ctx, args, ret, user);  // Gear: a sword taken off in the menu is put away
 }
 
 static bool add_bool_option(const char* key, bool def, ConfigVarHandle* out) {
