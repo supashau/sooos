@@ -3988,6 +3988,7 @@ static cXyz midnaTalkSpot;   // where she was when Link started talking to her
 static bool midnaTucking;    // picked to transform Link: she's on her way back into his shadow
 static int tuckFrames;       // how long she's been at it (she's never left hanging past a limit)
 static int sinceTalk = 1000; // frames since a talk with her ended
+static int talkStarting;     // frames a talk she was just called for has to get going
 static u32 lastExtButtons;
 static void trail_wanted();  // her flying trail, further down
 
@@ -4228,9 +4229,14 @@ static HookAction midna_exec_pre(ModContext*, void* args, void*, void*) {
         midnaMoving = false;
         midnaTalkSpot = midna->current.pos;
     } else if (midnaPhase == MIDNA_TALKING && !talkingToHer) {
-        midnaPhase = MIDNA_FOLLOWING;
-        sinceTalk = 0;
+        if (talkStarting > 0) {
+            talkStarting--;  // called, but the talk itself hasn't begun yet
+        } else {
+            midnaPhase = MIDNA_FOLLOWING;
+            sinceTalk = 0;
+        }
     }
+    if (talkingToHer) talkStarting = 0;
     if (sinceTalk < 1000) sinceTalk++;
 
     // "Transform" picked from her talk: she zooms back to his feet and dives into his shadow
@@ -4359,7 +4365,7 @@ static bool rideLent;
 
 static HookAction call_her_while_out(ModContext*, void* args, void*, void*) {
     auto* lnk = mods::arg<daAlink_c*>(args, 0);
-    bool out = midnaPhase == MIDNA_FOLLOWING || midnaPhase == MIDNA_RISING;
+    bool out = midnaPhase == MIDNA_FOLLOWING || midnaPhase == MIDNA_RISING || midnaPhase == MIDNA_TALKING;
     if (out && !lnk->checkWolf() && !lnk->checkMidnaRide()) {
         lnk->onMidnaRide();
         rideLent = true;
@@ -4372,6 +4378,46 @@ static void call_her_done(ModContext*, void* args, void*, void*) {
     rideLent = false;
     mods::arg<daAlink_c*>(args, 0)->offMidnaRide();
 }
+
+// Where she shows up for a normal talk (out of his shadow, in front of him, or to his side if
+// there's a wall), the same spot the game works out for that. Going there for the talk means the
+// game's own talk camera frames the two of them just as it always does.
+static cXyz talk_spot(daAlink_c* lnk) {
+    s16 behind = lnk->shape_angle.y + 0x8000;
+    f32 s = cM_ssin(behind), c = cM_scos(behind);
+    cXyz from(lnk->current.pos.x, lnk->current.pos.y + 150.0f, lnk->current.pos.z);
+    cXyz ahead(from.x + 150.0f * cM_ssin(lnk->shape_angle.y), from.y, from.z + 150.0f * cM_scos(lnk->shape_angle.y));
+    cXyz spot = lnk->current.pos;
+    if (fopAcM_lc_c::lineCheck(&from, &ahead, lnk)) {
+        spot.x += 30.0f * s - 65.0f * c;
+        spot.z += 30.0f * c + 65.0f * s;
+    } else {
+        spot.x -= 120.0f * s;
+        spot.z -= 120.0f * c;
+    }
+    spot.y += kMidnaHeight;
+    return spot;
+}
+
+// the Midna button just called her for a talk: she's at the talk spot before the talk begins
+static void call_her_for_talk(ModContext* ctx, void* args, void* retval, void* user) {
+    bool wasOut = rideLent;
+    call_her_done(ctx, args, retval, user);
+    if (!wasOut || !retval || *static_cast<int*>(retval) == 0 || dComIfGp_att_getZHint() != nullptr) return;
+    auto* lnk = mods::arg<daAlink_c*>(args, 0);
+    daMidna_c* midna = daPy_py_c::getMidnaActor();
+    if (!midna || midnaPhase == MIDNA_TALKING || midnaPhase == MIDNA_HIDDEN) return;
+    midnaTalkSpot = midnaSpot = talk_spot(lnk);
+    midna->current.pos = midna->old.pos = midnaSpot;
+    midna->onTagWaitPosWarp(&midnaSpot);
+    midnaPhase = MIDNA_TALKING;
+    midnaMoving = false;
+    talkStarting = 30;
+}
+
+// Midna's choices (warp included) depend on her riding with Link; while she's out beside him
+// they're the same as always
+DEFINE_HOOK(&daAlink_c::checkAcceptWarp, LinkAcceptWarp);
 
 DEFINE_HOOK(&daAlink_c::orderTalk, LinkOrderTalk);
 DEFINE_HOOK(&daAlink_c::orderZTalk, LinkOrderZTalk);
@@ -4650,9 +4696,10 @@ static void midna_follow_init() {
     HookOptions first = HOOK_OPTIONS_INIT;
     first.priority = 100;
     bool talkOk = hooked(mods::hook::add_pre<LinkOrderTalk>(call_her_while_out, &first), "pre") &&
-                  post_hook(LinkOrderTalk, call_her_done) &&
+                  post_hook(LinkOrderTalk, call_her_for_talk) &&
                   hooked(mods::hook::add_pre<LinkOrderZTalk>(call_her_while_out, &first), "pre") &&
-                  post_hook(LinkOrderZTalk, call_her_done);
+                  post_hook(LinkOrderZTalk, call_her_for_talk) &&
+                  pre_hook(LinkAcceptWarp, call_her_while_out) && post_hook(LinkAcceptWarp, call_her_done);
     if (!talkOk) mods::log::warn("Midna can't be talked to while she's out following");
 }
 
@@ -4761,8 +4808,51 @@ static const GearRowInfo kGearRows[GEAR_ROWS] = {
      dItemNo_WEAR_CASUAL_e, 0x193},
 };
 
-// the Ordon Clothes picture in the game's item icon archive
-static const u32 kOrdonClothesIcon = 0x6B;
+// The Ordon Clothes slot's own picture: res/ordoncloth_icon.rgba (256 x 256, 8 bits a channel).
+// The game has no picture for it, so the slot gets a small stand-in texture of our own, and the
+// texture service swaps our picture in wherever that stand-in is drawn. Without the file the slot
+// shows the Hero's Clothes picture.
+static const int kOrdonClothSize = 256;
+static ResourceBuffer ordonClothArt = RESOURCE_BUFFER_INIT;
+static TextureReplacementHandle ordonClothSwap;
+struct alignas(32) StandInTexture {
+    ResTIMG header;
+    u8 texels[8 * 8 * 4];  // 8 x 8 RGBA8, never seen
+};
+static StandInTexture ordonClothTex;
+
+static void load_ordon_cloth_icon() {
+    if (svc_resource->load(mod_ctx, "ordoncloth_icon.rgba", &ordonClothArt) != MOD_OK ||
+        ordonClothArt.size != (size_t)kOrdonClothSize * kOrdonClothSize * 4) {
+        mods::log::warn("ordoncloth_icon.rgba missing or the wrong size, the Ordon Clothes slot shows the Hero's Clothes");
+        return;
+    }
+    ResTIMG& h = ordonClothTex.header;
+    std::memset(&ordonClothTex, 0, sizeof(ordonClothTex));
+    h.format = GX_TF_RGBA8;
+    h.alphaEnabled = 1;
+    h.width = 8;
+    h.height = 8;
+    h.minFilter = GX_LINEAR;
+    h.magFilter = GX_LINEAR;
+    h.mipmapCount = 1;
+    h.imageOffset = (s32)offsetof(StandInTexture, texels);
+
+    TextureKey key = TEXTURE_KEY_INIT;
+    key.kind = TEXTURE_KEY_POINTER;
+    key.pointer = ordonClothTex.texels;
+    TextureData art = TEXTURE_DATA_INIT;
+    art.data = ordonClothArt.data;
+    art.size = ordonClothArt.size;
+    art.width = art.height = kOrdonClothSize;
+    art.gx_format = GX_TF_RGBA8_PC;
+    if (svc_texture->register_data(mod_ctx, &key, &art, &ordonClothSwap) != MOD_OK) {
+        mods::log::warn("couldn't set up the Ordon Clothes picture, the slot shows the Hero's Clothes");
+        ordonClothSwap = 0;
+    }
+}
+
+static ResTIMG* ordon_cloth_texture() { return ordonClothSwap ? &ordonClothTex.header : nullptr; }
 
 struct GearSlot {
     u64 tag;                // our cell's tag, what getItemTag hands out
@@ -4864,6 +4954,9 @@ static void build_gear_slot(dMenu_Collect2D_c* m, int row, CPaneMgr* measure) {
     f32 sy = (stepY != 0.0f && next->getParentPane() == parent) ? localStepY / stepY : sx;
     slot.dx = (targetX - homeAt.x) * sx;
     slot.dy = (targetY - homeAt.y) * sy;
+    mods::log::info("gear row {}: leftmost cell {} ({}), game slot at {:.0f},{:.0f} shown {} (holder shown {}), ours at {:.0f},{:.0f}",
+                    row, left, tag_text(leftPane->mInfoTag), homeAt.x, homeAt.y, home->isVisible(), parent->isVisible(),
+                    targetX, targetY);
 
     // our cell: an empty pane the size of the game's slot, where ours is drawn
     slot.tag = gear_tag(row, 0xFFFF);
@@ -4892,11 +4985,9 @@ static void build_gear_slot(dMenu_Collect2D_c* m, int row, CPaneMgr* measure) {
     for (J2DPane* piece : {slot.ring, slot.keep})
         if (piece && piece->getParentPane() == parent && loose < 2) slot.loose[loose++] = piece;
 
-    if (row == GEAR_CLOTHES) {
-        // the game never shows the Ordon Clothes here, so the picture comes from the item icons;
-        // it sits over the slot's own icon (the Hero's Clothes) and only shows while ours is drawn
-        JKRArchive* icons = dComIfGp_getItemIconArchive();
-        auto* tex = icons ? static_cast<ResTIMG*>(icons->getIdxResource(kOrdonClothesIcon)) : nullptr;
+    if (row == GEAR_CLOTHES && ordon_cloth_texture()) {
+        // our picture sits over the slot's own icon (the Hero's Clothes), only while ours is drawn
+        ResTIMG* tex = ordon_cloth_texture();
         J2DPane* icon = slot.keep;
         if (!icon) {
             // no icon by the expected name: the slot's biggest picture that isn't the ring
@@ -5175,6 +5266,14 @@ static void draw_slot(dMenu_Collect2D_c* m, int row, J2DGrafContext* graf) {
         if (slot.loose[i]) looseX[i] = slot.loose[i]->getTranslateX(), looseY[i] = slot.loose[i]->getTranslateY();
 
     // ours, for one drawing
+    // Another mod may hide the game's slot (and what holds it) to draw its own; ours is drawn at
+    // the menu's own fade either way, not the hidden parent's.
+    bool influenced = home->mIsInfluencedAlpha;
+    u8 alpha = home->getAlpha();
+    J2DPane* next = m->mpScreen->search(kGearRows[row].next);
+    u8 fade = next && next->isVisible() ? next->mColorAlpha : m->mpScreen->mColorAlpha;
+    home->mIsInfluencedAlpha = false;
+    home->setAlpha(fade);
     home->translate(homeX + slot.dx, homeY + slot.dy);
     home->show();
     if (slot.ownIcon) {
@@ -5193,6 +5292,8 @@ static void draw_slot(dMenu_Collect2D_c* m, int row, J2DGrafContext* graf) {
         if (slot.loose[i] && slot.loose[i] != home) slot.loose[i]->draw(0.0f, 0.0f, graf, false, true);
 
     // and back
+    home->mIsInfluencedAlpha = influenced;
+    home->setAlpha(alpha);
     home->translate(homeX, homeY);
     set_shown(home, homeShown);
     set_shown(slot.keep, keepShown);
@@ -5536,10 +5637,37 @@ static void clothes_tick(daAlink_c* lnk) {
         return;
     }
     sumo_ready();  // start loading early, so taking them off works right away
-    if (!bare || lnk->checkWolf() || dComIfGp_event_runCheck()) return;
-    if (lnk->checkNoResetFlg2(daPy_py_c::FLG2_UNK_80000) || lnk->checkNoResetFlg2(daPy_py_c::FLG2_UNK_200000)) return;
-    if (lnk->getClothesChangeWaitTimer() != 0) return;
-    if (lnk->mProcID == daAlink_c::PROC_METAMORPHOSE || lnk->mProcID == daAlink_c::PROC_METAMORPHOSE_ONLY) return;
+
+    // The sumo outfit is put back on whenever Link is rebuilt in clothes (a new area, back from
+    // the wolf). If it comes off any other way (clothes picked in the menu, by us or by another
+    // mod), that's the clothes going back on, and it stays that way.
+    static fpc_ProcID sumoLink = fpcM_ERROR_PROCESS_ID_e;
+    static bool sumoSeen, rebuilt;
+    fpc_ProcID me = fopAcM_GetID(lnk);
+    if (!bare) {
+        sumoSeen = false;
+        sumoLink = me;
+        return;
+    }
+    if (me != sumoLink) sumoLink = me, sumoSeen = false, rebuilt = true;
+    bool changing = lnk->getClothesChangeWaitTimer() != 0 || lnk->checkMetamorphose() ||
+                    lnk->mProcID == daAlink_c::PROC_METAMORPHOSE || lnk->mProcID == daAlink_c::PROC_METAMORPHOSE_ONLY;
+    if (lnk->checkWolf()) {
+        rebuilt = true;  // he'll come back as human Link in clothes
+        sumoSeen = false;
+        return;
+    }
+    bool inSumo = lnk->checkNoResetFlg2(daPy_py_c::FLG2_UNK_80000) || lnk->checkNoResetFlg2(daPy_py_c::FLG2_UNK_200000);
+    if (inSumo || changing) {
+        if (inSumo) sumoSeen = true, rebuilt = false;
+        return;
+    }
+    if (sumoSeen && !rebuilt) {
+        wrBlob("gearClothesOff", 0);  // dressed again by something else
+        sumoSeen = false;
+        return;
+    }
+    if (dComIfGp_event_runCheck()) return;
     if (sumo_ready()) lnk->setClothesChange(1);
 }
 
@@ -5578,6 +5706,7 @@ static void gear_init() {
     add_bool_option("ordonShieldSlot", true, &vOrdonShieldSlot);
     add_bool_option("alwaysOrdonShield", false, &vAlwaysOrdonShield);
     add_bool_option("ordonClothesSlot", true, &vOrdonClothesSlot);
+    load_ordon_cloth_icon();
 
     // any one of these is enough to get the slots onto the screen
     int seen = post_hook(CollectScreenSet, gear_screen_post) + post_hook(CollectCreate, gear_screen_post);
@@ -5599,6 +5728,9 @@ static void gear_init() {
 
 static void gear_shutdown() {
     auto* lnk = (daAlink_c*)dComIfGp_getPlayer(0);
+    if (ordonClothSwap) svc_texture->unregister(mod_ctx, ordonClothSwap);
+    ordonClothSwap = 0;
+    if (ordonClothArt.data) svc_resource->free(mod_ctx, &ordonClothArt);
     if (tableShield != fpcM_ERROR_PROCESS_ID_e) {
         if (fopAc_ac_c* shield = fopAcM_SearchByID(tableShield)) fopAcM_delete(shield);
         tableShield = fpcM_ERROR_PROCESS_ID_e;
