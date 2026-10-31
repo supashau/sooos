@@ -20,48 +20,46 @@
 #include "mods/svc/texture.h"
 #include "mods/svc/ui.h"
 
+#include "JSystem/J2DGraph/J2DPicture.h"
+#include "JSystem/J2DGraph/J2DScreen.h"
 #include "JSystem/J2DGraph/J2DTextBox.h"
 #include "JSystem/J3DGraphBase/J3DMaterial.h"
+#include "JSystem/JKernel/JKRExpHeap.h"
 #include "JSystem/JMessage/control.h"
 #include "JSystem/JParticle/JPAEmitter.h"
+#include "JSystem/JParticle/JPAEmitterManager.h"
+#include "JSystem/JParticle/JPAResourceManager.h"
 #include "JSystem/JUtility/JUTFont.h"
+#include "JSystem/JUtility/JUTGamePad.h"
+#include "JSystem/JUtility/JUTTexture.h"
+#include "dolphin/dvd.h"
 #include "d/actor/d_a_alink.h"
 #include "d/actor/d_a_arrow.h"
 #include "d/actor/d_a_bg.h"
 #include "d/actor/d_a_bg_obj.h"
 #include "d/actor/d_a_boomerang.h"
 #include "d/actor/d_a_horse.h"
-#include "d/actor/d_a_midna.h"
-#include "JSystem/JUtility/JUTGamePad.h"
-#include "JSystem/JKernel/JKRExpHeap.h"
-#include "JSystem/JParticle/JPAEmitterManager.h"
-#include "JSystem/JParticle/JPAResourceManager.h"
-#include "d/d_particle.h"
-#include "m_Do/m_Do_dvd_thread.h"
-#include "dolphin/dvd.h"
-#include "m_Do/m_Do_graphic.h"
 #include "d/actor/d_a_kytag08.h"
+#include "d/actor/d_a_midna.h"
 #include "d/actor/d_a_nbomb.h"
 #include "d/actor/d_a_obj_iceleaf.h"
 #include "d/actor/d_a_tag_shop_item.h"
+#include "d/d_a_item_static.h"
 #include "d/d_a_shop_item_static.h"
 #include "d/d_bomb.h"
+#include "d/d_cc_d.h"
 #include "d/d_cc_uty.h"
 #include "d/d_com_inf_game.h"
 #include "d/d_item_data.h"
-#include "d/d_kantera_icon_meter.h"
 #include "d/d_kankyo.h"
-#include "d/d_cc_d.h"
+#include "d/d_kantera_icon_meter.h"
+#include "d/d_lib.h"
 #include "d/d_map_path_dmap.h"
+#include "d/d_menu_collect.h"
 #include "d/d_menu_fmap_map.h"
 #include "d/d_menu_item_explain.h"
 #include "d/d_menu_ring.h"
-#include "d/d_menu_collect.h"
 #include "d/d_menu_window.h"
-#include "d/d_a_item_static.h"
-#include "JSystem/J2DGraph/J2DPicture.h"
-#include "JSystem/J2DGraph/J2DScreen.h"
-#include "JSystem/JUtility/JUTTexture.h"
 #include "d/d_meter2.h"
 #include "d/d_meter2_draw.h"
 #include "d/d_meter2_info.h"
@@ -71,7 +69,9 @@
 #include "d/d_msg_object.h"
 #include "d/d_msg_string_base.h"
 #include "d/d_pane_class.h"
+#include "d/d_particle.h"
 #include "d/d_save.h"
+#include "d/d_select_cursor.h"
 #include "d/d_shop_system.h"
 #include "d/d_stage.h"
 #include "f_op/f_op_actor_mng.h"
@@ -80,7 +80,9 @@
 #include "f_pc/f_pc_name.h"
 #include "m_Do/m_Do_audio.h"
 #include "m_Do/m_Do_controller_pad.h"
+#include "m_Do/m_Do_dvd_thread.h"
 #include "m_Do/m_Do_ext.h"
+#include "m_Do/m_Do_graphic.h"
 
 DEFINE_MOD();
 IMPORT_SERVICE(LogService, svc_log);
@@ -160,16 +162,52 @@ static bool stage_is(const char* s) {
     return cur && !strcmp(cur, s);
 }
 
+// Settings are read a lot (many of them every frame), so each one's value is kept here: read from
+// the config service the first time it's asked for, then kept current by a change notice.
+struct CachedSetting {
+    ConfigVarHandle var;  // 0 = empty slot
+    int64_t value;
+};
+static const int kSettingSlots = 256;  // comfortably more than the mod registers
+static CachedSetting settingCache[kSettingSlots];
+
+static CachedSetting* setting_slot(ConfigVarHandle v) {
+    u32 at = (u32)((v * 0x9E3779B97F4A7C15ull) >> 56);
+    for (int probe = 0; probe < kSettingSlots; probe++, at = (at + 1) % kSettingSlots)
+        if (settingCache[at].var == v || settingCache[at].var == 0) return &settingCache[at];
+    return nullptr;
+}
+
+static void setting_changed(ModContext*, ConfigVarHandle v, const ConfigVarValue* value, const ConfigVarValue*, void*) {
+    CachedSetting* slot = setting_slot(v);
+    if (!slot || slot->var != v || !value) return;
+    slot->value = value->type == CONFIG_VAR_BOOL ? (value->bool_value ? 1 : 0) : value->int_value;
+}
+
+static int64_t setting(ConfigVarHandle v, bool isBool, int64_t fallback) {
+    CachedSetting* slot = setting_slot(v);
+    if (slot && slot->var == v) return slot->value;
+    int64_t value = fallback;
+    if (isBool) {
+        bool on = fallback != 0;
+        if (svc_config->get_bool(mod_ctx, v, &on) == MOD_OK) value = on ? 1 : 0;
+    } else {
+        svc_config->get_int(mod_ctx, v, &value);
+    }
+    // only kept once it's sure to hear about changes; otherwise it's asked for every time
+    if (slot && svc_config->subscribe(mod_ctx, v, setting_changed, nullptr, nullptr) == MOD_OK) {
+        slot->var = v;
+        slot->value = value;
+    }
+    return value;
+}
+
 static bool cfgOn(ConfigVarHandle v, bool fallback = true) {
-    bool on = fallback;
-    if (v) svc_config->get_bool(mod_ctx, v, &on);
-    return on;
+    return v ? setting(v, true, fallback ? 1 : 0) != 0 : fallback;
 }
 
 static int cfgInt(ConfigVarHandle v, int def) {
-    int64_t val = def;
-    if (v) svc_config->get_int(mod_ctx, v, &val);
-    return (int)val;
+    return v ? (int)setting(v, false, def) : def;
 }
 
 static bool real_flag(u16 bit) {
@@ -811,6 +849,10 @@ static void bridge_tick() {
 
     bool wanted = bridge_jump_wanted();
     if (!wanted && bridgeRooms == 0) return;  // nothing to add or take away
+    // rooms load and unload over many frames, so a look every few frames is plenty
+    static int lookIn;
+    if (lookIn-- > 0) return;
+    lookIn = 8;
     for (int room = 0; room < 64; room++) {
         bool done = (bridgeRooms >> room) & 1;
         void* file = room_file(room);
@@ -830,7 +872,7 @@ static void bridge_tick() {
 DEFINE_HOOK(&daAlink_c::execute, Exec);
 DEFINE_HOOK(&daAlink_c::checkNewItemChange, NewItem);
 DEFINE_HOOK(&daAlink_c::checkSnowCode, SnowCode);
-DEFINE_HOOK(&daAlink_c::setStickData, Stick);
+DEFINE_HOOK(&daAlink_c::setStickData, StickData);
 DEFINE_HOOK(&dSv_player_item_c::setLineUpItem, LineUp);
 DEFINE_HOOK(&dMeter2Info_c::readItemTexture, ReadTex);
 // item-get text box, by name like the two below; arg 1 is the message id
@@ -1055,8 +1097,7 @@ static HookAction exec_pre(ModContext*, void* args, void*, void*) {
         }
     }
 
-    bool always = false;
-    if (vAlways) svc_config->get_bool(mod_ctx, vAlways, &always);
+    bool always = cfgOn(vAlways, false);
 
     // snowpeak slide ends -> the game's own leaf is deleted while we were on it
     fopAc_ac_c* board = link->mRideAcKeep.getActor();
@@ -1204,10 +1245,9 @@ static void exec_post(ModContext*, void* args, void*, void*) {
             if (dComIfGp_getSelectItem(btn) == leafItem) link->field_0x2faf |= (u8)(1 << btn);
     if (!out() || mounting || !link->checkBoardRide() || !mDoCPd_c::getHoldR(PAD_1)) return;
 
-    bool on = false;
-    if (vBoost) svc_config->get_bool(mod_ctx, vBoost, &on);
+    if (!cfgOn(vBoost, false)) return;
     f32 sp = link->mNormalSpeed + 2.5f;
-    if (on) link->mNormalSpeed = sp > 75.0f ? 75.0f : sp;
+    link->mNormalSpeed = sp > 75.0f ? 75.0f : sp;
 }
 
 static HookAction msgbegin_pre(ModContext*, void* args, void*, void*) {
@@ -2282,14 +2322,6 @@ static void flourish_after(daAlink_c* lnk) {
     if (cfgInt(flourishOption, FLOURISH_DEFAULT) == FLOURISH_OFF) lnk->mSwordFlourishTimer = 0;
 }
 
-static HookAction flourish_exec_pre(ModContext*, void* args, void*, void*) {
-    flourish_before(mods::arg<daAlink_c*>(args, 0));
-    return HOOK_CONTINUE;
-}
-
-static void flourish_exec_post(ModContext*, void* args, void*, void*) {
-    flourish_after(mods::arg<daAlink_c*>(args, 0));
-}
 
 // ======================== Mortal Draw Hand Anim ========================
 
@@ -3001,8 +3033,10 @@ static f32 distance_to_body(const cXyz& at, fopAc_ac_c* actor) {
     return at.abs(nearest);
 }
 
+// the fire: one spot, or a few along an arrow's path, all checked in a single pass over the actors
 struct FireNearby {
-    cXyz at;
+    const cXyz* at;
+    int spots;
     f32 reach;
     bool lit;
     BurningArrow* arrow;  // an arrow's fire only notes who it brushed (see confirm_brushed)
@@ -3031,14 +3065,16 @@ static void* catch_fire_nearby(void* actor, void* data) {
     auto* ac = static_cast<fopAc_ac_c*>(actor);
     auto* fire = static_cast<FireNearby*>(data);
     if (fopAcM_GetGroup(ac) != fopAc_ENEMY_e) return nullptr;
-    if (distance_to_body(fire->at, ac) > fire->reach) return nullptr;
+    bool reached = false;
+    for (int i = 0; i < fire->spots && !reached; i++) reached = distance_to_body(fire->at[i], ac) <= fire->reach;
+    if (!reached) return nullptr;
     if (fire->arrow) note_brushed(*fire->arrow, fopAcM_GetID(ac));
     else if (set_on_fire(ac)) fire->lit = true;
     return nullptr;
 }
 
-static bool set_fire_around(const cXyz& at, f32 reach, BurningArrow* arrow = nullptr) {
-    FireNearby fire = {at, reach, false, arrow};
+static bool set_fire_around(const cXyz* at, int spots, f32 reach, BurningArrow* arrow = nullptr) {
+    FireNearby fire = {at, spots, reach, false, arrow};
     fopAcIt_Judge(catch_fire_nearby, &fire);
     return fire.lit;
 }
@@ -3082,14 +3118,10 @@ static void lantern_swing_burns(daAlink_c* link) {
     if (!cfgOn(vLanternBurn) || link->mProcID != daAlink_c::PROC_KANDELAAR_SWING) return;
     if (!link->mAtSph.ChkAtSet()) return;
     lightingFromLantern = true;
-    set_fire_around(link->mKandelaarFlamePos, link->mAtSph.GetR() + 30.0f);
+    set_fire_around(&link->mKandelaarFlamePos, 1, link->mAtSph.GetR() + 30.0f);
     lightingFromLantern = false;
 }
 
-static void burn_post(ModContext*, void* args, void*, void*) {
-    lantern_swing_burns(mods::arg<daAlink_c*>(args, 0));
-    burn_enemies();
-}
 
 static void arrow_post(ModContext*, void* args, void*, void*) {
     auto* arrow = mods::arg<daArrow_c*>(args, 0);
@@ -3154,10 +3186,9 @@ static void arrow_post(ModContext*, void* args, void*, void*) {
     cXyz ahead = tip;
     if (flying) ahead = tip + (tip - f.lastTip) * 1.5f;
     if (flying) {
-        for (int step = 0; step <= 4; step++) {
-            cXyz along = f.lastTip + (ahead - f.lastTip) * (step / 4.0f);
-            set_fire_around(along, kFireReach + 20.0f, &f);
-        }
+        cXyz along[5];
+        for (int step = 0; step <= 4; step++) along[step] = f.lastTip + (ahead - f.lastTip) * (step / 4.0f);
+        set_fire_around(along, 5, kFireReach + 20.0f, &f);
     }
     // Whatever the arrow itself hits burns too (another player, say, that the fire somehow missed),
     // unless it was a shield it hit; the fire's brushes get lit once no block has come in.
@@ -3287,9 +3318,6 @@ static void hang_bomb(daAlink_c* link) {
     static_cast<daNbomb_c*>(bomb)->procBoomerangMoveInit(nullptr);
 }
 
-static void galebomb_exec_post(ModContext*, void* args, void*, void*) {
-    hang_bomb(mods::arg<daAlink_c*>(args, 0));
-}
 
 // A new HUD (after a warp, a load or a stage change) starts blank: nothing on it is drawn as a
 // combination yet, and the bomb count needs writing again.
@@ -3464,9 +3492,9 @@ static HookAction manual_bash_pre(ModContext*, void* args, void*, void*) {
     return HOOK_CONTINUE;
 }
 
-// While shielding, B belongs to the shield. Link reads his buttons once a frame here, so B is taken
-// off before anything else sees it: no sword drawn from the sheath mid-bash, no swing or charge.
-DEFINE_HOOK(&daAlink_c::setStickData, StickData);
+// While shielding, B belongs to the shield. Link reads his buttons once a frame (setStickData), so
+// B is taken off before anything else sees it: no sword drawn from the sheath mid-bash, no swing or
+// charge.
 
 static void shield_keeps_b(ModContext*, void* args, void*, void*) {
     auto* lnk = mods::arg<daAlink_c*>(args, 0);
@@ -3753,7 +3781,6 @@ static void unarmed_init() {
 
     int lost = 0;
     lost += !post_hook(CheckItemAction, item_action_post);
-    lost += !pre_hook(Exec, manual_bash_pre);
     lost += !pre_hook(GuardAttackInit, guard_attack_pre);
     lost += !pre_hook(CutTurnInit, no_spin_while_shielding);
     lost += !post_hook(StickData, shield_keeps_b);
@@ -3947,7 +3974,7 @@ DEFINE_HOOK(&daMidna_c::checkMidnaPosState, MidnaPos);
 DEFINE_HOOK(&daMidna_c::setAnm, MidnaAnm);
 DEFINE_HOOK(&daMidna_c::setMidnaNoDrawFlg, MidnaNoDraw);
 
-enum MidnaPhase { MIDNA_HIDDEN, MIDNA_RISING, MIDNA_FOLLOWING, MIDNA_LEAVING, MIDNA_DIVING };
+enum MidnaPhase { MIDNA_HIDDEN, MIDNA_RISING, MIDNA_FOLLOWING, MIDNA_TALKING, MIDNA_LEAVING, MIDNA_DIVING };
 static MidnaPhase midnaPhase = MIDNA_HIDDEN;
 static bool midnaWanted;     // L3 has called her out (she may still be away for a cutscene)
 static bool midnaMoving;     // flying to catch up, rather than hanging in place
@@ -3956,6 +3983,10 @@ static bool midnaShowsReal;     // her real body is what's actually drawn
 static s16 midnaFacing;      // where she looks while hanging in place
 static cXyz midnaGoal;       // where she's flying to
 static cXyz midnaSpot;       // the spot we're steering her wait mode to this frame
+static cXyz midnaTalkSpot;   // where she was when Link started talking to her
+static bool midnaTucking;    // picked to transform Link: she's on her way back into his shadow
+static int tuckFrames;       // how long she's been at it (she's never left hanging past a limit)
+static int sinceTalk = 1000; // frames since a talk with her ended
 static u32 lastExtButtons;
 static void trail_wanted();  // her flying trail, further down
 
@@ -4131,11 +4162,15 @@ static void midna_hide_now(daMidna_c* midna) {
     midnaShadowForced = false;
     midnaPhase = MIDNA_HIDDEN;
     midnaMoving = false;
+    midnaTucking = false;
 }
+
+static void hook_midna_trail(bool out);  // with her trail, further down
 
 static void midna_follow_tick() {
     auto* lnk = (daAlink_c*)dComIfGp_getPlayer(0);
     bool pressed = l3_pressed();
+    hook_midna_trail(midnaWanted || midnaPhase != MIDNA_HIDDEN);
     if (!lnk) return;
     if (pressed) {
         if (midnaWanted) {
@@ -4150,6 +4185,7 @@ static void midna_follow_tick() {
         midnaWanted = false;
         midna_hide_now(daPy_py_c::getMidnaActor());
     }
+    hook_midna_trail(midnaWanted || midnaPhase != MIDNA_HIDDEN);
 }
 
 // steps the spot from where she is toward where she's going, at Link's pace
@@ -4182,7 +4218,36 @@ static HookAction midna_exec_pre(ModContext*, void* args, void*, void*) {
         if (ourBody.body) free_midna_body();
     }
 
-    if (!midna_allowed(lnk) || midna->mDemoMode != 0) {
+    // Talking to her while she's out: she stays where she is, and she and Link face each other.
+    // When the talk is over she just carries on following.
+    bool talkingToHer = midnaPhase != MIDNA_HIDDEN && dComIfGp_event_runCheck() &&
+                        fopAcM_getTalkEventPartner(lnk) == midna;
+    if (talkingToHer && midnaPhase != MIDNA_TALKING && !midnaTucking) {
+        midnaPhase = MIDNA_TALKING;
+        midnaMoving = false;
+        midnaTalkSpot = midna->current.pos;
+    } else if (midnaPhase == MIDNA_TALKING && !talkingToHer) {
+        midnaPhase = MIDNA_FOLLOWING;
+        sinceTalk = 0;
+    }
+    if (sinceTalk < 1000) sinceTalk++;
+
+    // "Transform" picked from her talk: she zooms back to his feet and dives into his shadow
+    // while he changes, instead of just vanishing
+    bool fromTalk = midnaPhase == MIDNA_TALKING || sinceTalk < 30;
+    if (!midnaTucking && midnaPhase != MIDNA_HIDDEN && fromTalk && (lnk->checkMetamorphose() || midna->mDemoMode == 0xF)) {
+        midnaTucking = true;
+        tuckFrames = 0;
+        midnaWanted = false;
+        midnaPhase = MIDNA_LEAVING;
+        midnaMoving = true;
+    }
+    if (midnaTucking && ++tuckFrames > 120) {
+        midna_hide_now(midna);
+        return HOOK_CONTINUE;
+    }
+
+    if (!midnaTucking && midnaPhase != MIDNA_TALKING && (!midna_allowed(lnk) || midna->mDemoMode != 0)) {
         midna_hide_now(midna);  // she comes back up after the cutscene if she's still wanted
         return HOOK_CONTINUE;
     }
@@ -4204,7 +4269,7 @@ static HookAction midna_exec_pre(ModContext*, void* args, void*, void*) {
             lend_body(lnk);
         }
         return HOOK_CONTINUE;
-    } else if (!midnaWanted && midnaPhase != MIDNA_LEAVING && midnaPhase != MIDNA_DIVING) {
+    } else if (!midnaWanted && midnaPhase != MIDNA_LEAVING && midnaPhase != MIDNA_DIVING && midnaPhase != MIDNA_TALKING) {
         midnaPhase = MIDNA_LEAVING;
         midnaMoving = true;
     }
@@ -4237,6 +4302,9 @@ static HookAction midna_exec_pre(ModContext*, void* args, void*, void*) {
             midnaSpot = midna->current.pos;
         }
         break;
+    case MIDNA_TALKING:
+        midnaSpot = midnaTalkSpot;
+        break;
     case MIDNA_LEAVING: {
         // going back she zooms in, much faster than Link, so she never trails after him to get there
         cXyz feet = lnk->current.pos;
@@ -4267,12 +4335,52 @@ static void midna_exec_post(ModContext*, void*, void*, void*) {
     if (auto* lnk = (daAlink_c*)dComIfGp_getPlayer(0)) take_body_back(lnk);
 }
 
+// Link turns to face her for the talk
+static void link_faces_midna(ModContext*, void* args, void*, void*) {
+    if (midnaPhase != MIDNA_TALKING) return;
+    auto* lnk = mods::arg<daAlink_c*>(args, 0);
+    daMidna_c* midna = daPy_py_c::getMidnaActor();
+    if (!midna) return;
+    cXyz to = midna->current.pos - lnk->current.pos;
+    if (to.absXZ() < 1.0f) return;
+    s16 face = lnk->shape_angle.y;
+    cLib_addCalcAngleS(&face, cM_atan2s(to.x, to.z), 4, 0x1000, 0x100);
+    lnk->shape_angle.y = lnk->current.angle.y = face;
+}
+
+// The Midna button only works while she rides in his shadow; while she's out beside him it
+// calls her the same way, for just the check that asks.
+static bool rideLent;
+
+static HookAction call_her_while_out(ModContext*, void* args, void*, void*) {
+    auto* lnk = mods::arg<daAlink_c*>(args, 0);
+    bool out = midnaPhase == MIDNA_FOLLOWING || midnaPhase == MIDNA_RISING;
+    if (out && !lnk->checkWolf() && !lnk->checkMidnaRide()) {
+        lnk->onMidnaRide();
+        rideLent = true;
+    }
+    return HOOK_CONTINUE;
+}
+
+static void call_her_done(ModContext*, void* args, void*, void*) {
+    if (!rideLent) return;
+    rideLent = false;
+    mods::arg<daAlink_c*>(args, 0)->offMidnaRide();
+}
+
+DEFINE_HOOK(&daAlink_c::orderTalk, LinkOrderTalk);
+DEFINE_HOOK(&daAlink_c::orderZTalk, LinkOrderZTalk);
+
 // The game moves her toward her wait spot at no more than 30 units a frame, slower than a sprint
 // (or a mod's speed). Her pace is ours to set, so she's put on this frame's spot before it moves
 // her: she's always exactly where her pace and the leash put her.
 static HookAction midna_pos_pre(ModContext*, void* args, void*, void*) {
     auto* midna = mods::arg<daMidna_c*>(args, 0);
-    if (midnaPhase == MIDNA_HIDDEN || !midna->checkStateFlg0(daMidna_c::FLG0_TAG_WAIT)) return HOOK_CONTINUE;
+    if (midnaPhase == MIDNA_HIDDEN) return HOOK_CONTINUE;
+    // a talk with her ends the game's wait mode; we keep her in it, floating where she is
+    bool ours = midnaPhase == MIDNA_TALKING || midnaTucking;
+    if (ours && !midna->checkStateFlg0(daMidna_c::FLG0_TAG_WAIT)) midna->onTagWaitPos(&midnaSpot);
+    if (!midna->checkStateFlg0(daMidna_c::FLG0_TAG_WAIT)) return HOOK_CONTINUE;
     midna->current.pos = midnaSpot;
     return HOOK_CONTINUE;
 }
@@ -4285,7 +4393,11 @@ static void midna_pos_post(ModContext*, void* args, void*, void*) {
     auto* lnk = (daAlink_c*)dComIfGp_getPlayer(0);
     if (!lnk) return;
     s16 want = lnk->shape_angle.y;  // hanging in place: look where Link looks
-    if (midnaMoving) {
+    if (midnaPhase == MIDNA_TALKING) {
+        // in a talk: turned to Link, looking him in the eye
+        want = cM_atan2s(lnk->current.pos.x - midna->current.pos.x, lnk->current.pos.z - midna->current.pos.z);
+        midna->setForceNeckAimPos(lnk->eyePos);
+    } else if (midnaMoving) {
         midna->offStateFlg0(daMidna_c::FLG0_UNK_200);
         // flying: turn toward where she's headed (straight up or down keeps her facing as is)
         cXyz to = midnaGoal - midna->current.pos;
@@ -4529,8 +4641,26 @@ static void midna_follow_init() {
               pre_hook(MidnaDraw, real_body_for_drawing) && post_hook(MidnaDraw, shadow_form_after_drawing) &&
               pre_hook(LinkShadowDraw, real_body_for_drawing) && post_hook(LinkShadowDraw, shadow_form_after_drawing);
     if (!ok) mods::log::warn("L3 Midna Follow won't work");
-    bool trailOk = pre_hook(KeyedParticleSet, particle_set_pre) && post_hook(KeyedParticleSet, particle_set_post);
-    if (!trailOk) mods::log::warn("Midna's flying trail stays as each area has it");
+    bool talkOk = pre_hook(LinkOrderTalk, call_her_while_out) &&
+                  post_hook(LinkOrderTalk, call_her_done) && pre_hook(LinkOrderZTalk, call_her_while_out) &&
+                  post_hook(LinkOrderZTalk, call_her_done);
+    if (!talkOk) mods::log::warn("Midna can't be talked to while she's out following");
+}
+
+// Every particle the game makes goes through that call, so the trail's hooks are only on it while
+// Midna is called out (from the frame she's called, before she can fly).
+static bool trailHooked;
+
+static void hook_midna_trail(bool out) {
+    if (out == trailHooked) return;
+    if (out) {
+        if (!(pre_hook(KeyedParticleSet, particle_set_pre) && post_hook(KeyedParticleSet, particle_set_post)))
+            mods::log::warn("Midna's flying trail stays as each area has it");
+    } else {
+        mods::hook::uninstall<KeyedParticleSet>();
+        lendingTrail = false;
+    }
+    trailHooked = out;
 }
 
 // ======================== Dialogue Correction ========================
@@ -4576,239 +4706,22 @@ static void dialogue_tick() {
     }
 }
 
-// ======================== Bonus Items (Experimental) ========================
-// A rebuild of the Bonus Inventory Wheel idea: extra items Link can put on from a menu, opened by
-// clicking the right stick (R3) as human Link. Each item can be switched off on the Experimental
-// page, which also takes it off. (D-pad Down stays the game's own item wheel.)
-//
-// - Hover Boots: walking off a ledge, Link floats level for a moment before he drops.
-// - Lens of Truth: wolf senses as human Link (Poes, ghost rats, scents and dig spots show).
-// - Stone Mask: enemies can't see Link, as if he weren't there.
-// - Ocarina: sets the time of day, and the rain, on the spot.
-
-static ConfigVarHandle vBonusMenu, vHoverBoots, vLensOfTruth, vStoneMask, vOcarina;
-static bool add_bool_option(const char* key, bool def, ConfigVarHandle* out);  // with the settings, below
-
-static bool hoverOn, lensOn, maskOn;  // what Link has on right now (from the menu)
-static u32 bonusLastExt;
-
-static bool bonus_has(ConfigVarHandle item) { return cfgOn(vBonusMenu, false) && cfgOn(item, true); }
-
-// --- Hover Boots ---
-static const int kHoverFrames = 40;  // about a second and a third of floating
-static int hoverFor;
-static f32 hoverHeight;
-
-static void hover_boots(daAlink_c* lnk) {
-    if (!hoverOn || !bonus_has(vHoverBoots) || lnk->checkWolf()) return;
-    if (lnk->mLinkAcch.ChkGroundHit()) {
-        hoverFor = 0;
-        hoverHeight = lnk->current.pos.y;
-        return;
-    }
-    // only the drop from walking off an edge, not jumps, climbs, swims or being knocked back
-    if (lnk->mProcID != daAlink_c::PROC_FALL || hoverFor >= kHoverFrames || lnk->speed.y > 0.0f) return;
-    hoverFor++;
-    lnk->speed.y = 0.0f;
-    lnk->current.pos.y = hoverHeight;
-}
-
-// --- Lens of Truth ---
-// The game keeps the wolf's senses up once they're on, whatever form Link is in; human Link just
-// never has a way to turn them on.
-static bool lensWasOn;
-
-static void lens_of_truth(daAlink_c* lnk) {
-    bool want = lensOn && bonus_has(vLensOfTruth) && !lnk->checkWolf();
-    if (want && !lnk->checkWolfEyeUp()) lnk->onWolfEyeUp();
-    if (!want && lensWasOn && !lnk->checkWolf()) lnk->offWolfEyeUp();
-    lensWasOn = want;
-}
-
-static void bonus_exec_post(ModContext*, void* args, void*, void*) {
-    auto* lnk = mods::arg<daAlink_c*>(args, 0);
-    hover_boots(lnk);
-    lens_of_truth(lnk);
-}
-
-// --- Stone Mask ---
-// Enemies size Link up through a handful of the game's "how far / which way is that actor" helpers;
-// while the mask is on, an enemy asking about Link gets "far away, behind you".
-DEFINE_HOOK(&fopAcM_searchActorDistance, ActorDistance);
-DEFINE_HOOK(&fopAcM_searchActorDistance2, ActorDistance2);
-DEFINE_HOOK(&fopAcM_searchActorDistanceXZ, ActorDistanceXZ);
-DEFINE_HOOK(&fopAcM_searchActorDistanceXZ2, ActorDistanceXZ2);
-DEFINE_HOOK(&fopAcM_seenActorAngleY, SeenAngle);
-
-static const f32 kUnseenDistance = 100000.0f;
-
-static bool enemy_looking_for_link(void* args) {
-    if (!maskOn || !bonus_has(vStoneMask)) return false;
-    auto* looker = mods::arg<const fopAc_ac_c*>(args, 0);
-    auto* target = mods::arg<const fopAc_ac_c*>(args, 1);
-    fopAc_ac_c* link = dComIfGp_getPlayer(0);
-    return looker && link && target == link && fopAcM_GetGroup(looker) == fopAc_ENEMY_e && !daPy_py_c::checkNowWolf();
-}
-
-static void unseen_distance(ModContext*, void* args, void* retval, void*) {
-    if (retval && enemy_looking_for_link(args)) *static_cast<f32*>(retval) = kUnseenDistance;
-}
-
-static void unseen_distance_squared(ModContext*, void* args, void* retval, void*) {
-    if (retval && enemy_looking_for_link(args)) *static_cast<f32*>(retval) = kUnseenDistance * kUnseenDistance;
-}
-
-static void unseen_angle(ModContext*, void* args, void* retval, void*) {
-    if (retval && enemy_looking_for_link(args)) *static_cast<s32*>(retval) = 0x7FFF;  // right behind them
-}
-
-// --- Ocarina: time and rain ---
-// the game's day runs 0 to 360, 15 to the hour
-static const f32 kTimes[4] = {90.0f, 180.0f, 270.0f, 0.0f};
-static const char* const kTimeNames[4] = {"Dawn (6:00)", "Noon (12:00)", "Dusk (18:00)", "Midnight (0:00)"};
-
-static void set_time_of_day(ModContext*, void* which) {
-    if (!bonus_has(vOcarina)) return;
-    dKy_instant_timechg(kTimes[reinterpret_cast<intptr_t>(which)]);
-}
-
-static void set_rain(bool on) {
-    if (on) {
-        dKy_instant_rainchg();
-    } else {
-        dKyw_rain_set(0);
-        g_env_light.mColpatWeather = 0;
-        g_env_light.wether_pat0 = 0;
-        g_env_light.wether_pat1 = 0;
-    }
-}
-
-static void rain_on(ModContext*, void*) { if (bonus_has(vOcarina)) set_rain(true); }
-static void rain_off(ModContext*, void*) { if (bonus_has(vOcarina)) set_rain(false); }
-
-// --- the menu ---
-struct BonusItem {
-    const char* name;
-    ConfigVarHandle* allowed;
-    bool* worn;
-};
-static const BonusItem kBonusItems[] = {
-    {"Hover Boots", &vHoverBoots, &hoverOn},
-    {"Lens of Truth", &vLensOfTruth, &lensOn},
-    {"Stone Mask", &vStoneMask, &maskOn},
-};
-
-static void worn_get(ModContext*, void* item, UiControlValue* out) {
-    out->bool_value = *static_cast<const BonusItem*>(item)->worn;
-}
-
-static void worn_set(ModContext*, void* item, const UiControlValue* value) {
-    auto* it = static_cast<const BonusItem*>(item);
-    *it->worn = value->bool_value && bonus_has(*it->allowed);
-}
-
-static bool item_unavailable(ModContext*, void* item) {
-    return !bonus_has(*static_cast<const BonusItem*>(item)->allowed);
-}
-
-static bool ocarina_unavailable(ModContext*, void*) { return !bonus_has(vOcarina); }
-
-static ModResult bonus_items_tab(ModContext*, UiWindowHandle, UiElementHandle pane, UiElementHandle, void*, ModError*) {
-    for (const BonusItem& item : kBonusItems) {
-        UiControlDesc row = UI_CONTROL_DESC_INIT;
-        row.kind = UI_CONTROL_TOGGLE;
-        row.label = item.name;
-        row.binding = UI_BINDING_CALLBACKS;
-        row.get = worn_get;
-        row.set = worn_set;
-        row.is_disabled = item_unavailable;
-        row.user_data = const_cast<BonusItem*>(&item);
-        svc_ui->pane_add_control(mod_ctx, pane, &row, nullptr);
-    }
-    return MOD_OK;
-}
-
-static ModResult ocarina_tab(ModContext*, UiWindowHandle, UiElementHandle pane, UiElementHandle, void*, ModError*) {
-    svc_ui->pane_add_section(mod_ctx, pane, "Time of Day");
-    for (int t = 0; t < 4; t++) {
-        UiControlDesc b = UI_CONTROL_DESC_INIT;
-        b.kind = UI_CONTROL_BUTTON;
-        b.label = kTimeNames[t];
-        b.on_pressed = set_time_of_day;
-        b.is_disabled = ocarina_unavailable;
-        b.user_data = reinterpret_cast<void*>(static_cast<intptr_t>(t));
-        svc_ui->pane_add_control(mod_ctx, pane, &b, nullptr);
-    }
-    svc_ui->pane_add_section(mod_ctx, pane, "Weather");
-    UiControlDesc rain = UI_CONTROL_DESC_INIT;
-    rain.kind = UI_CONTROL_BUTTON;
-    rain.label = "Bring Rain";
-    rain.on_pressed = rain_on;
-    rain.is_disabled = ocarina_unavailable;
-    svc_ui->pane_add_control(mod_ctx, pane, &rain, nullptr);
-    UiControlDesc clear = rain;
-    clear.label = "Clear Skies";
-    clear.on_pressed = rain_off;
-    svc_ui->pane_add_control(mod_ctx, pane, &clear, nullptr);
-    return MOD_OK;
-}
-
-static UiWindowHandle bonusWindow;
-static void bonus_closed(ModContext*, UiWindowHandle, void*) { bonusWindow = 0; }
-
-static void open_bonus_menu() {
-    if (bonusWindow) return;
-    UiTabDesc tabs[2] = {UI_TAB_DESC_INIT, UI_TAB_DESC_INIT};
-    tabs[0].title = "Bonus Items";
-    tabs[0].build = bonus_items_tab;
-    tabs[1].title = "Ocarina";
-    tabs[1].build = ocarina_tab;
-    UiWindowDesc win = UI_WINDOW_DESC_INIT;
-    win.tabs = tabs;
-    win.tab_count = 2;
-    win.on_closed = bonus_closed;
-    if (svc_ui->window_push(mod_ctx, &win, &bonusWindow) != MOD_OK) bonusWindow = 0;
-}
-
-static void bonus_tick() {
-    u32 now = JUTGamePad::mPadStatus[PAD_1].extButton;
-    bool pressed = (now & PAD_BUTTON_RIGHT_STICK) && !(bonusLastExt & PAD_BUTTON_RIGHT_STICK);
-    bonusLastExt = now;
-
-    // anything switched off on the Experimental page comes off
-    for (const BonusItem& item : kBonusItems)
-        if (!bonus_has(*item.allowed)) *item.worn = false;
-
-    auto* lnk = (daAlink_c*)dComIfGp_getPlayer(0);
-    if (!pressed || !cfgOn(vBonusMenu, false) || !lnk || lnk->checkWolf() || dComIfGp_event_runCheck()) return;
-    open_bonus_menu();
-}
-
-static void bonus_init() {
-    add_bool_option("bonusMenu", false, &vBonusMenu);
-    add_bool_option("bonusHoverBoots", true, &vHoverBoots);
-    add_bool_option("bonusLensOfTruth", true, &vLensOfTruth);
-    add_bool_option("bonusStoneMask", true, &vStoneMask);
-    add_bool_option("bonusOcarina", true, &vOcarina);
-    if (!post_hook(Exec, bonus_exec_post)) mods::log::warn("Hover Boots and Lens of Truth won't work");
-    bool maskOk = post_hook(ActorDistance, unseen_distance) && post_hook(ActorDistance2, unseen_distance_squared) &&
-                  post_hook(ActorDistanceXZ, unseen_distance) && post_hook(ActorDistanceXZ2, unseen_distance_squared) &&
-                  post_hook(SeenAngle, unseen_angle);
-    if (!maskOk) mods::log::warn("the Stone Mask won't hide Link from every enemy");
-}
-
 // ======================== Gear ========================
 // The Ordon gear (Wooden Sword, Ordon Shield, Ordon Clothes) gets its own slots on the collection
 // screen, one column left of the game's own, and anything worn can be taken off again with A.
 // Taking the clothes off puts Link in the sumo outfit, which the game loads from its own files,
 // so model and texture packs for it still apply.
 //
-// The new slots are copies of the game's first slot in each row, made when the screen is built.
-// If something else already answers for the column next to the game's slots, ours move one
-// further left so the two never sit on top of each other.
+// The new slots are copies of the game's first slot in each row, added once the screen is up.
+// Everything they need (the cursor stepping onto them, A on them, their name, their ring) is
+// handled here rather than left to the game's own grid code, which doesn't know they exist.
+// If another mod already has a cell in the column next to the game's slots, ours take the
+// nearest free column further left, so the two never sit on top of each other.
 
 static ConfigVarHandle vUnequipGear, vWoodSwordSlot, vAlwaysWoodSword, vOrdonShieldSlot, vAlwaysOrdonShield,
     vOrdonClothesSlot;
+
+static bool add_bool_option(const char* key, bool def, ConfigVarHandle* out);  // with the settings, below
 
 enum GearRow { GEAR_SWORD, GEAR_SHIELD, GEAR_CLOTHES, GEAR_ROWS };
 
@@ -4844,6 +4757,7 @@ static const u32 kOrdonClothesIcon = 0x6B;
 
 struct GearSlot {
     u64 tag;              // our copy's tag, what getItemTag hands out
+    J2DPane* home;        // the game's slot it was copied from (we follow its fade)
     J2DPane* root;        // our copy of the row's first slot
     J2DPicture* ring;
     J2DPicture* icon;
@@ -4851,8 +4765,10 @@ struct GearSlot {
 };
 
 static GearSlot gearSlot[GEAR_ROWS];
-static dMenu_Collect2D_c* gearMenu;  // the screen our copies live in
+static dMenu_Collect2D_c* gearMenu;  // the menu our copies live in
+static J2DScreen* gearScreen;        // and its screen (a new menu can reuse the old one's memory)
 static int gearCol = 2;
+static bool gameLayout;  // the game's sword, shield and clothes cells are where the game puts them
 static bool gearAsking;  // asking the game (and anyone hooked) about a cell without us answering
 
 static const u64 kGearTagBase = 0x47454F0000000000ULL;  // "GEO", then the row and a counter
@@ -4894,7 +4810,10 @@ static J2DPane* copy_pane(J2DPane* src, u64 tag) {
     } else if (src->getTypeID() == 16) {
         copy = JKR_NEW J2DPane(tag, src->getBounds());
     }
-    if (copy) copy_look(copy, src);
+    if (copy) {
+        copy->mBounds = src->getBounds();  // the constructor re-anchors the box; keep the original's
+        copy_look(copy, src);
+    }
     return copy;
 }
 
@@ -4952,6 +4871,7 @@ static void build_gear_slot(dMenu_Collect2D_c* m, int row) {
     }
     parent->appendChild(root);
     root->translate(home->getTranslateX() + dx, home->getTranslateY() + dy);
+    slot.home = home;
     for (J2DPane* kid = home->getFirstChildPane(); kid; kid = kid->getNextChildPane())
         copy_tree(kid, root, 0.0f, 0.0f, row, n, pics);
     slot.root = root;
@@ -5011,6 +4931,14 @@ static void paint_ring(J2DPane* ring, bool worn) {
 static void paint_gear_rings(dMenu_Collect2D_c* m) {
     if (m != gearMenu || !m->mpScreen) return;
     J2DScreen* scr = m->mpScreen;
+    if (!gameLayout) {
+        // only our own rings; the game's cells belong to whoever rearranged them
+        bool bare = clothes_off();
+        paint_ring(gearSlot[GEAR_SWORD].ring, dComIfGs_getSelectEquipSword() == dItemNo_WOOD_STICK_e);
+        paint_ring(gearSlot[GEAR_SHIELD].ring, dComIfGs_getSelectEquipShield() == dItemNo_WOOD_SHIELD_e);
+        paint_ring(gearSlot[GEAR_CLOTHES].ring, !bare && dComIfGs_getSelectEquipClothes() == dItemNo_WEAR_CASUAL_e);
+        return;
+    }
     u8 sword = dComIfGs_getSelectEquipSword();
     u8 shield = dComIfGs_getSelectEquipShield();
     u8 clothes = dComIfGs_getSelectEquipClothes();
@@ -5054,6 +4982,8 @@ static void fill_gear_column(dMenu_Collect2D_c* m) {
         show_gear_slot(slot, show);
     }
 
+    if (!gameLayout) return;  // another mod has rearranged the game's own cells; leave them be
+
     if (gearSlot[GEAR_SWORD].root) {
         bool ordon = dComIfGs_isItemFirstBit(dItemNo_SWORD_e);
         m->field_0x22d[3][0] = ordon;
@@ -5084,37 +5014,64 @@ static void fill_gear_column(dMenu_Collect2D_c* m) {
     }
 }
 
-// someone else answering for this cell? (the game itself leaves it empty)
-static bool gear_cell_taken(dMenu_Collect2D_c* m, int x, int row) {
+// what the game (and any mod hooked into it) puts in a cell, without us answering
+static u64 cell_tag(dMenu_Collect2D_c* m, int x, int y) {
     gearAsking = true;
-    u64 tag = m->getItemTag(x, row, true);
+    u64 tag = m->getItemTag(x, y, true);
     gearAsking = false;
-    return tag != 0;
+    return tag;
 }
 
-static HookAction gear_screen_pre(ModContext*, void* args, void*, void*) {
-    auto* m = mods::arg<dMenu_Collect2D_c*>(args, 0);
+static bool gear_built_for(dMenu_Collect2D_c* m) {
+    if (m != gearMenu || m->mpScreen != gearScreen) return false;
+    for (GearSlot& slot : gearSlot)
+        if (slot.root && m->mpScreen->search(slot.tag) != slot.root) return false;
+    return true;
+}
+
+// Adds our slots to this menu's screen, once. Called from wherever we first see the menu with
+// its screen up (the screen being set up, the menu being made, or its first frame), whichever
+// the game actually reaches.
+static void gear_build(dMenu_Collect2D_c* m) {
+    if (!m || !m->mpScreen || gear_built_for(m)) return;
     gearMenu = nullptr;
+    gearScreen = nullptr;
     for (GearSlot& slot : gearSlot) slot = GearSlot{};
-    if (!m->mpScreen) return HOOK_CONTINUE;
 
-    gearCol = 2;
-    for (int row = 0; row < GEAR_ROWS; row++)
-        if (gear_cell_taken(m, 2, row)) gearCol = 1;
-    if (gearCol == 1) mods::log::info("the column left of the gear is taken, the Ordon slots go one further left");
+    gameLayout = cell_tag(m, 3, 0) == MULTI_CHAR('ken_n0') && cell_tag(m, 3, 1) == MULTI_CHAR('tate_n0') &&
+                 cell_tag(m, 3, 2) == MULTI_CHAR('fuku_n0');
 
-    for (int row = 0; row < GEAR_ROWS; row++)
-        if (gear_slot_on(row) && !gear_cell_taken(m, gearCol, row)) build_gear_slot(m, row);
+    // the nearest column left of the game's slots with nothing in it
+    gearCol = -1;
+    for (int col = 2; col >= 0 && gearCol < 0; col--) {
+        bool free = true;
+        for (int row = 0; row < GEAR_ROWS; row++) free = free && cell_tag(m, col, row) == 0;
+        if (free) gearCol = col;
+    }
+    if (gearCol < 0) {
+        mods::log::warn("no free column left of the gear for the Ordon slots");
+        return;
+    }
+    if (gearCol != 2) mods::log::info("the Ordon gear slots sit in column {}, the nearer one is taken", gearCol);
+
+    JKRHeap* was = mDoExt_setCurrentHeap(m->mpHeap);
+    for (int row = 0; row < GEAR_ROWS; row++) {
+        if (!gear_slot_on(row)) continue;
+        build_gear_slot(m, row);
+        GearSlot& slot = gearSlot[row];
+        if (slot.root && !m->mpSelPm[gearCol][row])
+            m->mpSelPm[gearCol][row] = JKR_NEW CPaneMgr(m->mpScreen, slot.tag, 0, nullptr);
+    }
+    mDoExt_setCurrentHeap(was);
+
     gearMenu = m;
-    return HOOK_CONTINUE;
+    gearScreen = m->mpScreen;
+    fill_gear_column(m);
+    paint_gear_rings(m);
 }
 
 static void gear_screen_post(ModContext*, void* args, void*, void*) {
-    auto* m = mods::arg<dMenu_Collect2D_c*>(args, 0);
-    if (m != gearMenu) return;
-    fill_gear_column(m);
-    if (m->mCursorX == gearCol && m->mCursorY < GEAR_ROWS) m->setItemNameString(m->mCursorX, m->mCursorY);
-    paint_gear_rings(m);
+    gear_build(mods::arg<dMenu_Collect2D_c*>(args, 0));
 }
 
 static void gear_tag_post(ModContext*, void* args, void* retval, void*) {
@@ -5127,6 +5084,76 @@ static void gear_tag_post(ModContext*, void* args, void* retval, void*) {
 
 static void gear_rings_post(ModContext*, void* args, void*, void*) {
     paint_gear_rings(mods::arg<dMenu_Collect2D_c*>(args, 0));
+}
+
+// --- the cursor on our cells ---
+
+static u8 waitX, waitY;  // where the cursor was when this frame of the menu started
+
+static bool is_ours(int x, int y) { return x == gearCol && y >= 0 && y < GEAR_ROWS && gearSlot[y].root; }
+
+// the cursor's frame around a cell, as the game draws it around its gear
+static void point_cursor_at(dMenu_Collect2D_c* m, int x, int y) {
+    CPaneMgr* cell = m->mpSelPm[x][y];
+    if (!cell || !m->mpDrawCursor) return;
+    Vec at = cell->getGlobalVtxCenter(false, 0);
+    m->mpDrawCursor->setAlphaRate(1.0f);
+    m->mpDrawCursor->setPos(at.x, at.y, cell->getPanePtr(), false);
+    m->mpDrawCursor->setParam(1.0f, 1.0f, 0.1f, 0.7f, 0.7f);
+}
+
+static void size_cell(dMenu_Collect2D_c* m, int x, int y, bool picked) {
+    if (x < 0 || x > 6 || y < 0 || y > 4 || (x == 6 && y == 0) || !m->mpSelPm[x][y]) return;
+    f32 size = picked ? g_drawHIO.mCollectScreen.mSelectItemScale : g_drawHIO.mCollectScreen.mUnselectItemScale;
+    m->mpSelPm[x][y]->getPanePtr()->scale(size, size);
+}
+
+static void move_cursor(dMenu_Collect2D_c* m, int x, int y) {
+    size_cell(m, m->mCursorX, m->mCursorY, false);
+    m->field_0x259 = waitX;
+    m->field_0x25a = waitY;
+    m->mCursorX = x;
+    m->mCursorY = y;
+    mDoAud_seStart(Z2SE_SY_CURSOR_ITEM, nullptr, 0, 0);
+    size_cell(m, x, y, true);
+    point_cursor_at(m, x, y);
+    m->setItemNameString(x, y);
+}
+
+// Left into our column from the cell beside it, right back out, and up/down between our own
+// slots. Only fills in what the grid code didn't do itself this frame.
+static void gear_cursor(dMenu_Collect2D_c* m) {
+    STControl* stick = m->mpStick;
+    if (!stick) return;
+    u8 fresh = stick->mDirectionTrig & ~stick->field_0x0d;
+    if (!fresh) return;
+    int x0 = waitX, y0 = waitY;
+    bool moved = m->mCursorX != x0 || m->mCursorY != y0;
+    int toX = -1, toY = -1;
+
+    if ((fresh & STControl::TRIG_LEFT) && !moved && x0 > gearCol && is_ours(gearCol, y0)) {
+        toX = gearCol, toY = y0;
+    } else if ((fresh & STControl::TRIG_RIGHT) && !moved && is_ours(x0, y0)) {
+        for (int x = x0 + 1; x <= 6 && toX < 0; x++)
+            if (m->mpSelPm[x][y0]) toX = x, toY = y0;
+    } else if ((fresh & (STControl::TRIG_UP | STControl::TRIG_DOWN)) && is_ours(x0, y0)) {
+        int step = (fresh & STControl::TRIG_UP) ? -1 : 1;
+        for (int y = y0 + step; y >= 0 && y < GEAR_ROWS && toX < 0; y += step)
+            if (is_ours(gearCol, y)) toX = gearCol, toY = y;
+        // past our last slot downward the game's own move into the items stands
+    }
+    if (toX < 0 || (toX == m->mCursorX && toY == m->mCursorY)) return;
+    move_cursor(m, toX, toY);
+}
+
+// our copies fade in and out with the slots they were copied from, and grow when picked
+static void gear_follow_screen(dMenu_Collect2D_c* m) {
+    for (int row = 0; row < GEAR_ROWS; row++) {
+        GearSlot& slot = gearSlot[row];
+        if (!slot.root) continue;
+        if (slot.home) slot.root->setAlpha(slot.home->getAlpha());
+        size_cell(m, gearCol, row, m->mCursorX == gearCol && m->mCursorY == row);
+    }
 }
 
 // --- putting things on and taking them off ---
@@ -5236,11 +5263,11 @@ static bool take_off(dMenu_Collect2D_c* m, int row) {
 
 // A on a gear cell; true when we handled it and the game shouldn't
 static bool gear_press(dMenu_Collect2D_c* m) {
-    if (m != gearMenu) return false;
+    if (!gear_built_for(m)) return false;
     int x = m->mCursorX, y = m->mCursorY;
     if (y >= GEAR_ROWS || m->mIsWolf || !m->field_0x22d[x][y]) return false;
     bool ours = x == gearCol && gearSlot[y].root;
-    bool games = (x == 3 || x == 4) || (x == 5 && y == GEAR_CLOTHES);
+    bool games = gameLayout && ((x == 3 || x == 4) || (x == 5 && y == GEAR_CLOTHES));
     if (!ours && !games) return false;
 
     daPy_py_c* pl = daPy_getPlayerActorClass();
@@ -5265,6 +5292,9 @@ static bool gear_press(dMenu_Collect2D_c* m) {
 
 static HookAction gear_wait_pre(ModContext*, void* args, void*, void*) {
     auto* m = mods::arg<dMenu_Collect2D_c*>(args, 0);
+    gear_build(m);
+    waitX = m->mCursorX;
+    waitY = m->mCursorY;
     if (!dMw_A_TRIGGER()) return HOOK_CONTINUE;
     return gear_press(m) ? HOOK_SKIP_ORIGINAL : HOOK_CONTINUE;
 }
@@ -5276,9 +5306,11 @@ static HookAction gear_click_pre(ModContext*, void* args, void*, void*) {
 // the game only offers "Equip" on its own gear cells
 static void gear_wait_post(ModContext*, void* args, void*, void*) {
     auto* m = mods::arg<dMenu_Collect2D_c*>(args, 0);
-    if (m != gearMenu) return;
+    if (!gear_built_for(m)) return;
+    gear_cursor(m);
+    gear_follow_screen(m);
     int x = m->mCursorX, y = m->mCursorY;
-    if (x != gearCol || y >= GEAR_ROWS || !gearSlot[y].root) return;
+    if (!is_ours(x, y)) return;
     m->setAButtonString(m->field_0x22d[x][y] && !m->mIsWolf ? 0x436 : 0);
 }
 
@@ -5404,6 +5436,7 @@ static void gear_exec_post(ModContext*, void* args, void*, void*) {
 }
 
 DEFINE_HOOK(&dMenu_Collect2D_c::screenSet, CollectScreenSet);
+DEFINE_HOOK(&dMenu_Collect2D_c::_create, CollectCreate);
 DEFINE_HOOK(&dMenu_Collect2D_c::getItemTag, CollectItemTag);
 DEFINE_HOOK(&dMenu_Collect2D_c::wait_proc, CollectWait);
 DEFINE_HOOK(&dMenu_Collect2D_c::pointerActivateCurrent, CollectClick);
@@ -5420,17 +5453,21 @@ static void gear_init() {
     add_bool_option("alwaysOrdonShield", false, &vAlwaysOrdonShield);
     add_bool_option("ordonClothesSlot", true, &vOrdonClothesSlot);
 
-    bool slotsOk = pre_hook(CollectScreenSet, gear_screen_pre) && post_hook(CollectScreenSet, gear_screen_post) &&
-                   post_hook(CollectItemTag, gear_tag_post);
-    if (!slotsOk) mods::log::warn("no Ordon gear slots on the collection screen");
-    bool pressOk = pre_hook(CollectWait, gear_wait_pre) && post_hook(CollectWait, gear_wait_post) &&
-                   pre_hook(CollectClick, gear_click_pre);
-    if (!pressOk) mods::log::warn("gear on the collection screen can't be changed or taken off by the mod");
+    // any one of these is enough to get the slots onto the screen
+    int seen = post_hook(CollectScreenSet, gear_screen_post) + post_hook(CollectCreate, gear_screen_post);
+    if (!seen) mods::log::info("the Ordon gear slots are added on the menu's first frame instead");
+    if (!post_hook(CollectItemTag, gear_tag_post)) mods::log::info("the game's grid code won't know the Ordon slots");
+    // ahead of other mods' hooks on the menu, so a mod that takes over the grid can't swallow ours
+    HookOptions first = HOOK_OPTIONS_INIT;
+    first.priority = 100;
+    bool pressOk = hooked(mods::hook::add_pre<CollectWait>(gear_wait_pre, &first), "pre") &&
+                   post_hook(CollectWait, gear_wait_post) &&
+                   hooked(mods::hook::add_pre<CollectClick>(gear_click_pre, &first), "pre");
+    if (!pressOk) mods::log::warn("no Ordon gear slots on the collection screen");
     bool ringsOk = post_hook(CollectRingSword, gear_rings_post) && post_hook(CollectRingShield, gear_rings_post) &&
                    post_hook(CollectRingClothes, gear_rings_post);
     if (!ringsOk) mods::log::warn("the worn-gear rings may light the wrong slot");
     if (!pre_hook(ItemPickup, table_shield_pickup)) mods::log::warn("the Ordon Shield on the table won't play its pickup scene");
-    if (!post_hook(Exec, gear_exec_post)) mods::log::warn("a sword taken off in the menu stays in Link's hand");
 }
 
 static void gear_shutdown() {
@@ -5565,21 +5602,9 @@ static void item_rows() {
     toggle("Always Have Wooden Sword", vAlwaysWoodSword, wood_slot_off);
 }
 
-static bool bonus_menu_off(ModContext*, void*) { return !cfgOn(vBonusMenu, false); }
-
-static void experimental_rows() {
-    heading("Bonus Items");
-    note("Extra items to put on from a menu: click the right stick (R3) as human Link to open it.");
-    toggle("Bonus Items Menu (R3)", vBonusMenu);
-    toggle("Hover Boots", vHoverBoots, bonus_menu_off);
-    toggle("Lens of Truth", vLensOfTruth, bonus_menu_off);
-    toggle("Stone Mask", vStoneMask, bonus_menu_off);
-    toggle("Ocarina (Time and Rain)", vOcarina, bonus_menu_off);
-}
-
-static const int kTabCount = 4;
-static const char* const tabTitles[kTabCount] = {"Quality of Life", "Combat", "Items", "Experimental"};
-static void (*const tabRows[kTabCount])() = {quality_rows, combat_rows, item_rows, experimental_rows};
+static const int kTabCount = 3;
+static const char* const tabTitles[kTabCount] = {"Quality of Life", "Combat", "Items"};
+static void (*const tabRows[kTabCount])() = {quality_rows, combat_rows, item_rows};
 
 // one builder for every tab, user_data is the tab number
 static ModResult fill_tab(ModContext*, UiWindowHandle, UiElementHandle pane, UiElementHandle, void* which, ModError*) {
@@ -5663,6 +5688,29 @@ static void settings_init() {
         mods::log::warn("mods panel failed, settings keep their saved values");
 }
 
+// ======================== Link's update ========================
+// Everything that rides along on Link's own update, in one place: one hook on each side of it for
+// the whole mod rather than one per feature. The order is the order things need to happen in.
+
+static HookAction link_update_pre(ModContext* ctx, void* args, void* ret, void* user) {
+    auto* lnk = mods::arg<daAlink_c*>(args, 0);
+    exec_pre(ctx, args, ret, user);         // Ice Leaf: summoning, riding, putting it away
+    manual_bash_pre(ctx, args, ret, user);  // Manual Shielding: B bash before B can draw the sword
+    flourish_before(lnk);                   // Sword Flourish: the kill timer, by setting
+    return HOOK_CONTINUE;
+}
+
+static void link_update_post(ModContext* ctx, void* args, void* ret, void* user) {
+    auto* lnk = mods::arg<daAlink_c*>(args, 0);
+    exec_post(ctx, args, ret, user);    // Ice Leaf: lit button, R boost
+    flourish_after(lnk);                // Sword Flourish Off: no timer from this frame's kill
+    hang_bomb(lnk);                     // Gale-Bomb: a bomb on the boomerang the frame it's thrown
+    lantern_swing_burns(lnk);           // Deal Burn with Lantern
+    burn_enemies();                     // fire arrows / lantern: whoever's burning
+    gear_exec_post(ctx, args, ret, user);  // Gear: a sword taken off in the menu is put away
+    link_faces_midna(ctx, args, ret, user);  // Midna: turning to her for a talk
+}
+
 static bool add_bool_option(const char* key, bool def, ConfigVarHandle* out) {
     ConfigVarDesc d = CONFIG_VAR_DESC_INIT;
     d.name = key;
@@ -5678,31 +5726,24 @@ static bool add_int_option(const char* key, int64_t def, ConfigVarHandle* out) {
     d.name = key;
     d.type = CONFIG_VAR_INT;
     d.default_int = def;
-    return svc_config->register_var(mod_ctx, &d, out) == MOD_OK;
+    if (svc_config->register_var(mod_ctx, &d, out) == MOD_OK) return true;
+    *out = 0;
+    return false;
 }
 
 extern "C" {
 
 MOD_EXPORT ModResult mod_initialize(ModError* error) {
     // --- Less Restrictive Maps ---
-    for (int i = 0; i < EPONA_AREAS; i++) {
-        ConfigVarDesc d = CONFIG_VAR_DESC_INIT;
-        d.name = eponaKeys[i];
-        d.type = CONFIG_VAR_BOOL;
-        d.default_bool = true;
-        if (svc_config->register_var(mod_ctx, &d, &eponaToggle[i]) != MOD_OK)
+    for (int i = 0; i < EPONA_AREAS; i++)
+        if (!add_bool_option(eponaKeys[i], true, &eponaToggle[i]))
             return mods::set_error(error, MOD_ERROR, "can't register settings");
-    }
     if (!add_int_option("removeFaronMist", MIST_SEMI, &mistOption) ||
         !add_int_option("chudleysMode", SHOP_SEMI, &shopOption))
         return mods::set_error(error, MOD_ERROR, "can't register settings");
     shopModeLoaded = cfgInt(shopOption, SHOP_SEMI);  // whatever room we start in counts as loaded with it
 
-    ConfigVarDesc jump = CONFIG_VAR_DESC_INIT;
-    jump.name = "bridgeJump";
-    jump.type = CONFIG_VAR_BOOL;
-    jump.default_bool = true;
-    if (svc_config->register_var(mod_ctx, &jump, &bridgeJump) != MOD_OK)
+    if (!add_bool_option("bridgeJump", true, &bridgeJump))
         return mods::set_error(error, MOD_ERROR, "can't register settings");
 
     if (!pre_hook(HorseSavePos, keep_field_spot) || !pre_hook(SetStartStage, remember_stage) ||
@@ -5725,15 +5766,16 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     if (!pre_hook(BgObjExec, posters_down)) mods::log::warn("posters will stay up");
     if (!post_hook(ShelfSpawn, malo_shelf_prompt)) mods::log::warn("shelves keep Chudley's prices");
 
-    // --- Shop Expansion ---
-    ModResult res = mods::hook::add_pre<Exec>(exec_pre);
-    if (res == MOD_OK) res = mods::hook::add_post<Exec>(exec_post);
-    if (res != MOD_OK)
-        return mods::set_error(error, res, "couldn't hook daAlink_c::execute, the leaf won't work");
+    // Link's own update carries a lot of the mod (see link_update_pre/post)
+    ModResult res = mods::hook::add_pre<Exec>(link_update_pre);
+    if (res == MOD_OK) res = mods::hook::add_post<Exec>(link_update_post);
+    if (res != MOD_OK) return mods::set_error(error, res, "couldn't hook Link's update");
+
+    // --- Ice Leaf ---
 
     ModResult a = mods::hook::add_pre<NewItem>(newitem_pre);
     ModResult b = mods::hook::add_post<SnowCode>(snow_post);
-    if (mods::hook::add_post<Stick>(stick_post) != MOD_OK)
+    if (mods::hook::add_post<StickData>(stick_post) != MOD_OK)
         mods::log::warn("stick hook failed, link can walk during the pickup prompt");
     if (a != MOD_OK || b != MOD_OK)
         mods::log::warn("riding hooks failed (items {}, snow {}), items might work on the leaf", (int)a, (int)b);
@@ -5755,24 +5797,11 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     if (res != MOD_OK)
         mods::log::warn("pickup text hooks failed ({}), prompt will show the vanilla text", (int)res);
 
-    ConfigVarDesc d = CONFIG_VAR_DESC_INIT;
-    d.type = CONFIG_VAR_BOOL;
-    d.name = "rtBoost";
-    d.default_bool = false;
-    ModResult c = svc_config->register_var(mod_ctx, &d, &vBoost);
-    d.name = "alwaysHave";
-    ModResult e = svc_config->register_var(mod_ctx, &d, &vAlways);
-    d.default_bool = true;
-    d.name = "goronShop";
-    if (svc_config->register_var(mod_ctx, &d, &vGoron) != MOD_OK) vGoron = 0;
-    d.name = "chudleyShop";
-    if (svc_config->register_var(mod_ctx, &d, &vChud) != MOD_OK) vChud = 0;
-    d.name = "iceLeaf";
-    if (svc_config->register_var(mod_ctx, &d, &vLeaf) != MOD_OK) vLeaf = 0;
-    if (c != MOD_OK || e != MOD_OK) {
-        mods::log::warn("config register failed (boost {}, always {}), toggles off", (int)c, (int)e);
-        vBoost = vAlways = 0;
-    }
+    bool leafOk = add_bool_option("rtBoost", false, &vBoost) & add_bool_option("alwaysHave", false, &vAlways) &
+                  add_bool_option("iceLeaf", true, &vLeaf);
+    if (!leafOk) mods::log::warn("some Ice Leaf settings didn't register, those use their defaults");
+    add_bool_option("goronShop", true, &vGoron);
+    add_bool_option("chudleyShop", true, &vChud);
 
     shop_init();
 
@@ -5791,23 +5820,17 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     missed += !add_bool_option("helmSplitter", false, &vHead);
     missed += !add_bool_option("helmSplitterAlways", false, &vHeadAll);
     missed += !add_bool_option("backSliceAlways", false, &vBackAll);
-    if (!add_int_option("damageSword", 0, &vDamage)) {
-        vDamage = 0;
-        missed++;
-    }
+    missed += !add_int_option("damageSword", 0, &vDamage);
     if (missed) mods::log::warn("{} unarmed settings didn't register, those use their defaults", missed);
     unarmed_init();
 
     // --- Combat > Misc: Sword Flourish and Deal Burn with Lantern ---
-    if (!add_int_option("swordFlourish", FLOURISH_DEFAULT, &flourishOption)) flourishOption = 0;
+    add_int_option("swordFlourish", FLOURISH_DEFAULT, &flourishOption);
     add_bool_option("lanternBurn", true, &vLanternBurn);
     add_bool_option("manualShielding", false, &vManualShield);
     add_bool_option("mortalDrawHandAnim", true, &vHandPose);
     if (!post_hook(SetMatrix, hand_pose_post)) mods::log::warn("Mortal Draw Hand Anim stays on");
-    // rides along on Link's update, next to the Ice Leaf's own hooks there
-    bool flourishOk = pre_hook(Exec, flourish_exec_pre) && post_hook(Exec, flourish_exec_post) &&
-                      pre_hook(AllUnequip, flourish_put_away);
-    if (!flourishOk) mods::log::warn("sword flourish stays at the game's normal behaviour");
+    if (!pre_hook(AllUnequip, flourish_put_away)) mods::log::warn("sword flourish stays at the game's normal behaviour");
 
     // --- Item Combinations ---
     add_bool_option("itemCombinations", true, &vCombos);
@@ -5838,14 +5861,12 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     bool iconOk = pre_hook(ButtonIcon, button_icon_pre) && post_hook(ButtonIcon, button_icon_post);
     iconOk = iconOk && pre_hook(ReadTex, combo_tex_pre) && post_hook(ReadTex, combo_tex_post);
     if (!iconOk) mods::log::warn("the boomerang button won't show the little bomb");
-    if (!post_hook(Exec, galebomb_exec_post)) mods::log::warn("thrown boomerangs won't carry bombs");
     if (!pre_hook(ButtonCount, button_count_pre)) mods::log::warn("no bomb count on the boomerang button");
     if (!post_hook(HudCreate, hud_created)) mods::log::warn("combo icons may need a menu open after warping");
 
     // Fire Arrows
     if (!pre_hook(ButtonOilGauge, oil_gauge_pre)) mods::log::warn("no oil gauge on the fire-arrow bow");
     if (!post_hook(ArrowUpdate, arrow_post)) mods::log::warn("arrows won't catch fire");
-    if (!post_hook(Exec, burn_post)) mods::log::warn("enemies won't catch fire from fire arrows");
 
     settings_init();
 
@@ -5856,12 +5877,9 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     // --- Gear ---
     gear_init();
 
-    // --- Experimental: Bonus Items ---
-    bonus_init();
-
     // --- Midna: L3 Midna Follow ---
     add_bool_option("midnaFollow", true, &vMidnaFollow);
-    if (!add_int_option("midnaTrailFile", -1, &vMidnaTrailFile)) vMidnaTrailFile = 0;
+    add_int_option("midnaTrailFile", -1, &vMidnaTrailFile);
     midna_follow_init();
 
     // --- update check ---
@@ -5882,7 +5900,6 @@ MOD_EXPORT ModResult mod_update(ModError*) {
     dialogue_tick();
     midna_follow_tick();
     trail_tick();
-    bonus_tick();
     gear_tick();
     return MOD_OK;
 }
