@@ -20,6 +20,7 @@
 #include "mods/svc/texture.h"
 #include "mods/svc/ui.h"
 
+#include "JSystem/J2DGraph/J2DGrafContext.h"
 #include "JSystem/J2DGraph/J2DPicture.h"
 #include "JSystem/J2DGraph/J2DScreen.h"
 #include "JSystem/J2DGraph/J2DTextBox.h"
@@ -4331,8 +4332,12 @@ static HookAction midna_exec_pre(ModContext*, void* args, void*, void*) {
     return HOOK_CONTINUE;
 }
 
-static void midna_exec_post(ModContext*, void*, void*, void*) {
+static void midna_exec_post(ModContext*, void* args, void*, void*) {
     if (auto* lnk = (daAlink_c*)dComIfGp_getPlayer(0)) take_body_back(lnk);
+    // She only accepts being talked to while she rides in Link's shadow (the game says so at the
+    // end of her update). Out beside him she's just as available.
+    bool out = midnaPhase == MIDNA_FOLLOWING || midnaPhase == MIDNA_RISING || midnaPhase == MIDNA_TALKING;
+    if (out) mods::arg<daMidna_c*>(args, 0)->eventInfo.onCondition(dEvtCnd_CANTALK_e);
 }
 
 // Link turns to face her for the talk
@@ -4641,8 +4646,12 @@ static void midna_follow_init() {
               pre_hook(MidnaDraw, real_body_for_drawing) && post_hook(MidnaDraw, shadow_form_after_drawing) &&
               pre_hook(LinkShadowDraw, real_body_for_drawing) && post_hook(LinkShadowDraw, shadow_form_after_drawing);
     if (!ok) mods::log::warn("L3 Midna Follow won't work");
-    bool talkOk = pre_hook(LinkOrderTalk, call_her_while_out) &&
-                  post_hook(LinkOrderTalk, call_her_done) && pre_hook(LinkOrderZTalk, call_her_while_out) &&
+    // ahead of other mods on the Midna button, so one that moves her button still finds her callable
+    HookOptions first = HOOK_OPTIONS_INIT;
+    first.priority = 100;
+    bool talkOk = hooked(mods::hook::add_pre<LinkOrderTalk>(call_her_while_out, &first), "pre") &&
+                  post_hook(LinkOrderTalk, call_her_done) &&
+                  hooked(mods::hook::add_pre<LinkOrderZTalk>(call_her_while_out, &first), "pre") &&
                   post_hook(LinkOrderZTalk, call_her_done);
     if (!talkOk) mods::log::warn("Midna can't be talked to while she's out following");
 }
@@ -4756,16 +4765,19 @@ static const GearRowInfo kGearRows[GEAR_ROWS] = {
 static const u32 kOrdonClothesIcon = 0x6B;
 
 struct GearSlot {
-    u64 tag;              // our copy's tag, what getItemTag hands out
-    J2DPane* home;        // the game's slot it was copied from (we follow its fade)
-    J2DPane* root;        // our copy of the row's first slot
-    J2DPicture* ring;
-    J2DPicture* icon;
-    J2DPane* loose[2];    // ring or icon that sat beside the slot instead of inside it
+    u64 tag;                // our cell's tag, what getItemTag hands out
+    J2DPane* anchor;        // our cell: an empty pane where the slot sits, for the cursor
+    J2DPane* home;          // the game's first slot in the row, drawn again at our spot
+    f32 dx, dy;             // from the game's slot to ours, in its own parent's units
+    J2DPane* ring;          // the game's ring and icons inside (or beside) that slot
+    J2DPane* keep;
+    J2DPane* drop;
+    J2DPane* loose[2];      // ring or icon that sits beside the slot rather than inside it
+    J2DPicture* ownIcon;    // the Ordon Clothes picture (the game has none for that slot)
 };
 
 static GearSlot gearSlot[GEAR_ROWS];
-static dMenu_Collect2D_c* gearMenu;  // the menu our copies live in
+static dMenu_Collect2D_c* gearMenu;  // the menu our slots belong to
 static J2DScreen* gearScreen;        // and its screen (a new menu can reuse the old one's memory)
 static int gearCol = 2;
 static bool gameLayout;  // the game's sword, shield and clothes cells are where the game puts them
@@ -4775,139 +4787,139 @@ static const u64 kGearTagBase = 0x47454F0000000000ULL;  // "GEO", then the row a
 
 static u64 gear_tag(int row, int n) { return kGearTagBase | ((u64)row << 16) | (u64)n; }
 
-static void copy_look(J2DPane* to, J2DPane* from) {
-    to->mAlpha = from->mAlpha;
-    to->mColorAlpha = from->mColorAlpha;
-    to->mIsInfluencedAlpha = from->mIsInfluencedAlpha;
-    to->mConnected = from->mConnected;
-    to->mCullMode = from->mCullMode;
-    to->mBasePosition = from->mBasePosition;
-    to->mRotAxis = from->mRotAxis;
-    to->mRotateX = from->mRotateX;
-    to->mRotateY = from->mRotateY;
-    to->mRotateZ = from->mRotateZ;
-    to->mRotateOffsetX = from->mRotateOffsetX;
-    to->mRotateOffsetY = from->mRotateOffsetY;
-    to->mScaleX = from->mScaleX;
-    to->mScaleY = from->mScaleY;
-    if (from->isVisible())
-        to->show();
-    else
-        to->hide();
+static std::string tag_text(u64 tag) {
+    std::string out;
+    for (int shift = 56; shift >= 0; shift -= 8) {
+        char c = (char)((tag >> shift) & 0xFF);
+        if (c) out += (c >= 32 && c < 127) ? c : '?';
+    }
+    return out.empty() ? "-" : out;
 }
 
-// a plain pane or picture like src; text and windows aren't needed for a gear slot
-static J2DPane* copy_pane(J2DPane* src, u64 tag) {
-    J2DPane* copy = nullptr;
-    if (src->getTypeID() == 18) {
-        auto* pic = static_cast<J2DPicture*>(src);
-        JUTTexture* tex = pic->getTexture(0);
-        if (!tex || !tex->getTexInfo()) return nullptr;
-        auto* p = JKR_NEW J2DPicture(tag, src->getBounds(), tex->getTexInfo(), nullptr);
-        if (!p) return nullptr;
-        p->setBlackWhite(pic->getBlack(), pic->getWhite());
-        copy = p;
-    } else if (src->getTypeID() == 16) {
-        copy = JKR_NEW J2DPane(tag, src->getBounds());
-    }
-    if (copy) {
-        copy->mBounds = src->getBounds();  // the constructor re-anchors the box; keep the original's
-        copy_look(copy, src);
-    }
-    return copy;
+// what the game (and any mod hooked into it) puts in a cell, without us answering
+static u64 cell_tag(dMenu_Collect2D_c* m, int x, int y) {
+    gearAsking = true;
+    u64 tag = m->getItemTag(x, y, true);
+    gearAsking = false;
+    return tag;
 }
 
-static J2DPane* copy_tree(J2DPane* src, J2DPane* parent, f32 dx, f32 dy, int row, int& n, std::vector<J2DPicture*>& pics) {
-    J2DPane* copy = copy_pane(src, gear_tag(row, n++));
-    if (!copy) return nullptr;
-    parent->appendChild(copy);
-    copy->translate(src->getTranslateX() + dx, src->getTranslateY() + dy);
-
-    const GearRowInfo& info = kGearRows[row];
-    GearSlot& slot = gearSlot[row];
-    if (copy->getTypeID() == 18) {
-        auto* pic = static_cast<J2DPicture*>(copy);
-        if (src->mInfoTag == info.ring)
-            slot.ring = pic;
-        else if (src->mInfoTag == info.keep)
-            slot.icon = pic;
-        else if (info.drop && src->mInfoTag == info.drop)
-            pic->hide();
-        else
-            pics.push_back(pic);
-    }
-    for (J2DPane* kid = src->getFirstChildPane(); kid; kid = kid->getNextChildPane())
-        copy_tree(kid, copy, 0.0f, 0.0f, row, n, pics);
-    return copy;
+// any of the menu's cell managers will do for measuring where a pane ends up on screen
+static CPaneMgr* any_cell(dMenu_Collect2D_c* m) {
+    for (int x = 0; x < 7; x++)
+        for (int y = 0; y < 6; y++)
+            if (m->mpSelPm[x][y]) return m->mpSelPm[x][y];
+    return nullptr;
 }
 
-static void build_gear_slot(dMenu_Collect2D_c* m, int row) {
+// the middle of a pane, in screen units
+static Vec screen_middle(CPaneMgr* measure, J2DPane* pane) { return measure->getGlobalVtxCenter(pane, false, 0); }
+
+// one line in the log describing the collection screen's gear rows, so a layout that doesn't
+// come out right can be looked into
+static void log_gear_layout(dMenu_Collect2D_c* m) {
+    for (int y = 0; y < GEAR_ROWS; y++) {
+        std::string line;
+        for (int x = 0; x < 7; x++) line += tag_text(cell_tag(m, x, y)) + (x < 6 ? " " : "");
+        mods::log::info("gear row {} cells: {}", y, line);
+        J2DPane* home = m->mpScreen->search(kGearRows[y].home);
+        if (!home) continue;
+        std::string kids;
+        for (J2DPane* kid = home->getFirstChildPane(); kid; kid = kid->getNextChildPane())
+            kids += tag_text(kid->mInfoTag) + (kid->getTypeID() == 18 ? "(pic" : "(pane") + (kid->isVisible() ? ") " : ",hidden) ");
+        mods::log::info("gear row {} slot {} holds: {}", y, tag_text(kGearRows[y].home), kids);
+    }
+}
+
+static void build_gear_slot(dMenu_Collect2D_c* m, int row, CPaneMgr* measure) {
     const GearRowInfo& info = kGearRows[row];
     GearSlot& slot = gearSlot[row];
     J2DScreen* scr = m->mpScreen;
     J2DPane* home = scr->search(info.home);
     J2DPane* next = scr->search(info.next);
     J2DPane* parent = home ? home->getParentPane() : nullptr;
-    if (!home || !parent) {
+    if (!home || !parent || !next) {
         mods::log::warn("collection screen has no slot to copy for gear row {}", row);
         return;
     }
 
-    // one slot's step to the left, as far left as our column sits
-    f32 stepX = -home->getWidth() * 1.25f, stepY = 0.0f;
-    if (next && next->getParentPane() == parent) {
-        stepX = home->getTranslateX() - next->getTranslateX();
-        stepY = home->getTranslateY() - next->getTranslateY();
-    }
-    f32 dx = stepX * (3 - gearCol), dy = stepY * (3 - gearCol);
+    // the leftmost cell in use in this row (the game's first slot, or another mod's) and one
+    // slot's step, both on screen; ours goes that many steps further left
+    int left = 3;
+    for (int x = 0; x < 7; x++)
+        if (x != gearCol && cell_tag(m, x, row)) {
+            left = x;
+            break;
+        }
+    J2DPane* leftPane = scr->search(cell_tag(m, left, row));
+    if (!leftPane) leftPane = home;
+    Vec homeAt = screen_middle(measure, home), nextAt = screen_middle(measure, next);
+    Vec leftAt = screen_middle(measure, leftPane);
+    f32 stepX = nextAt.x - homeAt.x, stepY = nextAt.y - homeAt.y;
+    f32 targetX = leftAt.x - stepX * (left - gearCol), targetY = leftAt.y - stepY * (left - gearCol);
+    // screen units back into the slot's own (its parent may be scaled for widescreen)
+    f32 localStepX = next->getTranslateX() - home->getTranslateX();
+    f32 localStepY = next->getTranslateY() - home->getTranslateY();
+    f32 sx = (stepX != 0.0f && next->getParentPane() == parent) ? localStepX / stepX : 1.0f;
+    f32 sy = (stepY != 0.0f && next->getParentPane() == parent) ? localStepY / stepY : sx;
+    slot.dx = (targetX - homeAt.x) * sx;
+    slot.dy = (targetY - homeAt.y) * sy;
 
-    int n = 0;
-    std::vector<J2DPicture*> pics;
+    // our cell: an empty pane the size of the game's slot, where ours is drawn
     slot.tag = gear_tag(row, 0xFFFF);
-    J2DPane* root = copy_pane(home, slot.tag);
-    if (!root) {
-        mods::log::warn("couldn't copy the collection slot for gear row {}", row);
-        return;
-    }
-    parent->appendChild(root);
-    root->translate(home->getTranslateX() + dx, home->getTranslateY() + dy);
+    JGeometry::TBox2<f32> box = home->getBounds();
+    slot.anchor = JKR_NEW J2DPane(slot.tag, box);
+    if (!slot.anchor) return;
+    parent->appendChild(slot.anchor);
+    slot.anchor->mBounds = box;
+    slot.anchor->mBasePosition = home->mBasePosition;
+    slot.anchor->mRotateOffsetX = home->mRotateOffsetX;
+    slot.anchor->mRotateOffsetY = home->mRotateOffsetY;
+    slot.anchor->translate(home->getTranslateX() + slot.dx, home->getTranslateY() + slot.dy);
     slot.home = home;
-    for (J2DPane* kid = home->getFirstChildPane(); kid; kid = kid->getNextChildPane())
-        copy_tree(kid, root, 0.0f, 0.0f, row, n, pics);
-    slot.root = root;
 
-    // the ring or icon may sit beside the slot rather than inside it
+    // the pieces of the game's slot that change for ours: the ring, and which icon shows
+    auto find = [&](u64 tag) -> J2DPane* {
+        if (!tag) return nullptr;
+        if (J2DPane* inside = home->search(tag)) return inside;
+        J2DPane* beside = scr->search(tag);
+        return beside && beside->getParentPane() == parent ? beside : nullptr;
+    };
+    slot.ring = find(info.ring);
+    slot.keep = find(info.keep);
+    slot.drop = find(info.drop);
     int loose = 0;
-    for (u64 tag : {info.ring, info.keep}) {
-        bool have = tag == info.ring ? slot.ring != nullptr : slot.icon != nullptr;
-        J2DPane* src = have ? nullptr : scr->search(tag);
-        if (!src || src->getParentPane() != parent) continue;
-        J2DPane* copy = copy_tree(src, parent, dx, dy, row, n, pics);
-        if (copy) slot.loose[loose++] = copy;
-    }
+    for (J2DPane* piece : {slot.ring, slot.keep})
+        if (piece && piece->getParentPane() == parent && loose < 2) slot.loose[loose++] = piece;
 
     if (row == GEAR_CLOTHES) {
-        // the game never shows the Ordon Clothes here, so the picture comes from the item icons
-        if (!slot.icon && !pics.empty()) slot.icon = pics.front();
+        // the game never shows the Ordon Clothes here, so the picture comes from the item icons;
+        // it sits over the slot's own icon (the Hero's Clothes) and only shows while ours is drawn
         JKRArchive* icons = dComIfGp_getItemIconArchive();
         auto* tex = icons ? static_cast<ResTIMG*>(icons->getIdxResource(kOrdonClothesIcon)) : nullptr;
-        if (slot.icon && tex)
-            slot.icon->changeTexture(tex, 0);
-        else
-            mods::log::warn("no Ordon Clothes picture for the collection screen");
+        J2DPane* icon = slot.keep;
+        if (!icon) {
+            // no icon by the expected name: the slot's biggest picture that isn't the ring
+            f32 best = 0.0f;
+            for (J2DPane* kid = home->getFirstChildPane(); kid; kid = kid->getNextChildPane()) {
+                f32 area = kid->getWidth() * kid->getHeight();
+                if (kid->getTypeID() == 18 && kid != slot.ring && area > best) best = area, icon = kid;
+            }
+            slot.keep = icon;
+        }
+        if (tex && icon && icon->getParentPane()) {
+            slot.ownIcon = JKR_NEW J2DPicture(gear_tag(row, 1), icon->getBounds(), tex, nullptr);
+            if (slot.ownIcon) {
+                icon->getParentPane()->appendChild(slot.ownIcon);
+                slot.ownIcon->mBounds = icon->getBounds();
+                slot.ownIcon->mBasePosition = icon->mBasePosition;
+                slot.ownIcon->translate(icon->getTranslateX(), icon->getTranslateY());
+                slot.ownIcon->hide();
+            }
+        }
+        if (!slot.ownIcon) mods::log::warn("no Ordon Clothes picture for the collection screen");
     }
-    if (slot.icon) slot.icon->show();
     if (!slot.ring) mods::log::info("gear row {} has no ring of its own, it won't light up when worn", row);
-}
-
-static void show_gear_slot(GearSlot& slot, bool show) {
-    for (J2DPane* p : {slot.root, slot.loose[0], slot.loose[1]}) {
-        if (!p) continue;
-        if (show)
-            p->show();
-        else
-            p->hide();
-    }
 }
 
 static bool clothes_off() { return rdBlob("gearClothesOff"); }
@@ -4926,37 +4938,25 @@ static void paint_ring(J2DPane* ring, bool worn) {
                                                                                      : JUtility::TColor(107, 107, 107, 255));
 }
 
-// the rings after the game has painted them: ours lit for Ordon gear, the game's first slot only
-// for what it now holds, and nothing lit while the clothes are off
+// the rings after the game has painted them: the game's first slot only lights for what it now
+// holds (ours lights for the Ordon gear when it's drawn), and nothing lights while the clothes
+// are off
 static void paint_gear_rings(dMenu_Collect2D_c* m) {
-    if (m != gearMenu || !m->mpScreen) return;
+    if (m != gearMenu || !m->mpScreen || !gameLayout) return;
     J2DScreen* scr = m->mpScreen;
-    if (!gameLayout) {
-        // only our own rings; the game's cells belong to whoever rearranged them
-        bool bare = clothes_off();
-        paint_ring(gearSlot[GEAR_SWORD].ring, dComIfGs_getSelectEquipSword() == dItemNo_WOOD_STICK_e);
-        paint_ring(gearSlot[GEAR_SHIELD].ring, dComIfGs_getSelectEquipShield() == dItemNo_WOOD_SHIELD_e);
-        paint_ring(gearSlot[GEAR_CLOTHES].ring, !bare && dComIfGs_getSelectEquipClothes() == dItemNo_WEAR_CASUAL_e);
-        return;
-    }
     u8 sword = dComIfGs_getSelectEquipSword();
     u8 shield = dComIfGs_getSelectEquipShield();
     u8 clothes = dComIfGs_getSelectEquipClothes();
     bool bare = clothes_off();
 
-    if (gearSlot[GEAR_SWORD].root) {
-        paint_ring(gearSlot[GEAR_SWORD].ring, sword == dItemNo_WOOD_STICK_e);
+    if (gearSlot[GEAR_SWORD].anchor)
         paint_ring(scr->search(MULTI_CHAR('ken_g_0')), sword == dItemNo_SWORD_e && m->field_0x22d[3][0]);
-    }
-    if (gearSlot[GEAR_SHIELD].root) {
-        paint_ring(gearSlot[GEAR_SHIELD].ring, shield == dItemNo_WOOD_SHIELD_e);
+    if (gearSlot[GEAR_SHIELD].anchor)
         paint_ring(scr->search(MULTI_CHAR('tate_g_0')), shield == dItemNo_SHIELD_e && m->field_0x22d[3][1]);
-    }
-    if (gearSlot[GEAR_CLOTHES].root || bare) {
+    if (gearSlot[GEAR_CLOTHES].anchor || bare) {
         static const u64 rings[3] = {MULTI_CHAR('fuku_g_0'), MULTI_CHAR('fuku_g_1'), MULTI_CHAR('fuku_g_2')};
         static const u8 wear[3] = {dItemNo_WEAR_KOKIRI_e, dItemNo_WEAR_ZORA_e, dItemNo_ARMOR_e};
         for (int i = 0; i < 3; i++) paint_ring(scr->search(rings[i]), !bare && clothes == wear[i] && m->field_0x22d[i + 3][2]);
-        paint_ring(gearSlot[GEAR_CLOTHES].ring, !bare && clothes == dItemNo_WEAR_CASUAL_e);
     }
 }
 
@@ -4973,18 +4973,15 @@ static void show_tag(J2DScreen* scr, u64 tag, bool show) {
 static void fill_gear_column(dMenu_Collect2D_c* m) {
     J2DScreen* scr = m->mpScreen;
     for (int row = 0; row < GEAR_ROWS; row++) {
-        GearSlot& slot = gearSlot[row];
-        if (!slot.root) continue;
-        bool show = gear_owned(row);
-        m->field_0x22d[gearCol][row] = show;
+        if (!gearSlot[row].anchor) continue;
+        m->field_0x22d[gearCol][row] = gear_owned(row);
         m->field_0x184[gearCol][row] = kGearRows[row].name;
         m->field_0x1d8[gearCol][row] = kGearRows[row].name + 0x100;
-        show_gear_slot(slot, show);
     }
 
     if (!gameLayout) return;  // another mod has rearranged the game's own cells; leave them be
 
-    if (gearSlot[GEAR_SWORD].root) {
+    if (gearSlot[GEAR_SWORD].anchor) {
         bool ordon = dComIfGs_isItemFirstBit(dItemNo_SWORD_e);
         m->field_0x22d[3][0] = ordon;
         m->field_0x184[3][0] = 0x18D;
@@ -4993,7 +4990,7 @@ static void fill_gear_column(dMenu_Collect2D_c* m) {
         show_tag(scr, MULTI_CHAR('ken_01'), true);
         show_tag(scr, MULTI_CHAR('ken_n0'), ordon);
     }
-    if (gearSlot[GEAR_SHIELD].root) {
+    if (gearSlot[GEAR_SHIELD].anchor) {
         bool wooden = dComIfGs_isItemFirstBit(dItemNo_SHIELD_e);
         m->field_0x22d[3][1] = wooden;
         m->field_0x184[3][1] = 0x190;
@@ -5004,7 +5001,7 @@ static void fill_gear_column(dMenu_Collect2D_c* m) {
     }
     // the game hides the whole clothes row while the Ordon Clothes are on; with their own slot the
     // rest of the row is still something to change into
-    if (gearSlot[GEAR_CLOTHES].root && dComIfGs_getSelectEquipClothes() == dItemNo_WEAR_CASUAL_e) {
+    if (gearSlot[GEAR_CLOTHES].anchor && dComIfGs_getSelectEquipClothes() == dItemNo_WEAR_CASUAL_e) {
         static const u64 slots[3] = {MULTI_CHAR('fuku_n0'), MULTI_CHAR('fuku_n1'), MULTI_CHAR('fuku_n2')};
         static const u8 wear[3] = {dItemNo_WEAR_KOKIRI_e, dItemNo_WEAR_ZORA_e, dItemNo_ARMOR_e};
         for (int i = 0; i < 3; i++) {
@@ -5014,18 +5011,10 @@ static void fill_gear_column(dMenu_Collect2D_c* m) {
     }
 }
 
-// what the game (and any mod hooked into it) puts in a cell, without us answering
-static u64 cell_tag(dMenu_Collect2D_c* m, int x, int y) {
-    gearAsking = true;
-    u64 tag = m->getItemTag(x, y, true);
-    gearAsking = false;
-    return tag;
-}
-
 static bool gear_built_for(dMenu_Collect2D_c* m) {
     if (m != gearMenu || m->mpScreen != gearScreen) return false;
     for (GearSlot& slot : gearSlot)
-        if (slot.root && m->mpScreen->search(slot.tag) != slot.root) return false;
+        if (slot.anchor && m->mpScreen->search(slot.tag) != slot.anchor) return false;
     return true;
 }
 
@@ -5037,29 +5026,31 @@ static void gear_build(dMenu_Collect2D_c* m) {
     gearMenu = nullptr;
     gearScreen = nullptr;
     for (GearSlot& slot : gearSlot) slot = GearSlot{};
+    CPaneMgr* measure = any_cell(m);
+    if (!measure) return;  // the screen isn't set up yet
 
     gameLayout = cell_tag(m, 3, 0) == MULTI_CHAR('ken_n0') && cell_tag(m, 3, 1) == MULTI_CHAR('tate_n0') &&
                  cell_tag(m, 3, 2) == MULTI_CHAR('fuku_n0');
+    log_gear_layout(m);
 
-    // the nearest column left of the game's slots with nothing in it
-    gearCol = -1;
-    for (int col = 2; col >= 0 && gearCol < 0; col--) {
-        bool free = true;
-        for (int row = 0; row < GEAR_ROWS; row++) free = free && cell_tag(m, col, row) == 0;
-        if (free) gearCol = col;
-    }
+    // one column left of the leftmost cell in use across the gear rows
+    int left = 7;
+    for (int row = 0; row < GEAR_ROWS; row++)
+        for (int x = 0; x < left; x++)
+            if (cell_tag(m, x, row)) left = x;
+    gearCol = left - 1;
     if (gearCol < 0) {
         mods::log::warn("no free column left of the gear for the Ordon slots");
         return;
     }
-    if (gearCol != 2) mods::log::info("the Ordon gear slots sit in column {}, the nearer one is taken", gearCol);
+    mods::log::info("Ordon gear slots go in column {}", gearCol);
 
     JKRHeap* was = mDoExt_setCurrentHeap(m->mpHeap);
     for (int row = 0; row < GEAR_ROWS; row++) {
         if (!gear_slot_on(row)) continue;
-        build_gear_slot(m, row);
+        build_gear_slot(m, row, measure);
         GearSlot& slot = gearSlot[row];
-        if (slot.root && !m->mpSelPm[gearCol][row])
+        if (slot.anchor && !m->mpSelPm[gearCol][row])
             m->mpSelPm[gearCol][row] = JKR_NEW CPaneMgr(m->mpScreen, slot.tag, 0, nullptr);
     }
     mDoExt_setCurrentHeap(was);
@@ -5078,7 +5069,7 @@ static void gear_tag_post(ModContext*, void* args, void* retval, void*) {
     if (gearAsking || !retval) return;
     auto* m = mods::arg<dMenu_Collect2D_c*>(args, 0);
     int x = mods::arg<int>(args, 1), y = mods::arg<int>(args, 2);
-    if (m != gearMenu || x != gearCol || y < 0 || y >= GEAR_ROWS || !gearSlot[y].root) return;
+    if (m != gearMenu || x != gearCol || y < 0 || y >= GEAR_ROWS || !gearSlot[y].anchor) return;
     *static_cast<u64*>(retval) = gearSlot[y].tag;
 }
 
@@ -5090,7 +5081,7 @@ static void gear_rings_post(ModContext*, void* args, void*, void*) {
 
 static u8 waitX, waitY;  // where the cursor was when this frame of the menu started
 
-static bool is_ours(int x, int y) { return x == gearCol && y >= 0 && y < GEAR_ROWS && gearSlot[y].root; }
+static bool is_ours(int x, int y) { return x == gearCol && y >= 0 && y < GEAR_ROWS && gearSlot[y].anchor; }
 
 // the cursor's frame around a cell, as the game draws it around its gear
 static void point_cursor_at(dMenu_Collect2D_c* m, int x, int y) {
@@ -5146,14 +5137,90 @@ static void gear_cursor(dMenu_Collect2D_c* m) {
     move_cursor(m, toX, toY);
 }
 
-// our copies fade in and out with the slots they were copied from, and grow when picked
-static void gear_follow_screen(dMenu_Collect2D_c* m) {
-    for (int row = 0; row < GEAR_ROWS; row++) {
-        GearSlot& slot = gearSlot[row];
-        if (!slot.root) continue;
-        if (slot.home) slot.root->setAlpha(slot.home->getAlpha());
-        size_cell(m, gearCol, row, m->mCursorX == gearCol && m->mCursorY == row);
+// --- drawing our slots ---
+// Each of our slots is the game's own first slot in that row drawn a second time, moved over to
+// our spot, with the Ordon item's icon showing and its ring lit for what's worn. Drawn this way it
+// looks exactly like the game's (and like any texture pack's) and fades with the menu.
+
+static void set_shown(J2DPane* pane, bool show) {
+    if (!pane) return;
+    if (show)
+        pane->show();
+    else
+        pane->hide();
+}
+
+static bool ordon_worn(int row) {
+    switch (row) {
+    case GEAR_SWORD: return dComIfGs_getSelectEquipSword() == dItemNo_WOOD_STICK_e;
+    case GEAR_SHIELD: return dComIfGs_getSelectEquipShield() == dItemNo_WOOD_SHIELD_e;
+    default: return dComIfGs_getSelectEquipClothes() == dItemNo_WEAR_CASUAL_e && !clothes_off();
     }
+}
+
+static void draw_slot(dMenu_Collect2D_c* m, int row, J2DGrafContext* graf) {
+    GearSlot& slot = gearSlot[row];
+    J2DPane* home = slot.home;
+    if (!home || !m->field_0x22d[gearCol][row]) return;
+
+    // as the game's slot is now
+    f32 homeX = home->getTranslateX(), homeY = home->getTranslateY();
+    bool homeShown = home->isVisible();
+    bool keepShown = slot.keep && slot.keep->isVisible(), dropShown = slot.drop && slot.drop->isVisible();
+    JUtility::TColor ringBlack, ringWhite;
+    auto* ring = slot.ring && slot.ring->getTypeID() == 18 ? static_cast<J2DPicture*>(slot.ring) : nullptr;
+    if (ring) ringBlack = ring->getBlack(), ringWhite = ring->getWhite();
+    f32 looseX[2], looseY[2];
+    for (int i = 0; i < 2; i++)
+        if (slot.loose[i]) looseX[i] = slot.loose[i]->getTranslateX(), looseY[i] = slot.loose[i]->getTranslateY();
+
+    // ours, for one drawing
+    home->translate(homeX + slot.dx, homeY + slot.dy);
+    home->show();
+    if (slot.ownIcon) {
+        set_shown(slot.keep, false);
+        slot.ownIcon->show();
+    } else {
+        set_shown(slot.keep, true);
+    }
+    set_shown(slot.drop, false);
+    paint_ring(slot.ring, ordon_worn(row));
+    for (int i = 0; i < 2; i++)
+        if (slot.loose[i]) slot.loose[i]->translate(looseX[i] + slot.dx, looseY[i] + slot.dy);
+
+    home->draw(0.0f, 0.0f, graf, false, true);
+    for (int i = 0; i < 2; i++)
+        if (slot.loose[i] && slot.loose[i] != home) slot.loose[i]->draw(0.0f, 0.0f, graf, false, true);
+
+    // and back
+    home->translate(homeX, homeY);
+    set_shown(home, homeShown);
+    set_shown(slot.keep, keepShown);
+    set_shown(slot.drop, dropShown);
+    if (slot.ownIcon) slot.ownIcon->hide();
+    if (ring) ring->setBlackWhite(ringBlack, ringWhite);
+    for (int i = 0; i < 2; i++)
+        if (slot.loose[i]) slot.loose[i]->translate(looseX[i], looseY[i]);
+}
+
+// the collection screen draws its cursor right after the screen itself: ours go in just before it
+DEFINE_HOOK(&dSelect_cursor_c::draw, CursorDraw);
+
+static HookAction gear_draw(ModContext*, void* args, void*, void*) {
+    dMenu_Collect2D_c* m = gearMenu;
+    if (!m || mods::arg<dSelect_cursor_c*>(args, 0) != m->mpDrawCursor || !gear_built_for(m)) return HOOK_CONTINUE;
+    J2DGrafContext* graf = dComIfGp_getCurrentGrafPort();
+    if (!graf) return HOOK_CONTINUE;
+    graf->setup2D();
+    for (int row = 0; row < GEAR_ROWS; row++)
+        if (gearSlot[row].anchor) draw_slot(m, row, graf);
+    return HOOK_CONTINUE;
+}
+
+// our cells grow when picked, like the game's
+static void gear_follow_screen(dMenu_Collect2D_c* m) {
+    for (int row = 0; row < GEAR_ROWS; row++)
+        if (gearSlot[row].anchor) size_cell(m, gearCol, row, m->mCursorX == gearCol && m->mCursorY == row);
 }
 
 // --- putting things on and taking them off ---
@@ -5184,28 +5251,6 @@ static void gear_changed(dMenu_Collect2D_c* m, int row) {
     else
         m->setEquipItemFrameColorClothes(-1);
     paint_gear_rings(m);
-}
-
-// the item a gear cell stands for
-static u8 gear_item_at(int x, int y) {
-    if (x == gearCol && y < GEAR_ROWS && gearSlot[y].root) return kGearRows[y].item;
-    bool ownSlots = y < GEAR_ROWS && gearSlot[y].root;
-    switch (y) {
-    case 0:
-        if (x == 3) return dComIfGs_isItemFirstBit(dItemNo_SWORD_e) || ownSlots ? dItemNo_SWORD_e : dItemNo_WOOD_STICK_e;
-        if (x == 4) return dComIfGs_isItemFirstBit(dItemNo_LIGHT_SWORD_e) ? dItemNo_LIGHT_SWORD_e : dItemNo_MASTER_SWORD_e;
-        break;
-    case 1:
-        if (x == 3) return dComIfGs_isItemFirstBit(dItemNo_SHIELD_e) || ownSlots ? dItemNo_SHIELD_e : dItemNo_WOOD_SHIELD_e;
-        if (x == 4) return dItemNo_HYLIA_SHIELD_e;
-        break;
-    case 2:
-        if (x == 3) return dItemNo_WEAR_KOKIRI_e;
-        if (x == 4) return dItemNo_WEAR_ZORA_e;
-        if (x == 5) return dItemNo_ARMOR_e;
-        break;
-    }
-    return dItemNo_NONE_e;
 }
 
 static bool gear_worn(int row, u8 item) {
@@ -5261,33 +5306,101 @@ static bool take_off(dMenu_Collect2D_c* m, int row) {
     return true;
 }
 
-// A on a gear cell; true when we handled it and the game shouldn't
-static bool gear_press(dMenu_Collect2D_c* m) {
-    if (!gear_built_for(m)) return false;
-    int x = m->mCursorX, y = m->mCursorY;
-    if (y >= GEAR_ROWS || m->mIsWolf || !m->field_0x22d[x][y]) return false;
-    bool ours = x == gearCol && gearSlot[y].root;
-    bool games = gameLayout && ((x == 3 || x == 4) || (x == 5 && y == GEAR_CLOTHES));
-    if (!ours && !games) return false;
+// --- A on a gear cell ---
+// Our own slots are handled here outright. Every other gear cell is left to the game (or to a mod
+// that has rearranged the grid); afterwards, if A changed nothing and the cell under the cursor
+// is the one lit as worn, that's "take it off". Which cell is lit is read off the screen itself
+// (the yellow ring), so it doesn't matter whose cell it is or where it sits.
 
+struct GearWorn {
+    u8 sword, shield, clothes;
+    bool bare;
+};
+
+static GearWorn worn_now() {
+    return {dComIfGs_getSelectEquipSword(), dComIfGs_getSelectEquipShield(), dComIfGs_getSelectEquipClothes(), clothes_off()};
+}
+
+static GearWorn wornBefore;
+static bool aPressed;
+
+static bool gear_busy() {
     daPy_py_c* pl = daPy_getPlayerActorClass();
-    if (!pl) return false;
-    if (pl->getSwordChangeWaitTimer() || pl->getShieldChangeWaitTimer() || pl->getClothesChangeWaitTimer())
-        return ours;  // still changing, try again in a moment
+    return !pl || pl->getSwordChangeWaitTimer() || pl->getShieldChangeWaitTimer() || pl->getClothesChangeWaitTimer();
+}
 
-    u8 item = gear_item_at(x, y);
-    if (item == dItemNo_NONE_e) return false;
-    if (gear_worn(y, item)) return unequip_on() ? take_off(m, y) : ours;
-
-    // back into clothes the game thinks are already on: it would do nothing, so we change back
-    if (y == GEAR_CLOTHES && clothes_off() && dComIfGs_getSelectEquipClothes() == item) {
+// A on one of our slots
+static bool press_ours(dMenu_Collect2D_c* m) {
+    int x = m->mCursorX, y = m->mCursorY;
+    if (!gear_built_for(m) || !is_ours(x, y) || m->mIsWolf || !m->field_0x22d[x][y]) return false;
+    if (gear_busy()) return true;  // still changing, try again in a moment
+    u8 item = kGearRows[y].item;
+    if (gear_worn(y, item)) {
+        if (unequip_on()) take_off(m, y);
+    } else {
         put_on(m, y, item);
-        return true;
     }
-    if (y == GEAR_CLOTHES && clothes_off()) wrBlob("gearClothesOff", 0);  // the game's change takes it from here
-    if (!ours) return false;
-    put_on(m, y, item);
     return true;
+}
+
+static bool is_lit_ring(J2DPane* pane) {
+    if (pane->getTypeID() != 18) return false;
+    JUtility::TColor white = static_cast<J2DPicture*>(pane)->getWhite();
+    return white.r == 255 && white.g == 255 && white.b == 0;
+}
+
+// a lit (yellow) ring drawn over the middle of this cell, anywhere in the screen
+static bool lit_ring_over(J2DPane* pane, CPaneMgr* measure, const Vec& middle, f32 reach) {
+    if (!pane->isVisible()) return false;
+    if (is_lit_ring(pane)) {
+        Vec at = measure->getGlobalVtxCenter(pane, false, 0);
+        f32 dx = at.x - middle.x, dy = at.y - middle.y;
+        if (dx * dx + dy * dy <= reach * reach) return true;
+    }
+    for (J2DPane* kid = pane->getFirstChildPane(); kid; kid = kid->getNextChildPane())
+        if (lit_ring_over(kid, measure, middle, reach)) return true;
+    return false;
+}
+
+static bool cell_lit(dMenu_Collect2D_c* m, int x, int y) {
+    CPaneMgr* cell = m->mpSelPm[x][y];
+    J2DPane* pane = cell ? cell->getPanePtr() : nullptr;
+    if (!pane) {
+        u64 tag = m->getItemTag(x, y, true);
+        pane = tag ? m->mpScreen->search(tag) : nullptr;
+    }
+    CPaneMgr* measure = cell ? cell : m->mpSelPm[3][0];
+    if (!pane || !measure || !m->mpScreen) return false;
+    Mtx scratch;
+    Vec corner0 = measure->getGlobalVtx(pane, &scratch, 0, false, 0);
+    Vec corner3 = measure->getGlobalVtx(pane, &scratch, 3, false, 0);
+    Vec middle = {(corner0.x + corner3.x) * 0.5f, (corner0.y + corner3.y) * 0.5f, 0.0f};
+    f32 w = corner3.x - corner0.x, h = corner3.y - corner0.y;
+    f32 reach = 0.4f * std::sqrt(w * w + h * h);  // inside the cell
+    return lit_ring_over(m->mpScreen, measure, middle, reach);
+}
+
+static void after_press(dMenu_Collect2D_c* m) {
+    int x = m->mCursorX, y = m->mCursorY;
+    if (y < 0 || y >= GEAR_ROWS || m->mIsWolf || !m->mpScreen || (gear_built_for(m) && is_ours(x, y))) return;
+    GearWorn now = worn_now();
+    bool changed = now.sword != wornBefore.sword || now.shield != wornBefore.shield || now.clothes != wornBefore.clothes;
+    if (changed) {
+        // new clothes picked while in the sumo outfit: the game's change has put him back in clothes
+        if (now.clothes != wornBefore.clothes && wornBefore.bare) wrBlob("gearClothesOff", 0);
+        return;
+    }
+    if (gear_busy()) return;
+    bool lit = cell_lit(m, x, y);
+    if (y == GEAR_CLOTHES && wornBefore.bare) {
+        // back into the clothes he had on (the game thinks they still are, so it did nothing)
+        static const u8 wear[3] = {dItemNo_WEAR_KOKIRI_e, dItemNo_WEAR_ZORA_e, dItemNo_ARMOR_e};
+        bool gameCell = gameLayout && x >= 3 && x <= 5 && m->field_0x22d[x][y] && now.clothes == wear[x - 3];
+        bool thatOne = gameLayout ? gameCell : lit;
+        if (thatOne) put_on(m, y, now.clothes);
+        return;
+    }
+    if (lit && unequip_on()) take_off(m, y);
 }
 
 static HookAction gear_wait_pre(ModContext*, void* args, void*, void*) {
@@ -5295,22 +5408,35 @@ static HookAction gear_wait_pre(ModContext*, void* args, void*, void*) {
     gear_build(m);
     waitX = m->mCursorX;
     waitY = m->mCursorY;
-    if (!dMw_A_TRIGGER()) return HOOK_CONTINUE;
-    return gear_press(m) ? HOOK_SKIP_ORIGINAL : HOOK_CONTINUE;
+    wornBefore = worn_now();
+    aPressed = dMw_A_TRIGGER();
+    if (aPressed && press_ours(m)) {
+        aPressed = false;
+        return HOOK_SKIP_ORIGINAL;
+    }
+    return HOOK_CONTINUE;
 }
 
+// a mouse click on a cell
 static HookAction gear_click_pre(ModContext*, void* args, void*, void*) {
-    return gear_press(mods::arg<dMenu_Collect2D_c*>(args, 0)) ? HOOK_SKIP_ORIGINAL : HOOK_CONTINUE;
+    auto* m = mods::arg<dMenu_Collect2D_c*>(args, 0);
+    if (press_ours(m)) return HOOK_SKIP_ORIGINAL;
+    aPressed = true;
+    return HOOK_CONTINUE;
 }
 
-// the game only offers "Equip" on its own gear cells
 static void gear_wait_post(ModContext*, void* args, void*, void*) {
     auto* m = mods::arg<dMenu_Collect2D_c*>(args, 0);
+    if (aPressed) {
+        aPressed = false;
+        after_press(m);
+    }
     if (!gear_built_for(m)) return;
     gear_cursor(m);
     gear_follow_screen(m);
     int x = m->mCursorX, y = m->mCursorY;
     if (!is_ours(x, y)) return;
+    // the game only offers "Equip" on its own gear cells
     m->setAButtonString(m->field_0x22d[x][y] && !m->mIsWolf ? 0x436 : 0);
 }
 
@@ -5467,6 +5593,7 @@ static void gear_init() {
     bool ringsOk = post_hook(CollectRingSword, gear_rings_post) && post_hook(CollectRingShield, gear_rings_post) &&
                    post_hook(CollectRingClothes, gear_rings_post);
     if (!ringsOk) mods::log::warn("the worn-gear rings may light the wrong slot");
+    if (!pre_hook(CursorDraw, gear_draw)) mods::log::warn("the Ordon gear slots can't be drawn");
     if (!pre_hook(ItemPickup, table_shield_pickup)) mods::log::warn("the Ordon Shield on the table won't play its pickup scene");
 }
 
