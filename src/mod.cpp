@@ -2864,11 +2864,11 @@ static bool was_judged(fpc_ProcID id) {
 // Who's close enough is measured here rather than waiting for the game to report a hit, since a
 // lot of enemies never report being touched by the lantern's kind of fire.
 //
-// In online multiplayer, other players are a stand-in actor (named "cpRival", counted as an enemy)
-// that passes any hit on to that player's game, fire included. So a player gets no big flame:
-// they get fire hits instead, and their own game shows Link catching fire. A hit they block isn't
-// passed on as one (only the block sound and push-back are), so their shield can't be set alight
-// from here.
+// Online multiplayer mods show other players as a stand-in actor of their own (counted as an
+// enemy) that passes any hit on to that player's game, fire included. So a player gets no big
+// flame: they get fire hits instead, and their own game shows Link catching fire. A hit they block
+// isn't passed on as one (only the block sound and push-back are), so their shield can't be set
+// alight from here.
 
 static const int kBurnFrames = 120;
 static const int kScorchAt[2] = {100, 50};  // frames left when each scorch lands
@@ -2905,10 +2905,11 @@ static const dCcD_SrcCps kPlayerFireSrc = {
     },
 };
 
-// the stand-in actor online multiplayer uses for another player, if it's loaded
+// Another player's stand-in, whichever multiplayer mod made it: an actor the game itself doesn't
+// have (a mod added it) that never set itself any eyes, the way the game's own creatures all do.
 static bool is_other_player(fopAc_ac_c* actor) {
-    dStage_objectNameInf* rival = dStage_searchName("cpRival");
-    return rival != nullptr && fopAcM_GetName(actor) == rival->procname;
+    if (fopAcM_GetName(actor) < fpcNm_MAX_NUM) return false;  // one of the game's own
+    return (actor->eyePos - actor->current.pos).abs2() < 1.0f;
 }
 
 // Players burn on the same clock as enemies, just without the big flame (their own game shows
@@ -4023,11 +4024,19 @@ static J3DModel* body_part(JKRArchive* arc, u32 index, u32 tag, u32 modelFlags, 
 // Throws the body away, all of it. Each Midna that wears it hooks her own eye, face and hand
 // animations into it, and those go with her when she's removed (any reload: a loading zone, a
 // fall into a pit, a warp), so a body one Midna wore is never handed to the next.
-static void free_midna_body() {
+//
+// The memory it lives in is kept, though, and reused for the next one: after a warp or a long
+// play session there may not be a big enough free stretch left to make it again.
+static void free_midna_body(bool keepRoom = true) {
     if (bodyArchive) bodyArchive->unmount();  // also takes it off the game's list of archives
-    if (bodyHeap) bodyHeap->destroy();
     bodyArchive = nullptr;
-    bodyHeap = nullptr;
+    if (bodyHeap) {
+        if (keepRoom)
+            bodyHeap->freeAll();
+        else
+            bodyHeap->destroy();
+    }
+    if (!keepRoom) bodyHeap = nullptr;
     ourBody = {};
     midnaBodyTried = false;
 }
@@ -4051,9 +4060,11 @@ static bool load_midna_body() {
     DVDClose(&file);
     u32 room = fileSize * 3 + 0x200000;
 
+    if (bodyHeap && u32(bodyHeap->getHeapSize()) < room) free_midna_body(false);  // a bigger model now
     JKRHeap* parents[] = {JKRHeap::sRootHeap, mDoExt_getArchiveHeap(), mDoExt_getGameHeap()};
     for (JKRHeap* parent : parents) {
-        if (parent && (bodyHeap = JKRExpHeap::create(room, parent, false))) break;
+        if (bodyHeap) break;
+        if (parent) bodyHeap = JKRExpHeap::create(room, parent, false);
     }
     if (!bodyHeap) {
         mods::log::warn("no room ({} KB) to load Midna's body, she'll show in her shadow form", room / 1024);
@@ -4153,8 +4164,12 @@ static bool midna_allowed(daAlink_c* lnk) {
 }
 
 // straight back into the shadow, no animation (cutscenes, the wolf, the setting turned off)
+static int justHidden;  // frames since she went back into his shadow (see midna_exec_post)
+static void show_shadow_state_outside(daMidna_c* midna);  // with her drawing, further down
+
 static void midna_hide_now(daMidna_c* midna) {
     if (midna && midnaPhase != MIDNA_HIDDEN) {
+        justHidden = 30;
         midna->offTagWaitPos();
         midna->offStateFlg0((daMidna_c::daMidna_FLG0)(daMidna_c::FLG0_WOLF_NO_POS | daMidna_c::FLG0_UNK_200 |
                                                       daMidna_c::FLG0_UNK_100));
@@ -4205,6 +4220,8 @@ static fpc_ProcID midnaSeen = fpcM_ERROR_PROCESS_ID_e;  // the Midna the follow 
 
 static HookAction midna_exec_pre(ModContext*, void* args, void*, void*) {
     auto* midna = mods::arg<daMidna_c*>(args, 0);
+    // her own update sees her as she really is, not the shadow state shown to the outside
+    if (midnaShadowForced && midnaShowsReal) midna->offStateFlg1(daMidna_c::FLG1_SHADOW_MODEL_DRAW_DEMO_FORCE);
     auto* lnk = (daAlink_c*)dComIfGp_getPlayer(0);
     if (!lnk) return HOOK_CONTINUE;
 
@@ -4217,7 +4234,7 @@ static HookAction midna_exec_pre(ModContext*, void* args, void*, void*) {
         midnaMoving = false;
         midnaShadowForced = false;
         midnaShowsReal = false;
-        if (ourBody.body) free_midna_body();
+        if (ourBody.body || midnaBodyTried) free_midna_body();  // and a body that failed gets another try
     }
 
     // Talking to her while she's out: she stays where she is, and she and Link face each other.
@@ -4339,7 +4356,21 @@ static HookAction midna_exec_pre(ModContext*, void* args, void*, void*) {
 }
 
 static void midna_exec_post(ModContext*, void* args, void*, void*) {
-    if (auto* lnk = (daAlink_c*)dComIfGp_getPlayer(0)) take_body_back(lnk);
+    auto* lnk = (daAlink_c*)dComIfGp_getPlayer(0);
+    if (lnk) take_body_back(lnk);
+    auto* me = mods::arg<daMidna_c*>(args, 0);
+    // In a talk with her she counts as riding with Link, the way she always is for a talk: her
+    // choices (warp, transform) and the game's talk camera for her both go by that.
+    if (lnk && midnaPhase == MIDNA_TALKING && !lnk->checkWolf()) lnk->onMidnaRide();
+    // Once she's back in his shadow outside a cutscene, nothing of ours may leave her shadow form
+    // showing (it would hang in the air where she'd ride a wolf).
+    if (justHidden > 0) {
+        justHidden--;
+        if (midnaPhase == MIDNA_HIDDEN && lnk && !lnk->checkWolf() && !lnk->checkMetamorphose() &&
+            !dComIfGp_event_runCheck())
+            me->offStateFlg1(daMidna_c::FLG1_SHADOW_MODEL_DRAW_DEMO_FORCE);
+    }
+    show_shadow_state_outside(me);
     // She only accepts being talked to while she rides in Link's shadow (the game says so at the
     // end of her update). Out beside him she's just as available.
     bool out = midnaPhase == MIDNA_FOLLOWING || midnaPhase == MIDNA_RISING || midnaPhase == MIDNA_TALKING;
@@ -4484,9 +4515,10 @@ static HookAction midna_anm_pre(ModContext*, void* args, void*, void*) {
 // shadow form if the body couldn't be loaded).
 //
 // Between frames, though, she's left in the state the game itself uses for Midna showing beside
-// human Link: her shadow form. Anything outside her own drawing that looks at her (another mod
-// mirroring her to other players, say) sees that, and only her drawing (and Link's ground shadow,
-// which the game skips while that state is on) sees her real body.
+// human Link: her shadow form. Anything that looks at her from outside (another mod mirroring her
+// to other players, say) sees the game's own, ordinary state for her. The game itself never does:
+// that state is lifted for her whole update and her drawing (and Link's ground shadow, which the
+// game skips while it's on), so the game's own logic always sees her as she really is.
 DEFINE_HOOK(&daMidna_c::draw, MidnaDraw);
 DEFINE_HOOK(&daAlink_c::shadowDraw, LinkShadowDraw);
 
@@ -4499,8 +4531,18 @@ static void midna_draw_post(ModContext*, void* args, void*, void*) {
         return;
     }
     midnaShowsReal = midna->mpModel != nullptr;
-    if (midnaShowsReal)
+    if (midnaShowsReal) {
         midna->offStateFlg0((daMidna_c::daMidna_FLG0)(daMidna_c::FLG0_NO_DRAW | daMidna_c::FLG0_UNK_10000));
+    } else if (!midna->checkStateFlg1(daMidna_c::FLG1_SHADOW_MODEL_DRAW_DEMO_FORCE)) {
+        // no body to show: the game draws her shadow form, which takes that state for real
+        midna->onStateFlg1(daMidna_c::FLG1_SHADOW_MODEL_DRAW_DEMO_FORCE);
+        midnaShadowForced = true;
+    }
+}
+
+// the outside-facing shadow state goes on once her update is done (see above)
+static void show_shadow_state_outside(daMidna_c* midna) {
+    if (midnaPhase == MIDNA_HIDDEN || !midnaShowsReal) return;
     if (!midna->checkStateFlg1(daMidna_c::FLG1_SHADOW_MODEL_DRAW_DEMO_FORCE)) {
         midna->onStateFlg1(daMidna_c::FLG1_SHADOW_MODEL_DRAW_DEMO_FORCE);
         midnaShadowForced = true;
@@ -5112,6 +5154,18 @@ static bool gear_built_for(dMenu_Collect2D_c* m) {
 // Adds our slots to this menu's screen, once. Called from wherever we first see the menu with
 // its screen up (the screen being set up, the menu being made, or its first frame), whichever
 // the game actually reaches.
+// The menu's own memory is sized for the game's own panes and can be full, so our panes and cell
+// managers live in a small heap of the mod's own (the screen still frees the panes with it).
+static JKRHeap* gearHeap;
+static CPaneMgr* ourCells[GEAR_ROWS];
+
+static void forget_our_cells() {
+    for (CPaneMgr*& cell : ourCells) {
+        if (cell) JKR_DELETE(cell);
+        cell = nullptr;
+    }
+}
+
 static void gear_build(dMenu_Collect2D_c* m) {
     if (!m || !m->mpScreen || gear_built_for(m)) return;
     gearMenu = nullptr;
@@ -5136,13 +5190,25 @@ static void gear_build(dMenu_Collect2D_c* m) {
     }
     mods::log::info("Ordon gear slots go in column {}", gearCol);
 
-    JKRHeap* was = mDoExt_setCurrentHeap(m->mpHeap);
+    forget_our_cells();  // the last menu's, its panes are gone
+    if (!gearHeap) gearHeap = trail_make_heap(0x40000);
+    if (!gearHeap) {
+        mods::log::warn("no memory for the Ordon gear slots");
+        return;
+    }
+    JKRHeap* was = mDoExt_setCurrentHeap(gearHeap);
     for (int row = 0; row < GEAR_ROWS; row++) {
         if (!gear_slot_on(row)) continue;
         build_gear_slot(m, row, measure);
         GearSlot& slot = gearSlot[row];
-        if (slot.anchor && !m->mpSelPm[gearCol][row])
-            m->mpSelPm[gearCol][row] = JKR_NEW CPaneMgr(m->mpScreen, slot.tag, 0, nullptr);
+        if (!slot.anchor) {
+            mods::log::warn("Ordon gear slot for row {} couldn't be made", row);
+            continue;
+        }
+        if (!m->mpSelPm[gearCol][row]) {
+            ourCells[row] = JKR_NEW CPaneMgr(m->mpScreen, slot.tag, 0, nullptr);
+            m->mpSelPm[gearCol][row] = ourCells[row];
+        }
     }
     mDoExt_setCurrentHeap(was);
 
@@ -5313,6 +5379,14 @@ static HookAction gear_draw(ModContext*, void* args, void*, void*) {
     J2DGrafContext* graf = dComIfGp_getCurrentGrafPort();
     if (!graf) return HOOK_CONTINUE;
     graf->setup2D();
+    static dMenu_Collect2D_c* loggedFor;
+    if (loggedFor != m) {
+        loggedFor = m;
+        for (int row = 0; row < GEAR_ROWS; row++)
+            if (gearSlot[row].anchor)
+                mods::log::info("drawing Ordon gear slot {} (owned {}), moved {:.0f},{:.0f}", row,
+                                (int)m->field_0x22d[gearCol][row], gearSlot[row].dx, gearSlot[row].dy);
+    }
     for (int row = 0; row < GEAR_ROWS; row++)
         if (gearSlot[row].anchor) draw_slot(m, row, graf);
     return HOOK_CONTINUE;
@@ -5728,6 +5802,9 @@ static void gear_init() {
 
 static void gear_shutdown() {
     auto* lnk = (daAlink_c*)dComIfGp_getPlayer(0);
+    // a menu that's still open keeps its panes; only the cell managers are ours to drop
+    gearMenu = nullptr;
+    gearScreen = nullptr;
     if (ordonClothSwap) svc_texture->unregister(mod_ctx, ordonClothSwap);
     ordonClothSwap = 0;
     if (ordonClothArt.data) svc_resource->free(mod_ctx, &ordonClothArt);
@@ -6173,7 +6250,7 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
     drop_bombling_art();
     fire_arrow_shutdown();
     if (daMidna_c* midna = daPy_py_c::getMidnaActor()) midna_hide_now(midna);
-    free_midna_body();
+    free_midna_body(false);
     gear_shutdown();
     return MOD_OK;
 }
