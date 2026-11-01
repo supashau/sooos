@@ -3103,10 +3103,18 @@ static const dCcD_SrcCps kPlayerFireSrc = {
     },
 };
 
-// Another player's stand-in, whichever multiplayer mod made it: an actor the game itself doesn't
-// have (a mod added it) that never set itself any eyes, the way the game's own creatures all do.
+// Another player's stand-in. Online co-op adds one actor of its own for every other player,
+// registered under the name below (and it sets that actor's eyes when locking on to players is
+// allowed, so the eyes alone can't tell). For any other multiplayer mod: an actor the game itself
+// doesn't have (a mod added it) that never set itself any eyes, the way the game's own creatures
+// all do.
+static const char kCoopPlayerActor[] = "cpRival";
+
 static bool is_other_player(fopAc_ac_c* actor) {
-    if (fopAcM_GetName(actor) < fpcNm_MAX_NUM) return false;  // one of the game's own
+    s16 name = fopAcM_GetName(actor);
+    if (name < fpcNm_MAX_NUM) return false;  // one of the game's own
+    dStage_objectNameInf* coopPlayer = dStage_searchName(kCoopPlayerActor);
+    if (coopPlayer && coopPlayer->procname == name) return true;
     return (actor->eyePos - actor->current.pos).abs2() < 1.0f;
 }
 
