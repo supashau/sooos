@@ -129,6 +129,7 @@ enum FlourishMode : int { FLOURISH_ON, FLOURISH_WOODEN, FLOURISH_DEFAULT, FLOURI
 static const char* const flourishNames[] = {"On", "Wooden", "Default", "Off"};
 static ConfigVarHandle flourishOption;
 static ConfigVarHandle vLanternBurn;  // Deal Burn with Lantern
+static ConfigVarHandle vTrueDamage;   // PVP True Damage
 static ConfigVarHandle vManualShield; // Manual Shielding
 static ConfigVarHandle vFireDamage;     // Deal Burn Damage (fire arrows)
 
@@ -3064,7 +3065,7 @@ static bool was_judged(fpc_ProcID id) {
 //
 // Online multiplayer mods show other players as a stand-in actor of their own (counted as an
 // enemy) that passes any hit on to that player's game, fire included. So a player gets no big
-// flame: they get fire hits instead, and their own game shows Link catching fire. A hit they block
+// flame: they get one fire hit instead, and their own game shows Link catching fire. A hit they block
 // isn't passed on as one (only the block sound and push-back are), so their shield can't be set
 // alight from here.
 
@@ -3118,10 +3119,10 @@ static bool is_other_player(fopAc_ac_c* actor) {
     return (actor->eyePos - actor->current.pos).abs2() < 1.0f;
 }
 
-// Players burn on the same clock as enemies, just without the big flame (their own game shows
-// Link on fire): a fire hit as they catch fire, then two more while they burn. Each one is passed
-// on to their game as a fire hit, so it hurts a bit each time and keeps them burning.
-static const int kPlayerFireAt[3] = {kBurnFrames - 1, 80, 40};  // frames left when each one lands
+// A player gets one fire hit as they catch fire, passed on to their game, and that's all: their
+// Link burns there the game's own way (its own flame, damage and how long it lasts). They're still
+// counted as burning for the usual time, so the same fire doesn't keep hitting them.
+static const int kPlayerFireAt = kBurnFrames - 1;  // frames left when it lands
 
 struct BurningEnemy {
     fpc_ProcID id;
@@ -3183,17 +3184,12 @@ static bool set_on_fire(fopAc_ac_c* actor) {
     return true;
 }
 
-// Deal Burn Damage off: a fire arrow still sets things alight (the flame on an enemy, and on a
-// player the first fire hit, which is what sets their Link on fire), but the burn does no damage
-// after that
+// Deal Burn Damage off: a fire arrow still sets an enemy alight (its flame), but the burn does no
+// damage after that. A player's one fire hit is what sets their Link on fire, so it always lands.
 static bool hit_due(const BurningEnemy& enemy) {
+    if (enemy.player) return enemy.framesLeft == kPlayerFireAt;
     bool burnDamage = !enemy.fromArrow || cfgOn(vFireDamage);
-    if (!burnDamage) return enemy.player && enemy.framesLeft == kPlayerFireAt[0];
-    if (enemy.player) {
-        for (int at : kPlayerFireAt)
-            if (enemy.framesLeft == at) return true;
-        return false;
-    }
+    if (!burnDamage) return false;
     return enemy.framesLeft == kScorchAt[0] || enemy.framesLeft == kScorchAt[1];
 }
 
@@ -3559,6 +3555,9 @@ DEFINE_HOOK(&daAlink_c::setShieldGuard, SetShieldGuard);
 DEFINE_HOOK(&daAlink_c::checkItemAction, CheckItemAction);
 DEFINE_HOOK(&daAlink_c::decideCommonDoStatus, DoStatus);
 DEFINE_HOOK(&daAlink_c::checkNextAction, NextAction);
+DEFINE_HOOK(&daAlink_c::setSwordAtParam, SwordAtParam);
+DEFINE_HOOK(&daAlink_c::setCylAtParam, CylAtParam);
+DEFINE_HOOK(&daAlink_c::initCutTurnAt, TurnAtParam);
 DEFINE_HOOK(&cc_at_check, CcAtCheck);
 DEFINE_HOOK(&daAlink_c::checkCutAction, CutAction);
 DEFINE_HOOK(&daAlink_c::setSwordAtCollision, SwordHit);
@@ -3573,8 +3572,8 @@ DEFINE_HOOK(&daAlink_c::setSwordUpColorEffect, FxUp);
 DEFINE_HOOK(&daAlink_c::setSwordCutSplash, FxSplash);
 DEFINE_HOOK(&daAlink_c::setCutWaterDropEffect, FxDrop);
 
-static int comboStep, hp0;
-static bool wasGuarding, swinging, swordTucked, hpValid, flipping;
+static int comboStep;
+static bool wasGuarding, swinging, swordTucked, flipping;
 static bool forcedJump, forcedTurn, forcedDown, forcedHead, forcedBack;
 
 static bool in_cut_proc(daAlink_c* lnk) {
@@ -3868,37 +3867,116 @@ static void next_post(ModContext*, void* args, void*, void*) {
     swordTucked = false;
 }
 
-// cc_at_check already took off the plain (ordon) damage, so redo it from hp0 with the multiplier.
-// pct: wooden .5 (default), ordon 1, master 2, light 4 (master x2 again from the glow)
-static HookAction cc_pre(ModContext*, void* args, void*, void*) {
-    fopAc_ac_c* en = mods::arg<fopAc_ac_c*>(args, 0);
-    hpValid = swinging && en;
-    if (hpValid) hp0 = en->health;
-    return HOOK_CONTINUE;
-}
-
-static void cc_post(ModContext*, void* args, void*, void*) {
-    if (!hpValid) return;
-    hpValid = false;
-    fopAc_ac_c* en = mods::arg<fopAc_ac_c*>(args, 0);
-    dCcU_AtInfo* info = mods::arg<dCcU_AtInfo*>(args, 1);
-    if (!en || !info || info->mAttackPower == 0 || info->mHitType != HIT_TYPE_LINK_NORMAL_ATTACK) return;
-
+// Swing damage: the multiplier goes on the swing's own attack power, set the moment each move
+// starts (the game sets it once per move, through these three). The game then works the damage
+// out from that power as it does for any sword, and anything else that reads the hit sees the
+// same power: online co-op passes a hit on to the other player's game as its power, so the
+// multiplier reaches other players too. Wooden x0.5, Ordon x1, Master x2, Light x4 (an unarmed
+// swing counts as no sword at all, so the game adds no sword bonus of its own; the post-Zant glow
+// still doubles it like it does a real sword).
+static int unarmed_power(int atp) {
     static const int pct[] = {50, 100, 200, 400};
     int pick = cfgInt(vDamage, 0);
     if (pick < 0) pick = 0;
     if (pick > 3) pick = 3;
+    int power = atp * pct[pick] / 100;
+    return atp > 0 && power < 1 ? 1 : power;
+}
 
-    int dmg = info->mAttackPower * pct[pick] / 100;
-    if (dmg < 1) dmg = 1;
-    int hp = hp0 - dmg;
+// PVP True Damage: a real sword's swings carry its bonus in their power too (Master Sword x2,
+// covering the Light Sword; Wooden Sword x0.5; the timed sword glow x2), so online co-op passes
+// the sword's real strength on to other players instead of every sword's plain power. The game
+// adds that bonus itself when the hit lands on an enemy, so for enemies it's taken back off again
+// in true_damage_post: they take what they always would.
+static int sword_bonus_pct(daAlink_c* lnk) {
+    int pct = 100;
+    if (daAlink_c::checkMasterSwordEquip()) pct *= 2;
+    if (daAlink_c::checkWoodSwordEquip()) pct /= 2;
+    if (lnk->getSwordAtUpTime()) pct *= 2;
+    return pct;
+}
+
+// What a move's power was before and after, for each of Link's three kinds of swing hit
+struct SwingPower {
+    int before = 0, after = 0;
+};
+static SwingPower capsulePower, cylinderPower, spherePower;
+
+static void scale_swing_power(void* args, int atpArg, SwingPower& record) {
+    auto* lnk = mods::arg<daAlink_c*>(args, 0);
+    record = {};
+    if (lnk->checkWolf() || !in_cut_proc(lnk)) return;
+    int& atp = mods::arg_ref<int>(args, atpArg);
+    int before = atp;
+    if (!daAlink_c::checkSwordGet()) {
+        atp = unarmed_power(atp);  // our unarmed swings
+        return;
+    }
+    if (!cfgOn(vTrueDamage, false) || atp <= 0) return;
+    int pct = sword_bonus_pct(lnk);
+    if (pct == 100) return;
+    atp = std::max(1, atp * pct / 100);
+    record = {before, atp};
+}
+
+static HookAction sword_power_pre(ModContext*, void* args, void*, void*) {
+    scale_swing_power(args, 4, capsulePower);  // (spl, hit mark, sound, power, ...)
+    return HOOK_CONTINUE;
+}
+
+static HookAction cyl_power_pre(ModContext*, void* args, void*, void*) {
+    scale_swing_power(args, 5, cylinderPower);  // (type, spl, hit mark, sound, power, ...)
+    return HOOK_CONTINUE;
+}
+
+static HookAction turn_power_pre(ModContext*, void* args, void*, void*) {
+    scale_swing_power(args, 2, spherePower);  // (radius, power)
+    return HOOK_CONTINUE;
+}
+
+// the true-damage record for whichever of Link's swing hits this was, if it's one
+static const SwingPower* true_damage_record(cCcD_Obj* hit) {
+    auto* lnk = (daAlink_c*)dComIfGp_getPlayer(0);
+    if (!lnk || !hit) return nullptr;
+    const SwingPower* record = nullptr;
+    int power = -1;  // what the hit carries now, so a power the game set some other way isn't touched
+    for (auto& cps : lnk->mAtCps)
+        if (hit == &cps) record = &capsulePower, power = cps.GetAtAtp();
+    if (hit == &lnk->mAtCyl) record = &cylinderPower, power = lnk->mAtCyl.GetAtAtp();
+    if (hit == &lnk->mAtSph) record = &spherePower, power = lnk->mAtSph.GetAtAtp();
+    return record && record->after != record->before && power == record->after ? record : nullptr;
+}
+
+static int trueHp0;
+static bool trueHpSaved;
+
+static HookAction true_damage_pre(ModContext*, void* args, void*, void*) {
+    fopAc_ac_c* enemy = mods::arg<fopAc_ac_c*>(args, 0);
+    dCcU_AtInfo* info = mods::arg<dCcU_AtInfo*>(args, 1);
+    trueHpSaved = enemy && info && true_damage_record(info->mpCollider) && !is_other_player(enemy);
+    if (trueHpSaved) trueHp0 = enemy->health;
+    return HOOK_CONTINUE;
+}
+
+static void true_damage_post(ModContext*, void* args, void*, void*) {
+    if (!trueHpSaved) return;
+    trueHpSaved = false;
+    fopAc_ac_c* enemy = mods::arg<fopAc_ac_c*>(args, 0);
+    dCcU_AtInfo* info = mods::arg<dCcU_AtInfo*>(args, 1);
+    const SwingPower* record = true_damage_record(info->mpCollider);
+    if (!record || info->mAttackPower == 0 || info->mHitType != HIT_TYPE_LINK_NORMAL_ATTACK) return;
+
+    // the game's damage came from the raised power with its own bonus on top; work it out again
+    // from the move's usual power
+    int damage = std::max(1, info->mAttackPower * record->before / record->after);
+    int hp = trueHp0 - damage;
     if (hp <= 0) {
         hp = 0;
         info->mHitStatus = 2;
     } else if (info->mHitStatus == 2) {
         info->mHitStatus = 1;
     }
-    en->health = hp;
+    enemy->health = hp;
 }
 
 static HookAction fx_skip(ModContext*, void*, void*, void*) {
@@ -3994,7 +4072,9 @@ static void unarmed_init() {
     lost += !post_hook(StickData, shield_keeps_b);
     lost += !post_hook(DoStatus, do_status_post);
     lost += !pre_hook(NextAction, next_pre) + !post_hook(NextAction, next_post);
-    lost += !pre_hook(CcAtCheck, cc_pre) + !post_hook(CcAtCheck, cc_post);
+    lost += !pre_hook(SwordAtParam, sword_power_pre) + !pre_hook(CylAtParam, cyl_power_pre) +
+            !pre_hook(TurnAtParam, turn_power_pre);
+    lost += !pre_hook(CcAtCheck, true_damage_pre) + !post_hook(CcAtCheck, true_damage_post);
     lost += !pre_hook(CutAction, cut_action_pre);
     lost += !post_hook(SwordHit, sword_hit_post);
     lost += !post_hook(DownState, down_state_post) + !post_hook(HeadState, head_state_post);
@@ -5376,6 +5456,7 @@ static void combat_rows() {
     choice("Sword Flourish", flourishOption, FLOURISH_DEFAULT, flourishNames, 4);
     toggle("Manual Shielding", vManualShield);
     toggle("Deal Burn with Lantern", vLanternBurn);
+    toggle("PVP True Damage", vTrueDamage);
 }
 
 static void item_rows() {
@@ -5622,10 +5703,11 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     if (missed) mods::log::warn("{} unarmed settings didn't register, those use their defaults", missed);
     unarmed_init();
 
-    // --- Combat > Misc: Sword Flourish and Deal Burn with Lantern ---
+    // --- Combat > Misc: Sword Flourish, Manual Shielding, Deal Burn with Lantern, PVP True Damage ---
     add_int_option("swordFlourish", FLOURISH_DEFAULT, &flourishOption);
     add_bool_option("lanternBurn", true, &vLanternBurn);
     add_bool_option("manualShielding", false, &vManualShield);
+    add_bool_option("pvpTrueDamage", false, &vTrueDamage);
     if (!pre_hook(AllUnequip, flourish_put_away)) mods::log::warn("sword flourish stays at the game's normal behaviour");
 
     // --- Item Combinations ---
