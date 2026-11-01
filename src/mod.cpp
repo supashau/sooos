@@ -4493,12 +4493,6 @@ static void set_pose(J2DPane* p, const RowPose& pose) {
     p->translate(pose.x, pose.y);  // works out its matrix again too
 }
 
-// re-places a pane and everything in it without drawing anything, so things like the mouse find
-// it where it now is
-static void replace_row(J2DPane* row) {
-    if (J2DGrafContext* port = dComIfGp_getCurrentGrafPort()) row->draw(0.0f, 0.0f, port, false, false);
-}
-
 static void move_into_fourth_slot(dMsgScrn3Select_c* box) {
     CPaneMgr* rowMgr = box->mpSel_c[2];
     CPaneMgr* aboveMgr = box->mpSel_c[1];
@@ -4528,13 +4522,16 @@ static void move_into_fourth_slot(dMsgScrn3Select_c* box) {
                 (u16)info.mRotation.y * 360.0f / 65535.0f};
     }
     set_pose(row, pose);
-    replace_row(row);
 }
 
-static void back_into_third_slot(dMsgScrn3Select_c* box) {
+// The mouse's hit test works the row's place out from its own position each time, so putting the
+// pose back is all it needs. Only while drawing (the one time the game's drawing context exists;
+// it's thrown away after each frame's drawing) is the row re-placed as well, without drawing
+// anything, so its last drawn spot is row three's again.
+static void back_into_third_slot(dMsgScrn3Select_c* box, J2DGrafContext* drawingPort = nullptr) {
     J2DPane* row = box->mpSel_c[2]->getPanePtr();
     set_pose(row, savedPose);
-    replace_row(row);
+    if (drawingPort) row->draw(0.0f, 0.0f, drawingPort, false, false);
 }
 
 // "Follow me", pushed over to the middle the same way the game centres its own choices: a
@@ -4732,7 +4729,7 @@ static void choice_box_draw_post(ModContext*, void* args, void*, void*) {
     if (rubyShown) ruby->show();
     if (glow) glow->scale(glowX, glowY);
     if (glowRim) glowRim->scale(rimX, rimY);
-    back_into_third_slot(box);
+    back_into_third_slot(box, port);
 }
 
 // After "Follow me": once the talk has wrapped up she comes out. While she's out, her button
