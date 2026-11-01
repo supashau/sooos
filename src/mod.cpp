@@ -56,6 +56,7 @@
 #include "d/d_menu_item_explain.h"
 #include "d/d_menu_ring.h"
 #include "d/d_menu_window.h"
+#include "d/d_select_cursor.h"
 #include "d/d_meter2.h"
 #include "d/d_meter2_draw.h"
 #include "d/d_meter2_info.h"
@@ -2342,9 +2343,9 @@ static void hand_pose_post(ModContext*, void* args, void*, void*) {
 
 // ======================== Item Pages ========================
 // A second page of the item wheel, with its own 24 slots. With the wheel open, D-pad Right turns
-// to page 2 and D-pad Left back to page 1; opening the wheel always starts on page 1. Each page is
-// the game's own wheel: turning the page swaps the wheel on screen for a new one, which slides in
-// from the side it's on. While page 2's wheel is up, the inventory it works on is swapped for page
+// to page 2 and D-pad Left back to page 1; opening the wheel always starts on page 1. It's the
+// game's own wheel throughout: turning the page lays the same wheel out again for the other page
+// (see lay_out_wheel). While page 2's wheel is up, the inventory it works on is swapped for page
 // 2's slots, and swapped back the moment it's done, so the game never keeps anything of it. Things
 // that only make sense on the real inventory (setting items to X/Y, combining, the item
 // explanation) are switched off on page 2.
@@ -2445,44 +2446,78 @@ static void page_ring_out(ModContext*, void* args, void*, void*) {
     }
 }
 
+// Lays the wheel out again for whichever inventory is in place, the same way the wheel lays
+// itself out when it's made: the slots, the X and Y slots, each slot's picture, the spacing round
+// the ring and the cursor on the first slot. The wheel itself stays the same one the menu made.
+static void lay_out_wheel(dMenu_Ring_c* ring) {
+    for (int i = 0; i < MAX_ITEM_SLOTS; i++) {
+        for (int j = 0; j < 3; j++) {
+            if (ring->mpItemTex[i][j]) JKR_DELETE(ring->mpItemTex[i][j]);
+            if (ring->mpItemBuf[i][j]) ring->mpHeap->free(ring->mpItemBuf[i][j]);
+            ring->mpItemTex[i][j] = nullptr;
+            ring->mpItemBuf[i][j] = nullptr;
+        }
+        ring->mItemSlotParam1[i] = ring->mItemSlotParam2[i] = 0.0f;
+    }
+    ring->mTotalItemTexToAlloc = 0;
+    for (int i = 0; i < MAX_ITEM_SLOTS; i++) {
+        ring->mItemSlots[i] = dComIfGs_getLineUpItem(i);
+        if (ring->mItemSlots[i] != dItemNo_NONE_e) ring->mTotalItemTexToAlloc++;
+    }
+    ring->mItemsTotal = ring->mTotalItemTexToAlloc < 1 ? 1 : ring->mTotalItemTexToAlloc;
+    ring->mCurrentSlot = 0;
+    ring->mXButtonSlot = ring->mYButtonSlot = ring->field_0x6ac = ring->field_0x6ad = 0xff;
+    for (int i = 0; i < ring->mItemsTotal; i++) {
+        if (dComIfGs_getSelectItemIndex(0) == ring->mItemSlots[i]) ring->mXButtonSlot = i;
+        if (dComIfGs_getSelectItemIndex(1) == ring->mItemSlots[i]) ring->mYButtonSlot = i;
+    }
+    ring->field_0x634 = 0x10000 / ring->mItemsTotal;
+
+    for (int i = 0; i < ring->mTotalItemTexToAlloc; i++) {
+        for (int j = 0; j < 3; j++) ring->mpItemBuf[i][j] = (ResTIMG*)ring->mpHeap->alloc(0xC00, 0x20);
+        u8 item = dComIfGs_getItem(ring->mItemSlots[i], false);
+        if (item == dItemNo_NONE_e || !ring->mpItemBuf[i][0] || !ring->mpItemBuf[i][1] || !ring->mpItemBuf[i][2]) continue;
+        if (item == dItemNo_LIGHT_ARROW_e) item = dItemNo_BOW_e;  // as the game does: no picture of its own
+        int pictures = dMeter2Info_readItemTexture(item, ring->mpItemBuf[i][0], nullptr, ring->mpItemBuf[i][1], nullptr,
+                                                   ring->mpItemBuf[i][2], nullptr, nullptr, nullptr, -1);
+        for (int k = 0; k < pictures; k++) {
+            ring->mpItemTex[i][k] = JKR_NEW J2DPicture(ring->mpItemBuf[i][k]);
+            if (ring->mpItemTex[i][k]) ring->mpItemTex[i][k]->setBasePosition(J2DBasePosition_4);
+        }
+        dMeter2Info_setItemColor(item, ring->mpItemTex[i][0], ring->mpItemTex[i][1], ring->mpItemTex[i][2], nullptr);
+        f32 scale = dItem_data::getTexScale(item) / 100.0f;
+        ring->mItemSlotParam1[i] = ring->mpItemBuf[i][0]->width / 48.0f * scale;
+        ring->mItemSlotParam2[i] = ring->mpItemBuf[i][0]->height / 48.0f * scale;
+    }
+    ring->setRotate();
+    ring->mpDrawCursor->setPos(ring->mItemSlotPosX[0] + ring->mCenterPosX, ring->mItemSlotPosY[0] + ring->mCenterPosY);
+    if (dComIfGs_getItem(ring->mItemSlots[0], false) != dItemNo_NONE_e)
+        ring->mpDrawCursor->setParam(ring->mItemSlotParam1[0], ring->mItemSlotParam2[0], 0.1f, 0.6f, 0.5f);
+    else
+        ring->mpDrawCursor->setParam(1.0f, 1.0f, 0.1f, 0.6f, 0.5f);
+}
+
 // Turning the page, while the wheel is up and waiting (not mid-turn, not explaining an item): the
-// wheel on screen goes, and the other page's wheel is made the way the menu makes it, sliding in
-// from the right for page 2 and from the left for page 1. The menu then runs its own opening step
-// for it, as when the wheel first comes up.
+// same wheel is laid out again for the other page, with the wheel's turning sound.
 static HookAction page_turn(ModContext*, void* args, void*, void*) {
-    auto* window = mods::arg<dMw_c*>(args, 0);
-    dMenu_Ring_c* ring = window->mpMenuRing;
+    dMenu_Ring_c* ring = mods::arg<dMw_c*>(args, 0)->mpMenuRing;
     if (!pages_on() || !ring) return HOOK_CONTINUE;
     bool toSecond = !is_second_page(ring) && mDoCPd_c::getTrigRight(PAD_1);
     bool toFirst = is_second_page(ring) && mDoCPd_c::getTrigLeft(PAD_1);
     if (!toSecond && !toFirst) return HOOK_CONTINUE;
     if (ring->mStatus != dMenu_Ring_c::STATUS_WAIT || ring->mpItemExplain->getStatus() != 0) return HOOK_CONTINUE;
 
-    ring->_delete();
-    JKR_DELETE(ring);
-    window->mpMenuRing = nullptr;
     forget_second_page_wheel();
-
     if (toSecond) {
-        openingSecondPage = true;
+        secondRing = ring;
         second_page_in();
-    }
-    window->mpMenuRing = JKR_NEW dMenu_Ring_c(window->mpHeap, window->mpStick, window->mpCStick, toSecond ? 3 : 1);
-    if (window->mpMenuRing) window->mpMenuRing->_create();
-    if (toSecond) {
-        secondRing = window->mpMenuRing;
+        lay_out_wheel(ring);
         second_page_out();
-        openingSecondPage = false;
+    } else {
+        lay_out_wheel(ring);
     }
-    if (!window->mpMenuRing) {
-        // no room for the other page: the wheel just closes
-        mods::log::warn("no memory to turn the item wheel's page");
-        dMeter2Info_offMenuInForce(2);
-        window->mMenuProc = dMw_c::NO_MENU;
-        return HOOK_SKIP_ORIGINAL;
-    }
-    window->mMenuProc = dMw_c::RING_OPEN;
-    return HOOK_SKIP_ORIGINAL;
+    mDoAud_seStart(Z2SE_ITEM_RING_ROLL, nullptr, 0, 0);
+    return HOOK_CONTINUE;
 }
 
 static void page_ring_deleted(ModContext*, void*, void*, void*) { forget_second_page_wheel(); }
@@ -4864,11 +4899,16 @@ static UiElementHandle page;
 static void heading(const char* title) { svc_ui->pane_add_section(mod_ctx, page, title); }
 static void note(const char* line) { svc_ui->pane_add_text(mod_ctx, page, line, nullptr); }
 
+// The window's right-hand column shows whatever the focused row puts there. Rows with nothing to
+// show there still clear it, so a setting's choices never linger beside a different row.
+static const char kNothingAside[] = " ";
+
 static void add_row(UiControlDesc& row, const char* label, ConfigVarHandle var) {
     if (!var) return;  // never registered, so it just keeps its default
     row.label = label;
     row.binding = UI_BINDING_CONFIG_VAR;
     row.config_var = var;
+    if (!row.help_rml) row.help_rml = kNothingAside;
     svc_ui->pane_add_control(mod_ctx, page, &row, nullptr);
 }
 
@@ -4882,15 +4922,58 @@ static void toggle(const char* label, ConfigVarHandle var, UiPredicateFn greyIf 
 }
 
 // A setting with more than on and off: its choices are listed in the window's right-hand column
-// while the row is picked, one click each.
-static void choice(const char* label, ConfigVarHandle var, const char* const* names, int count,
+// while the row is picked, one click each. While the row is greyed out (the setting it depends on
+// is off), clicking a choice there does nothing.
+struct ChoiceRow {
+    ConfigVarHandle var;
+    int64_t byDefault;
+    UiPredicateFn greyIf;
+};
+static ChoiceRow choiceRows[8];  // the rows of the page being shown
+static int choiceRowCount;
+
+static void choice_get(ModContext*, void* user, UiControlValue* out) {
+    auto* row = static_cast<ChoiceRow*>(user);
+    int64_t value = row->byDefault;
+    svc_config->get_int(mod_ctx, row->var, &value);
+    out->int_value = value;
+}
+
+static void choice_set(ModContext* ctx, void* user, const UiControlValue* value) {
+    auto* row = static_cast<ChoiceRow*>(user);
+    if (row->greyIf && row->greyIf(ctx, nullptr)) return;
+    svc_config->set_int(mod_ctx, row->var, value->int_value);
+}
+
+static bool choice_greyed(ModContext* ctx, void* user) {
+    auto* row = static_cast<ChoiceRow*>(user);
+    return row->greyIf && row->greyIf(ctx, nullptr);
+}
+
+static bool choice_changed(ModContext*, void* user) {
+    auto* row = static_cast<ChoiceRow*>(user);
+    int64_t value = row->byDefault;
+    svc_config->get_int(mod_ctx, row->var, &value);
+    return value != row->byDefault;
+}
+
+static void choice(const char* label, ConfigVarHandle var, int64_t byDefault, const char* const* names, int count,
                    UiPredicateFn greyIf = nullptr) {
+    if (!var || choiceRowCount >= 8) return;
+    ChoiceRow* data = &choiceRows[choiceRowCount++];
+    *data = ChoiceRow{var, byDefault, greyIf};
     UiControlDesc row = UI_CONTROL_DESC_INIT;
     row.kind = UI_CONTROL_SELECT;
+    row.label = label;
+    row.binding = UI_BINDING_CALLBACKS;
+    row.get = choice_get;
+    row.set = choice_set;
+    row.is_disabled = choice_greyed;
+    row.is_modified = choice_changed;
+    row.user_data = data;
     row.options = names;
     row.option_count = count;
-    row.is_disabled = greyIf;
-    add_row(row, label, var);
+    svc_ui->pane_add_control(mod_ctx, page, &row, nullptr);
 }
 
 static void quality_rows() {
@@ -4898,8 +4981,8 @@ static void quality_rows() {
     for (int area = 0; area < EPONA_AREAS; area++) toggle(eponaLabels[area], eponaToggle[area]);
 
     heading("Map Changes");
-    choice("Remove faron woods mist", mistOption, mistNames, 3);
-    choice("Revert to Chudley's", shopOption, shopNames, 4);
+    choice("Remove faron woods mist", mistOption, MIST_SEMI, mistNames, 3);
+    choice("Revert to Chudley's", shopOption, SHOP_SEMI, shopNames, 4);
     toggle("Jump to Lake Hylia from Bridge", bridgeJump);
     toggle("Dialogue Correction", vDialogueFix);
 
@@ -4922,7 +5005,7 @@ static void combat_rows() {
 
     note("Unarmed Swing");
     toggle("Swing while unarmed", vSwing);
-    choice("Swing damage", vDamage, damageNames, 4, swing_off);
+    choice("Swing damage", vDamage, 0, damageNames, 4, swing_off);
     toggle("Jump strike while unarmed", vJump, swing_off);
     toggle("Always have charged jump strike", vChargedAll, move_off, &vJump);
     toggle("Spin attack while unarmed", vSpin, swing_off);
@@ -4934,7 +5017,7 @@ static void combat_rows() {
     toggle("Always have back slice", vBackAll, swing_off);
 
     heading("Misc");
-    choice("Sword Flourish", flourishOption, flourishNames, 4);
+    choice("Sword Flourish", flourishOption, FLOURISH_DEFAULT, flourishNames, 4);
     toggle("Mortal Draw Hand Anim", vHandPose);
     toggle("Manual Shielding", vManualShield);
     toggle("Deal Burn with Lantern", vLanternBurn);
@@ -4970,6 +5053,7 @@ static void (*const tabRows[kTabCount])() = {quality_rows, combat_rows, item_row
 // one builder for every tab, user_data is the tab number
 static ModResult fill_tab(ModContext*, UiWindowHandle, UiElementHandle pane, UiElementHandle, void* which, ModError*) {
     page = pane;
+    choiceRowCount = 0;
     tabRows[reinterpret_cast<intptr_t>(which)]();
     return MOD_OK;
 }
