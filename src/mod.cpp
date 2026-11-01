@@ -21,6 +21,7 @@
 #include "mods/svc/ui.h"
 
 #include "JSystem/J2DGraph/J2DGrafContext.h"
+#include "JSystem/J2DGraph/J2DOrthoGraph.h"
 #include "JSystem/J2DGraph/J2DPicture.h"
 #include "JSystem/J2DGraph/J2DScreen.h"
 #include "JSystem/J2DGraph/J2DTextBox.h"
@@ -4772,6 +4773,10 @@ struct GearSlot {
     J2DPane* ring;          // the yellow/grey ring that says "worn"
     SlotPiece pieces[kMaxSlotPieces];  // everything that makes up the game's slot, in drawing order
     int pieceCount;
+    SlotPiece band[4];      // the row's backing strip, drawn again under ours (clipped to our cell)
+    int bandCount;
+    f32 x, y, w, h;         // our cell on screen (its middle and one step's size)
+    f32 frameW, frameH;     // the slot's frame on screen, for the dark inside
 };
 
 static GearSlot gearSlot[GEAR_ROWS];
@@ -4941,6 +4946,46 @@ static void build_gear_slot(dMenu_Collect2D_c* m, int row, CPaneMgr* measure) {
         names += tag_text(piece.pane->mInfoTag) + " ";
     }
     mods::log::info("gear row {} slot is drawn from: {}", row, names);
+
+    // the slot's frame (its biggest piece) and our cell, on screen
+    for (int i = 0; i < slot.pieceCount; i++) {
+        ScreenBox b = screen_box(measure, slot.pieces[i].pane);
+        if (b.w * b.h > slot.frameW * slot.frameH) slot.frameW = b.w, slot.frameH = b.h;
+    }
+    slot.x = targetX, slot.y = targetY;
+    slot.w = std::fabs(stepX) > 1.0f ? std::fabs(stepX) : find.step;
+    slot.h = slot.w;
+
+    // The strip the row's slots sit on runs behind the game's cells and stops where the menu's
+    // left-hand panel starts. Whatever of it is under the game's first slot is drawn again under
+    // ours, so ours sits on the same strip instead of on that panel.
+    std::string bandNames;
+    std::vector<J2DPane*> stack{scr};
+    while (!stack.empty() && slot.bandCount < 4) {
+        J2DPane* p = stack.back();
+        stack.pop_back();
+        if (p != scr && !is_our_pane(p) && !holds(p, find.unit)) {
+            ScreenBox b = screen_box(measure, p);
+            bool underHome = std::fabs(b.x - homeAt.x) < b.w * 0.5f && std::fabs(b.y - homeAt.y) < b.h * 0.5f;
+            bool strip = b.w > 1.5f * find.step && b.h < 1.5f * find.step && b.h > 0.2f * find.step;
+            bool holdsCell = false;
+            for (int x = 0; x < 7 && !holdsCell; x++)
+                for (int y = 0; y < 6 && !holdsCell; y++)
+                    if (m->mpSelPm[x][y] && holds(p, m->mpSelPm[x][y]->getPanePtr())) holdsCell = true;
+            if (underHome && strip && !holdsCell) {
+                SlotPiece& piece = slot.band[slot.bandCount++];
+                piece.pane = p;
+                screen_to_local(measure, p, moveX, moveY, &piece.dx, &piece.dy);
+                bandNames += tag_text(p->mInfoTag) + " ";
+                continue;
+            }
+        }
+        // children in reverse, so they come off the stack in drawing order
+        std::vector<J2DPane*> kids;
+        for (J2DPane* kid = p->getFirstChildPane(); kid; kid = kid->getNextChildPane()) kids.push_back(kid);
+        for (auto it = kids.rbegin(); it != kids.rend(); ++it) stack.push_back(*it);
+    }
+    mods::log::info("gear row {} strip under the slots: {}", row, bandNames.empty() ? "none found" : bandNames);
 
     // our cell: an empty pane the size of the game's slot, where ours is drawn
     slot.tag = gear_tag(row, 0xFFFF);
@@ -5248,6 +5293,56 @@ static bool ordon_worn(int row) {
     }
 }
 
+// Clips drawing to a box given in the menu's own units (the screen's panes are laid out in
+// those, the clip works in the frame's pixels). Returns false if the drawing surface isn't the
+// menu's usual flat one, in which case nothing is clipped and nothing should be drawn that needs it.
+static bool clip_to(J2DGrafContext* graf, f32 x0, f32 y0, f32 x1, f32 y1) {
+    if (graf->getGrafType() != 1) return false;
+    auto* flat = static_cast<J2DOrthoGraph*>(graf);
+    const JGeometry::TBox2<f32>& units = *flat->getOrtho();
+    const JGeometry::TBox2<f32>& pixels = *flat->getBounds();
+    if (units.getWidth() <= 0.0f || units.getHeight() <= 0.0f) return false;
+    f32 sx = pixels.getWidth() / units.getWidth(), sy = pixels.getHeight() / units.getHeight();
+    graf->scissor(JGeometry::TBox2<f32>(pixels.i.x + (x0 - units.i.x) * sx, pixels.i.y + (y0 - units.i.y) * sy,
+                                        pixels.i.x + (x1 - units.i.x) * sx, pixels.i.y + (y1 - units.i.y) * sy));
+    graf->setScissor();
+    return true;
+}
+
+// What sits behind the game's slots: the row's strip, and the dark inside of the frame.
+static void draw_backing(GearSlot& slot, J2DGrafContext* graf, u8 fade) {
+    JGeometry::TBox2<f32> wasClip = graf->mScissorBounds;
+    if (slot.bandCount && clip_to(graf, slot.x - slot.w * 0.5f, slot.y - slot.h * 0.5f, slot.x + slot.w * 0.5f,
+                                  slot.y + slot.h * 0.5f)) {
+        for (int i = 0; i < slot.bandCount; i++) {
+            J2DPane* p = slot.band[i].pane;
+            f32 x = p->getTranslateX(), y = p->getTranslateY();
+            u8 alpha = p->getAlpha();
+            bool influenced = p->mIsInfluencedAlpha, shown = p->isVisible();
+            p->mIsInfluencedAlpha = false;
+            p->setAlpha((u8)(alpha * fade / 255));
+            p->translate(x + slot.band[i].dx, y + slot.band[i].dy);
+            p->show();
+            p->draw(0.0f, 0.0f, graf, false, true);
+            p->translate(x, y);
+            p->setAlpha(alpha);
+            p->mIsInfluencedAlpha = influenced;
+            set_shown(p, shown);
+        }
+        graf->scissor(wasClip);
+        graf->setScissor();
+        graf->setup2D();
+    }
+    // the dark inside of the frame, so the panel behind never shows through
+    if (slot.frameW > 0.0f) {
+        f32 w = slot.frameW * 0.9f, h = slot.frameH * 0.9f;
+        graf->setup2D();
+        graf->setColor(JUtility::TColor(0, 0, 0, (u8)(fade * 230 / 255)));
+        graf->fillBox(JGeometry::TBox2<f32>(slot.x - w * 0.5f, slot.y - h * 0.5f, slot.x + w * 0.5f, slot.y + h * 0.5f));
+        graf->setup2D();
+    }
+}
+
 static void draw_slot(dMenu_Collect2D_c* m, int row, J2DGrafContext* graf) {
     GearSlot& slot = gearSlot[row];
     J2DPane* home = slot.home;
@@ -5288,6 +5383,7 @@ static void draw_slot(dMenu_Collect2D_c* m, int row, J2DGrafContext* graf) {
         gameIcon = slot.icon->changeTexture(ordon_cloth_texture(), 0);
     paint_ring(slot.ring, owned && ordon_worn(row));
 
+    draw_backing(slot, graf, fade);
     for (int i = 0; i < slot.pieceCount; i++) slot.pieces[i].pane->draw(0.0f, 0.0f, graf, false, true);
 
     // and back
