@@ -3119,10 +3119,10 @@ static bool is_other_player(fopAc_ac_c* actor) {
     return (actor->eyePos - actor->current.pos).abs2() < 1.0f;
 }
 
-// A player gets one fire hit as they catch fire, passed on to their game, and that's all: their
-// Link burns there the game's own way (its own flame, damage and how long it lasts). They're still
-// counted as burning for the usual time, so the same fire doesn't keep hitting them.
-static const int kPlayerFireAt = kBurnFrames - 1;  // frames left when it lands
+// A player takes the burn as damage over the same few seconds enemies do, just without the big
+// flame (their own game shows Link on fire). Online co-op forwards a hit's damage to that player's
+// game, not an "on fire" state, so the burn has to land as its own hits, one per scorch frame,
+// rather than relying on one hit to set their Link alight.
 
 struct BurningEnemy {
     fpc_ProcID id;
@@ -3185,9 +3185,9 @@ static bool set_on_fire(fopAc_ac_c* actor) {
 }
 
 // Deal Burn Damage off: a fire arrow still sets an enemy alight (its flame), but the burn does no
-// damage after that. A player's one fire hit is what sets their Link on fire, so it always lands.
+// damage after that; with it off a player takes nothing, since the burn on them is only the damage.
+// Enemies and players alike take the scorch on the same frames.
 static bool hit_due(const BurningEnemy& enemy) {
-    if (enemy.player) return enemy.framesLeft == kPlayerFireAt;
     bool burnDamage = !enemy.fromArrow || cfgOn(vFireDamage);
     if (!burnDamage) return false;
     return enemy.framesLeft == kScorchAt[0] || enemy.framesLeft == kScorchAt[1];
@@ -3871,20 +3871,21 @@ static void next_post(ModContext*, void* args, void*, void*) {
 // starts (the game sets it once per move, through these three). The game then works the damage
 // out from that power as it does for any sword, and anything else that reads the hit sees the
 // same power: online co-op passes a hit on to the other player's game as its power, so the
-// multiplier reaches other players too. Wooden x0.5, Ordon x1, Master x2, Light x4 (an unarmed
-// swing counts as no sword at all, so the game adds no sword bonus of its own; the post-Zant glow
-// still doubles it like it does a real sword).
+// multiplier reaches other players too. Wooden x0.5, Ordon x1, Master x2 (the Light Sword hits
+// like the Master Sword, so it has no setting of its own). An unarmed swing counts as no sword at
+// all, so the game adds no sword bonus of its own; the attack power-up from Great Fairy's Tears or
+// Rare Chu Jelly still doubles it like it does a real sword.
 static int unarmed_power(int atp) {
-    static const int pct[] = {50, 100, 200, 400};
+    static const int pct[] = {50, 100, 200};
     int pick = cfgInt(vDamage, 0);
     if (pick < 0) pick = 0;
-    if (pick > 3) pick = 3;
+    if (pick > 2) pick = 0;  // a removed choice (the old Light Sword one): the default, as the menu shows
     int power = atp * pct[pick] / 100;
     return atp > 0 && power < 1 ? 1 : power;
 }
 
 // PVP True Damage: a real sword's swings carry its bonus in their power too (Master Sword x2,
-// covering the Light Sword; Wooden Sword x0.5; the timed sword glow x2), so online co-op passes
+// covering the Light Sword; Wooden Sword x0.5; Great Fairy's Tears or Rare Chu Jelly x2), so online co-op passes
 // the sword's real strength on to other players instead of every sword's plain power. The game
 // adds that bonus itself when the hit lands on an enemy, so for enemies it's taken back off again
 // in true_damage_post: they take what they always would.
@@ -5364,6 +5365,7 @@ struct ChoiceRow {
     ConfigVarHandle var;
     int64_t byDefault;
     UiPredicateFn greyIf;
+    int count;
 };
 static ChoiceRow choiceRows[8];  // the rows of the page being shown
 static int choiceRowCount;
@@ -5372,6 +5374,7 @@ static void choice_get(ModContext*, void* user, UiControlValue* out) {
     auto* row = static_cast<ChoiceRow*>(user);
     int64_t value = row->byDefault;
     svc_config->get_int(mod_ctx, row->var, &value);
+    if (value < 0 || value >= row->count) value = row->byDefault;  // saved from a choice that's since been removed
     out->int_value = value;
 }
 
@@ -5397,7 +5400,7 @@ static void choice(const char* label, ConfigVarHandle var, int64_t byDefault, co
                    UiPredicateFn greyIf = nullptr) {
     if (!var || choiceRowCount >= 8) return;
     ChoiceRow* data = &choiceRows[choiceRowCount++];
-    *data = ChoiceRow{var, byDefault, greyIf};
+    *data = ChoiceRow{var, byDefault, greyIf, count};
     UiControlDesc row = UI_CONTROL_DESC_INIT;
     row.kind = UI_CONTROL_SELECT;
     row.label = label;
@@ -5430,7 +5433,7 @@ static void quality_rows() {
     toggle("Midna Companion", vMidnaFollow);
 }
 
-static const char* const damageNames[] = {"x0.5 Wooden Sword", "x1 Ordon Sword", "x2 Master Sword", "x4 Light Sword"};
+static const char* const damageNames[] = {"x0.5 Wooden Sword", "x1 Ordon Sword", "x2 Master Sword"};
 
 static void combat_rows() {
     heading("Unarmed Combat");
@@ -5441,7 +5444,7 @@ static void combat_rows() {
 
     note("Unarmed Swing");
     toggle("Swing while unarmed", vSwing);
-    choice("Swing damage", vDamage, 0, damageNames, 4, swing_off);
+    choice("Swing damage", vDamage, 0, damageNames, 3, swing_off);
     toggle("Jump strike while unarmed", vJump, swing_off);
     toggle("Always have charged jump strike", vChargedAll, move_off, &vJump);
     toggle("Spin attack while unarmed", vSpin, swing_off);
