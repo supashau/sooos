@@ -19,6 +19,7 @@
 #include "mods/svc/texture.h"
 #include "mods/svc/ui.h"
 
+#include "JSystem/J2DGraph/J2DGrafContext.h"
 #include "JSystem/J2DGraph/J2DPicture.h"
 #include "JSystem/J2DGraph/J2DScreen.h"
 #include "JSystem/J2DGraph/J2DTextBox.h"
@@ -50,6 +51,7 @@
 #include "d/d_com_inf_game.h"
 #include "d/d_item_data.h"
 #include "d/d_kankyo.h"
+#include "d/d_lib.h"
 #include "d/d_kantera_icon_meter.h"
 #include "d/d_map_path_dmap.h"
 #include "d/d_menu_fmap_map.h"
@@ -65,6 +67,8 @@
 #include "d/d_msg_flow.h"
 #include "d/d_msg_object.h"
 #include "d/d_msg_string_base.h"
+#include "d/d_msg_scrn_3select.h"
+#include "d/d_msg_scrn_talk.h"
 #include "d/d_pane_class.h"
 #include "d/d_particle.h"
 #include "d/d_save.h"
@@ -126,7 +130,6 @@ static const char* const flourishNames[] = {"On", "Wooden", "Default", "Off"};
 static ConfigVarHandle flourishOption;
 static ConfigVarHandle vLanternBurn;  // Deal Burn with Lantern
 static ConfigVarHandle vManualShield; // Manual Shielding
-static ConfigVarHandle vHandPose;  // Mortal Draw Hand Anim
 static ConfigVarHandle vFireDamage;     // Deal Burn Damage (fire arrows)
 
 // items: which bombs can ride the Gale Boomerang (normal, water, bomblings)
@@ -2319,28 +2322,6 @@ static void flourish_after(daAlink_c* lnk) {
 }
 
 
-// ======================== Mortal Draw Hand Anim ========================
-
-// When Link could do a mortal draw, he rests his hand on the hilt: the start of his sword-drawing
-// animation on his upper body. That pose is part of the game's "ready" state, which also puts Draw
-// on A, so turning the toggle off leaves the state alone and only stops the pose from showing.
-// setMatrix decides, each frame, how much of the upper-body animation his arms take before his
-// body is posed; with the toggle off and that animation being the mortal draw pose, the answer
-// becomes none. The mortal draw itself (Draw on A) works as normal.
-
-DEFINE_HOOK(&daAlink_c::setMatrix, SetMatrix);
-
-static void hand_pose_post(ModContext*, void* args, void*, void*) {
-    if (cfgOn(vHandPose)) return;
-    auto* lnk = mods::arg<daAlink_c*>(args, 0);
-    bool ready = lnk->checkNoResetFlg0(daAlink_c::FLG0_UNK_1000000) &&
-                 lnk->checkUpperAnime(dRes_ID_ALANM_BCK_WAITATOS_e) && lnk->mEquipItem == dItemNo_NONE_e;
-    // the cutscene version of the stance plays out in full
-    if (!ready || lnk->mProcID == daAlink_c::PROC_CUT_FAST_READY) return;
-    lnk->mNowAnmPackUpper[daAlink_c::UPPER_2].setRatio(0.0f);
-    lnk->field_0x3444 = 0.0f;  // what the arms' joints are given while he's being posed
-}
-
 // ======================== Item Pages ========================
 // A second page of the item wheel, with its own 24 slots. With the wheel open, D-pad Right turns
 // to page 2 and D-pad Left back to page 1; opening the wheel always starts on page 1. It's the
@@ -4369,10 +4350,19 @@ static cXyz midna_home(daAlink_c* lnk) {
     return home;
 }
 
-// she only comes out for human Link, outside cutscenes, once she's met him
-static bool midna_allowed(daAlink_c* lnk) {
+// She only comes out for human Link, outside cutscenes, once she's riding with him, and only
+// when she could be called the normal way: not while she's hurt (from Zant's attack until Zelda
+// heals her), and not in the stretch where the game itself won't let her be called (back in
+// Ordon Woods, until she comes out of the shadows).
+static bool midna_may_come(daAlink_c* lnk) {
     return cfgOn(vMidnaFollow, true) && !lnk->checkWolf() && daPy_py_c::checkFirstMidnaDemo() &&
-           !dComIfGp_event_runCheck() && !lnk->checkMetamorphose();
+           !daMidna_c::checkMidnaTired() && !real_flag(0x6140) &&  // F_0800: Midna can't be called
+           !lnk->checkMetamorphose();
+}
+
+// ...and not in the middle of a cutscene or a conversation
+static bool midna_allowed(daAlink_c* lnk) {
+    return midna_may_come(lnk) && !dComIfGp_event_runCheck();
 }
 
 // straight back into the shadow, no animation (cutscenes, the wolf, the setting turned off)
@@ -4395,11 +4385,229 @@ static void midna_hide_now(daMidna_c* midna) {
 
 static void hook_midna_trail(bool out);  // with her trail, further down
 
+// --- "Follow me" in Midna's call ---
+// Calling Midna (her button) asks "Transform into wolf / Warp / Talk to Midna" (or two of those).
+// While she's allowed out, the box gets one more row under the others, "Follow me". It isn't one
+// of the game's own rows: the box only has three, so the fourth is the bottom row drawn a second
+// time one row lower, with its own text. It's made from the box's own panes and their own layout
+// spacing, so anything that restyles or moves the box moves the fourth row with it.
+//
+// Down from the bottom row moves onto it (the game's own rows all go unlit, the same as when
+// nothing's picked), and A on it closes the box the way B would, then Midna comes up to follow.
+DEFINE_HOOK(&dMsgScrn3Select_c::selAnimeInit, ChoiceBoxOpen);
+DEFINE_HOOK(&dMsgScrn3Select_c::draw, ChoiceBoxDraw);
+DEFINE_HOOK(&jmessage_tReference::selectMessage, ChoiceCursor);
+DEFINE_HOOK(&dMsgObject_c::selectProc, ChoiceConfirm);
+
+static const char kFollowMe[] = "Follow me";
+static const int kFollowWait = 150;  // frames we wait for the talk to wrap up before giving up
+
+static bool followOffered;  // this box has the "Follow me" row
+static bool followPicked;   // the cursor is on it
+static bool followRowLogged;
+static int followAsked;     // picked: count down while the talk closes, then she comes out
+static bool faking_b;
+static u32 realTrigs;
+
+static dMsgScrn3Select_c* midna_choice_box() {
+    dMsgObject_c* msg = dMsgObject_getMsgObjectClass();
+    if (!msg || !msg->mpScrnDraw || !msg->isMidonaMessage()) return nullptr;
+    return static_cast<dMsgScrnTalk_c*>(msg->mpScrnDraw)->mpSelect_c;
+}
+
+static bool follow_row_on(dMsgScrn3Select_c* box) {
+    return followOffered && box && box == midna_choice_box();
+}
+
+static void choice_box_open_post(ModContext*, void* args, void*, void*) {
+    auto* box = mods::arg<dMsgScrn3Select_c*>(args, 0);
+    if (box != midna_choice_box()) return;  // some other menu's yes/no box
+    auto* lnk = (daAlink_c*)dComIfGp_getPlayer(0);
+    followOffered = lnk && midna_may_come(lnk) && !midnaWanted && midnaPhase == MIDNA_HIDDEN &&
+                    box->mpSel_c[1] && box->mpSel_c[2] && box->mpTmSel_c[2] && box->mpCursor_c[2];
+    followPicked = false;
+    followRowLogged = false;
+}
+
+// Up and down through Midna's rows, with one more past the bottom. Everything else (left/right
+// boxes, other people's questions) is left to the game.
+static HookAction choice_cursor_pre(ModContext*, void* args, void*, void*) {
+    auto* ref = mods::arg<jmessage_tReference*>(args, 0);
+    dMsgObject_c* msg = dMsgObject_getMsgObjectClass();
+    if (!follow_row_on(midna_choice_box()) || ref != msg->mpRefer || ref->mSelectType != 0) return HOOK_CONTINUE;
+    u8 count = ref->mSelectNum;
+    if (count != 2 && count != 3) return HOOK_CONTINUE;
+
+    u8 last = count - 1;
+    ref->mpStick->checkTrigger();
+    bool moved = false;
+    if (followPicked) {
+        if (ref->mpStick->checkUpTrigger()) {
+            followPicked = false;
+            ref->mSelectPos = last;
+            moved = true;
+        }
+    } else if (ref->mpStick->checkUpTrigger()) {
+        if (ref->mSelectPos != 0 && ref->mSelectPos <= last) ref->mSelectPos--, moved = true;
+    } else if (ref->mpStick->checkDownTrigger()) {
+        if (ref->mSelectPos == last) {
+            followPicked = true;
+            ref->mSelectPos = 0xFF;  // none of the game's rows lit, and A on it does nothing
+            moved = true;
+        } else if (ref->mSelectPos < last) {
+            ref->mSelectPos++;
+            moved = true;
+        } else {
+            ref->mSelectPos = 0;  // nothing was picked yet
+            moved = true;
+        }
+    }
+    if (moved) mDoAud_seStart(Z2SE_SY_TALK_CURSOR, nullptr, 0, 0);
+    return HOOK_SKIP_ORIGINAL;
+}
+
+// A on "Follow me" is turned into B for this one pass, so the box closes the game's own way
+static HookAction choice_confirm_pre(ModContext*, void* args, void*, void*) {
+    auto* msg = mods::arg<dMsgObject_c*>(args, 0);
+    if (!followPicked || !follow_row_on(midna_choice_box()) || !mDoCPd_c::getTrigA(PAD_1)) return HOOK_CONTINUE;
+    if (msg->getSelectCancelPos() == 0) {
+        mods::log::warn("Follow me: this box of Midna's can't be backed out of, so it can't close it");
+        return HOOK_CONTINUE;
+    }
+    u32& trigs = mDoCPd_c::m_cpadInfo[PAD_1].mPressedButtonFlags;
+    realTrigs = trigs;
+    trigs = (trigs & ~PAD_BUTTON_A) | PAD_BUTTON_B;
+    faking_b = true;
+    followAsked = kFollowWait;
+    mods::log::info("Follow me picked (box backs out to choice {})", msg->getSelectCancelPos());
+    mDoAud_seStart(Z2SE_SY_TALK_CURSOR_OK, nullptr, 0, 0);
+    return HOOK_CONTINUE;
+}
+
+static void choice_confirm_post(ModContext*, void*, void*, void*) {
+    if (!faking_b) return;
+    mDoCPd_c::m_cpadInfo[PAD_1].mPressedButtonFlags = realTrigs;
+    faking_b = false;
+    followPicked = false;
+}
+
+// Is `pane` the row or something inside it?
+static bool inside_row(J2DPane* pane, J2DPane* row) {
+    for (int depth = 0; pane && depth < 16; ++depth, pane = pane->getParentPane())
+        if (pane == row) return true;
+    return false;
+}
+
+// The fourth row: the bottom row's panes drawn once more, a row lower. It takes its pose from
+// whichever of the bottom two rows isn't lit, so it doesn't copy the game's lit-row look.
+static void choice_box_draw_post(ModContext*, void* args, void*, void*) {
+    auto* box = mods::arg<dMsgScrn3Select_c*>(args, 0);
+    if (!follow_row_on(box)) return;
+    CPaneMgr* rowMgr = box->mpSel_c[2];
+    CPaneMgr* aboveMgr = box->mpSel_c[1];
+    J2DPane* row = rowMgr->getPanePtr();
+    J2DPane* above = aboveMgr->getPanePtr();
+    J2DTextBox* text = (J2DTextBox*)box->mpTmSel_c[2]->getPanePtr();
+    if (!row || !above || !text || !row->isVisible()) return;
+    if (row->getParentPane() != above->getParentPane() || !inside_row(text, row)) {
+        if (!followRowLogged) mods::log::warn("Follow me: this choice box is laid out differently, leaving its row off");
+        followRowLogged = true;
+        followOffered = false;
+        return;
+    }
+
+    f32 step = rowMgr->mInitTrans.y - aboveMgr->mInitTrans.y;  // the layout's own row spacing
+    bool fromAbove = box->mSelNo == 2;  // the bottom row's lit, so copy the one above it
+    J2DPane* pose = fromAbove ? above : row;
+    f32 x = row->getTranslateX(), y = row->getTranslateY();
+    f32 sx = row->getScaleX(), sy = row->getScaleY();
+    f32 newY = pose->getTranslateY() + (fromAbove ? 2.0f : 1.0f) * step;
+
+    J2DPane* glow = box->mpSelCld_c[2] ? box->mpSelCld_c[2]->getPanePtr() : nullptr;
+    J2DPane* glowRim = box->mpSelCldr_c[2] ? box->mpSelCldr_c[2]->getPanePtr() : nullptr;
+    f32 glowX = glow ? glow->getScaleX() : 0, glowY = glow ? glow->getScaleY() : 0;
+    f32 rimX = glowRim ? glowRim->getScaleX() : 0, rimY = glowRim ? glowRim->getScaleY() : 0;
+    J2DTextBox* ruby = box->mpTmrSel_c[2] ? (J2DTextBox*)box->mpTmrSel_c[2]->getPanePtr() : nullptr;
+    bool rubyShown = ruby && ruby->isVisible();
+
+    char* words = text->getStringPtr();
+    size_t room = text->getStringAllocByte();
+    char saved[64];
+    snprintf(saved, sizeof saved, "%s", words);
+    JUtility::TColor savedColor = text->getWhite();
+
+    row->translate(pose->getTranslateX(), newY);
+    row->scale(pose->getScaleX(), pose->getScaleY());
+    if (glow) glow->scale(followPicked ? 1.0f : 0.0f, followPicked ? 1.0f : 0.0f);
+    if (glowRim) glowRim->scale(followPicked ? 1.0f : 0.0f, followPicked ? 1.0f : 0.0f);
+    if (rubyShown) ruby->hide();
+    if (room > sizeof kFollowMe) snprintf(words, room, "%s", kFollowMe);
+    text->setWhite(followPicked ? box->mSelMsgCol : box->mSelMsgInactiveCol);
+
+    J2DGrafContext* port = dComIfGp_getCurrentGrafPort();
+    port->setup2D();
+    row->draw(0.0f, 0.0f, port, false, true);  // not clipped to the box, which ends at the third row
+
+    if (!followRowLogged) {
+        Vec at = box->mpCursor_c[2]->getGlobalVtxCenter(true, 0);
+        mods::log::info("Follow me row at ({:.0f}, {:.0f}), {:.0f} below the bottom row", at.x, at.y, newY - y);
+        followRowLogged = true;
+    }
+
+    // the game's own pointer, drawn the same way it draws it for a lit row
+    if (followPicked && box->field_0x117 != 0 && box->mpSelectCursor) {
+        f32 nudge = (box->mWidth - 1.0f) *
+                    (box->mpCursor_c[2]->getInitCenterPosX() - box->mpSelCldw_c[1][2]->getInitPosX());
+        if (box->mWidth == 1.0f) nudge -= 3.0f;
+        Vec center = box->mpCursor_c[2]->getGlobalVtxCenter(true, 0);
+        box->mpSelectCursor->setPos(box->mOffsetX + box->mCursorPos[2].x + nudge, center.y,
+                                    box->mpCursor_c[2]->getPanePtr(), true);
+        box->mpSelectCursor->setParam(0.9f, 0.7f, 0.05f, 0.5f, 0.5f);
+        box->mpSelectCursor->draw();
+    }
+
+    // everything back as the game had it
+    if (room > sizeof kFollowMe) snprintf(words, room, "%s", saved);
+    text->setWhite(savedColor);
+    if (rubyShown) ruby->show();
+    if (glow) glow->scale(glowX, glowY);
+    if (glowRim) glowRim->scale(rimX, rimY);
+    row->scale(sx, sy);
+    row->translate(x, y);
+    row->draw(0.0f, 0.0f, port, false, false);  // just re-places it (nothing drawn), so the mouse finds row three where it is
+}
+
+// After "Follow me": once the talk has wrapped up she comes out. While she's out, her button
+// sends her back down.
+static void follow_me_tick(daAlink_c* lnk) {
+    if (followAsked > 0) {
+        if (midna_allowed(lnk)) {
+            followAsked = 0;
+            midnaWanted = true;
+            trail_wanted();
+        } else if (--followAsked == 0) {
+            mods::log::info("Follow me: the talk never wrapped up, so Midna stays put");
+        }
+        return;
+    }
+    if (midnaWanted && (midnaPhase == MIDNA_RISING || midnaPhase == MIDNA_FOLLOWING) &&
+        !dComIfGp_event_runCheck() && lnk->midnaTalkTrigger())
+        midnaWanted = false;
+}
+
+static void follow_me_init() {
+    bool ok = post_hook(ChoiceBoxOpen, choice_box_open_post) && post_hook(ChoiceBoxDraw, choice_box_draw_post) &&
+              pre_hook(ChoiceCursor, choice_cursor_pre) && pre_hook(ChoiceConfirm, choice_confirm_pre) &&
+              post_hook(ChoiceConfirm, choice_confirm_post);
+    if (!ok) mods::log::warn("\"Follow me\" won't show in Midna's call");
+}
+
 static void midna_follow_tick() {
     auto* lnk = (daAlink_c*)dComIfGp_getPlayer(0);
     bool pressed = l3_pressed();
     hook_midna_trail(midnaWanted || midnaPhase != MIDNA_HIDDEN);
     if (!lnk) return;
+    follow_me_tick(lnk);
     if (pressed) {
         if (midnaWanted) {
             midnaWanted = false;  // she flies back and dives in (see midna_exec_pre)
@@ -4818,6 +5026,7 @@ static void midna_follow_init() {
               pre_hook(MidnaDraw, real_body_for_drawing) && post_hook(MidnaDraw, shadow_form_after_drawing) &&
               pre_hook(LinkShadowDraw, real_body_for_drawing) && post_hook(LinkShadowDraw, shadow_form_after_drawing);
     if (!ok) mods::log::warn("L3 Midna Follow won't work");
+    follow_me_init();
 }
 
 // Every particle the game makes goes through that call, so the trail's hooks are only on it while
@@ -5018,7 +5227,6 @@ static void combat_rows() {
 
     heading("Misc");
     choice("Sword Flourish", flourishOption, FLOURISH_DEFAULT, flourishNames, 4);
-    toggle("Mortal Draw Hand Anim", vHandPose);
     toggle("Manual Shielding", vManualShield);
     toggle("Deal Burn with Lantern", vLanternBurn);
 }
@@ -5271,8 +5479,6 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     add_int_option("swordFlourish", FLOURISH_DEFAULT, &flourishOption);
     add_bool_option("lanternBurn", true, &vLanternBurn);
     add_bool_option("manualShielding", false, &vManualShield);
-    add_bool_option("mortalDrawHandAnim", true, &vHandPose);
-    if (!post_hook(SetMatrix, hand_pose_post)) mods::log::warn("Mortal Draw Hand Anim stays on");
     if (!pre_hook(AllUnequip, flourish_put_away)) mods::log::warn("sword flourish stays at the game's normal behaviour");
 
     // --- Item Combinations ---
