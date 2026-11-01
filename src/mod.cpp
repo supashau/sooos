@@ -4389,25 +4389,36 @@ static void hook_midna_trail(bool out);  // with her trail, further down
 // Calling Midna (her button) asks "Transform into wolf / Warp / Talk to Midna" (or two of those).
 // While she's allowed out, the box gets one more row under the others, "Follow me". It isn't one
 // of the game's own rows: the box only has three, so the fourth is the bottom row drawn a second
-// time one row lower, with its own text. It's made from the box's own panes and their own layout
-// spacing, so anything that restyles or moves the box moves the fourth row with it.
+// time one row lower, with its own text. It's made from the box's own panes, layout spacing and
+// animation, so anything that restyles or moves the box moves the fourth row with it.
 //
-// Down from the bottom row moves onto it (the game's own rows all go unlit, the same as when
-// nothing's picked), and A on it closes the box the way B would, then Midna comes up to follow.
+// Down from the bottom row (or the mouse) moves onto it, and the game's own rows all go unlit, the
+// same as when nothing's picked. A (or a click) on it closes the box the way B would, then Midna
+// comes up to follow.
 DEFINE_HOOK(&dMsgScrn3Select_c::selAnimeInit, ChoiceBoxOpen);
 DEFINE_HOOK(&dMsgScrn3Select_c::draw, ChoiceBoxDraw);
+DEFINE_HOOK(&dMsgScrn3Select_c::pointerMove, ChoicePointer);
 DEFINE_HOOK(&jmessage_tReference::selectMessage, ChoiceCursor);
 DEFINE_HOOK(&dMsgObject_c::selectProc, ChoiceConfirm);
 
 static const char kFollowMe[] = "Follow me";
 static const int kFollowWait = 150;  // frames we wait for the talk to wrap up before giving up
 
+// Where each row sits lit in the box's animation (the frames the game itself jumps to when a row
+// is picked from nothing), and the stretch the bottom row's own lit/unlit change plays over.
+static const f32 kRowLitFrame[3] = {300.0f, 303.0f, 403.0f};
+static const f32 kBottomUnlit = 400.0f;
+static const f32 kBottomLit = 403.0f;
+
 static bool followOffered;  // this box has the "Follow me" row
 static bool followPicked;   // the cursor is on it
+static bool followClicked;  // the mouse clicked it
+static f32 followFrame = kBottomUnlit;  // the fourth row's own spot in that lit/unlit change
 static bool followRowLogged;
 static int followAsked;     // picked: count down while the talk closes, then she comes out
 static bool faking_b;
 static u32 realTrigs;
+static bool pointerBusy;
 
 static dMsgScrn3Select_c* midna_choice_box() {
     dMsgObject_c* msg = dMsgObject_getMsgObjectClass();
@@ -4419,14 +4430,128 @@ static bool follow_row_on(dMsgScrn3Select_c* box) {
     return followOffered && box && box == midna_choice_box();
 }
 
+// Is `pane` the row or something inside it?
+static bool inside_row(J2DPane* pane, J2DPane* row) {
+    for (int depth = 0; pane && depth < 16; ++depth, pane = pane->getParentPane())
+        if (pane == row) return true;
+    return false;
+}
+
 static void choice_box_open_post(ModContext*, void* args, void*, void*) {
     auto* box = mods::arg<dMsgScrn3Select_c*>(args, 0);
     if (box != midna_choice_box()) return;  // some other menu's yes/no box
     auto* lnk = (daAlink_c*)dComIfGp_getPlayer(0);
     followOffered = lnk && midna_may_come(lnk) && !midnaWanted && midnaPhase == MIDNA_HIDDEN &&
-                    box->mpSel_c[1] && box->mpSel_c[2] && box->mpTmSel_c[2] && box->mpCursor_c[2];
+                    box->mpSel_c[1] && box->mpSel_c[2] && box->mpTmSel_c[2] && box->mpCursor_c[2] &&
+                    box->mpAnmBck;
+    if (followOffered) {
+        J2DPane* row = box->mpSel_c[2]->getPanePtr();
+        J2DPane* above = box->mpSel_c[1]->getPanePtr();
+        if (!row || !above || row->getParentPane() != above->getParentPane() ||
+            !inside_row(box->mpTmSel_c[2]->getPanePtr(), row) || row->field_0x4 == 0xFFFF) {
+            mods::log::warn("Follow me: this choice box is laid out differently, leaving its row off");
+            followOffered = false;
+        }
+    }
     followPicked = false;
+    followClicked = false;
+    followFrame = kBottomUnlit;
     followRowLogged = false;
+}
+
+// Lights one of the game's rows straight away, the way the game does when a row is picked from
+// nothing, but only that row (the game's own way re-poses all three, which squashes the others).
+static void light_row_now(dMsgScrn3Select_c* box, u8 row) {
+    if (row > 2 || box->mProcess != dMsgScrn3Select_c::PROC_SELECT_e) return;  // the game's way, then
+    f32 keep = box->mBckFrame;
+    box->mBckFrame = kRowLitFrame[row];
+    box->selectAnimeTransform(row);
+    box->mBckFrame = keep;
+    box->mLastSelNo = box->mSelNo;
+    box->mSelNo = row;
+    box->field_0x110 = row;
+}
+
+// --- placing the fourth row ---
+// The bottom row's pane is moved into the fourth slot for a moment (to draw it, or to see if the
+// mouse is on it) and then put straight back.
+struct RowPose {
+    f32 x, y, sx, sy, rx, ry, rz;
+};
+static RowPose savedPose;
+
+static RowPose pose_of(J2DPane* p) {
+    return {p->mTranslateX, p->mTranslateY, p->mScaleX, p->mScaleY, p->mRotateX, p->mRotateY, p->mRotateZ};
+}
+
+static void set_pose(J2DPane* p, const RowPose& pose) {
+    p->mScaleX = pose.sx;
+    p->mScaleY = pose.sy;
+    p->mRotateX = pose.rx;
+    p->mRotateY = pose.ry;
+    p->mRotateZ = pose.rz;
+    p->translate(pose.x, pose.y);  // works out its matrix again too
+}
+
+// re-places a pane and everything in it without drawing anything, so things like the mouse find
+// it where it now is
+static void replace_row(J2DPane* row) {
+    if (J2DGrafContext* port = dComIfGp_getCurrentGrafPort()) row->draw(0.0f, 0.0f, port, false, false);
+}
+
+static void move_into_fourth_slot(dMsgScrn3Select_c* box) {
+    CPaneMgr* rowMgr = box->mpSel_c[2];
+    CPaneMgr* aboveMgr = box->mpSel_c[1];
+    J2DPane* row = rowMgr->getPanePtr();
+    savedPose = pose_of(row);
+    f32 step = rowMgr->mInitTrans.y - aboveMgr->mInitTrans.y;  // the layout's own row spacing
+
+    RowPose pose;
+    if (box->mProcess <= dMsgScrn3Select_c::PROC_OPEN2_e) {
+        // while the box opens, it comes in along with the others: the bottom row's pose (or the
+        // one above's, if the bottom one's lit), a row lower
+        bool fromAbove = box->mSelNo == 2;
+        pose = pose_of(fromAbove ? aboveMgr->getPanePtr() : row);
+        pose.y += (fromAbove ? 2.0f : 1.0f) * step;
+    } else {
+        // after that it has its own lit/unlit change: the bottom row's poses from the box's own
+        // animation, a row lower
+        J2DAnmTransform* bck = box->mpAnmBck;
+        f32 keep = bck->getFrame();
+        bck->setFrame(followFrame);
+        J3DTransformInfo info;
+        bck->getTransform(row->field_0x4, &info);
+        bck->setFrame(keep);
+        // read the same way the game reads it (J2DPane::updateTransform)
+        pose = {info.mTranslate.x, info.mTranslate.z + step, info.mScale.x, info.mScale.z,
+                (u16)info.mRotation.x * 360.0f / 65535.0f, (u16)info.mRotation.z * 360.0f / 65535.0f,
+                (u16)info.mRotation.y * 360.0f / 65535.0f};
+    }
+    set_pose(row, pose);
+    replace_row(row);
+}
+
+static void back_into_third_slot(dMsgScrn3Select_c* box) {
+    J2DPane* row = box->mpSel_c[2]->getPanePtr();
+    set_pose(row, savedPose);
+    replace_row(row);
+}
+
+// "Follow me", pushed over to the middle the same way the game centres its own choices: a
+// cursor-right code worth half the space the words don't fill
+static void follow_words(J2DTextBox* text, char* out, size_t room) {
+    jmessage_tReference* ref = dMsgObject_getMsgObjectClass()->mpRefer;
+    JUTFont* font = text->getFont();
+    f32 width = 0.0f;
+    if (font && font->getCellWidth() > 0) {
+        f32 perUnit = ref->getSelFontSize() / (f32)font->getCellWidth();
+        for (const char* c = kFollowMe; *c; ++c) width += perUnit * font->getWidth((u8)*c) + ref->getSelCharSpace();
+    }
+    f32 lead = 0.5f + (ref->getSelTBoxWidth() - width) / 2.0f;
+    if (lead >= 1.0f)
+        snprintf(out, room, "\x1B" "CR[%d]%s", (int)lead, kFollowMe);
+    else
+        snprintf(out, room, "%s", kFollowMe);
 }
 
 // Up and down through Midna's rows, with one more past the bottom. Everything else (left/right
@@ -4434,9 +4559,15 @@ static void choice_box_open_post(ModContext*, void* args, void*, void*) {
 static HookAction choice_cursor_pre(ModContext*, void* args, void*, void*) {
     auto* ref = mods::arg<jmessage_tReference*>(args, 0);
     dMsgObject_c* msg = dMsgObject_getMsgObjectClass();
-    if (!follow_row_on(midna_choice_box()) || ref != msg->mpRefer || ref->mSelectType != 0) return HOOK_CONTINUE;
+    dMsgScrn3Select_c* box = midna_choice_box();
+    if (!follow_row_on(box) || ref != msg->mpRefer || ref->mSelectType != 0) return HOOK_CONTINUE;
     u8 count = ref->mSelectNum;
     if (count != 2 && count != 3) return HOOK_CONTINUE;
+
+    // the fourth row's own lit/unlit change, a frame of the animation each frame like the game's
+    f32 aim = followPicked ? kBottomLit : kBottomUnlit;
+    if (followFrame < aim) followFrame = std::min(followFrame + 1.0f, aim);
+    if (followFrame > aim) followFrame = std::max(followFrame - 1.0f, aim);
 
     u8 last = count - 1;
     ref->mpStick->checkTrigger();
@@ -4445,6 +4576,7 @@ static HookAction choice_cursor_pre(ModContext*, void* args, void*, void*) {
         if (ref->mpStick->checkUpTrigger()) {
             followPicked = false;
             ref->mSelectPos = last;
+            light_row_now(box, 2);  // the bottom row is always the box's third
             moved = true;
         }
     } else if (ref->mpStick->checkUpTrigger()) {
@@ -4466,10 +4598,58 @@ static HookAction choice_cursor_pre(ModContext*, void* args, void*, void*) {
     return HOOK_SKIP_ORIGINAL;
 }
 
-// A on "Follow me" is turned into B for this one pass, so the box closes the game's own way
+// The mouse: the game looks for it over its own rows first; if it's on none of them, the bottom
+// row is moved into the fourth slot and the game looks again, so the fourth row is found by the
+// game's own hit test.
+static HookAction choice_pointer_pre(ModContext*, void* args, void* ret, void*) {
+    auto* box = mods::arg<dMsgScrn3Select_c*>(args, 0);
+    if (pointerBusy || !follow_row_on(box)) return HOOK_CONTINUE;
+    jmessage_tReference* ref = dMsgObject_getMsgObjectClass()->mpRefer;
+    u8 count = ref->mSelectNum;
+    if (ref->mSelectType != 0 || (count != 2 && count != 3)) return HOOK_CONTINUE;
+
+    pointerBusy = true;
+    bool hit = box->pointerMove();
+    bool onFollow = false, clicked = false;
+    if (!hit) {
+        u8 aim = box->field_0x110;
+        move_into_fourth_slot(box);
+        if (box->pointerMove() && box->mDPDPoint == count - 1) {
+            onFollow = true;
+            clicked = box->consumePointerClick();
+        }
+        back_into_third_slot(box);
+        box->field_0x110 = aim;
+        box->mDPDPoint = 0xFF;
+    }
+    pointerBusy = false;
+
+    if (onFollow) {
+        if (!followPicked) {
+            followPicked = true;
+            ref->mSelectPos = 0xFF;
+            box->field_0x110 = 0xFF;
+            mDoAud_seStart(Z2SE_SY_TALK_CURSOR, nullptr, 0, 0);
+        }
+        if (clicked) followClicked = true;
+    } else if (hit && box->mDPDPoint < count && (followPicked || ref->mSelectPos != box->mDPDPoint)) {
+        bool wasOnFollow = followPicked;
+        followPicked = false;
+        ref->mSelectPos = box->mDPDPoint;
+        if (wasOnFollow) light_row_now(box, box->field_0x110);
+        mDoAud_seStart(Z2SE_SY_TALK_CURSOR, nullptr, 0, 0);
+    }
+    if (ret) *static_cast<bool*>(ret) = hit || onFollow;
+    return HOOK_SKIP_ORIGINAL;
+}
+
+// A (or a click) on "Follow me" is turned into B for this one pass, so the box closes the game's
+// own way
 static HookAction choice_confirm_pre(ModContext*, void* args, void*, void*) {
     auto* msg = mods::arg<dMsgObject_c*>(args, 0);
-    if (!followPicked || !follow_row_on(midna_choice_box()) || !mDoCPd_c::getTrigA(PAD_1)) return HOOK_CONTINUE;
+    bool chosen = followClicked || mDoCPd_c::getTrigA(PAD_1);
+    followClicked = false;
+    if (!followPicked || !chosen || !follow_row_on(midna_choice_box())) return HOOK_CONTINUE;
     if (msg->getSelectCancelPos() == 0) {
         mods::log::warn("Follow me: this box of Midna's can't be backed out of, so it can't close it");
         return HOOK_CONTINUE;
@@ -4491,37 +4671,14 @@ static void choice_confirm_post(ModContext*, void*, void*, void*) {
     followPicked = false;
 }
 
-// Is `pane` the row or something inside it?
-static bool inside_row(J2DPane* pane, J2DPane* row) {
-    for (int depth = 0; pane && depth < 16; ++depth, pane = pane->getParentPane())
-        if (pane == row) return true;
-    return false;
-}
-
-// The fourth row: the bottom row's panes drawn once more, a row lower. It takes its pose from
-// whichever of the bottom two rows isn't lit, so it doesn't copy the game's lit-row look.
+// The fourth row: the bottom row's panes drawn once more in the fourth slot, with its own text,
+// glow and pointer
 static void choice_box_draw_post(ModContext*, void* args, void*, void*) {
     auto* box = mods::arg<dMsgScrn3Select_c*>(args, 0);
     if (!follow_row_on(box)) return;
-    CPaneMgr* rowMgr = box->mpSel_c[2];
-    CPaneMgr* aboveMgr = box->mpSel_c[1];
-    J2DPane* row = rowMgr->getPanePtr();
-    J2DPane* above = aboveMgr->getPanePtr();
+    J2DPane* row = box->mpSel_c[2]->getPanePtr();
     J2DTextBox* text = (J2DTextBox*)box->mpTmSel_c[2]->getPanePtr();
-    if (!row || !above || !text || !row->isVisible()) return;
-    if (row->getParentPane() != above->getParentPane() || !inside_row(text, row)) {
-        if (!followRowLogged) mods::log::warn("Follow me: this choice box is laid out differently, leaving its row off");
-        followRowLogged = true;
-        followOffered = false;
-        return;
-    }
-
-    f32 step = rowMgr->mInitTrans.y - aboveMgr->mInitTrans.y;  // the layout's own row spacing
-    bool fromAbove = box->mSelNo == 2;  // the bottom row's lit, so copy the one above it
-    J2DPane* pose = fromAbove ? above : row;
-    f32 x = row->getTranslateX(), y = row->getTranslateY();
-    f32 sx = row->getScaleX(), sy = row->getScaleY();
-    f32 newY = pose->getTranslateY() + (fromAbove ? 2.0f : 1.0f) * step;
+    if (!row->isVisible()) return;
 
     J2DPane* glow = box->mpSelCld_c[2] ? box->mpSelCld_c[2]->getPanePtr() : nullptr;
     J2DPane* glowRim = box->mpSelCldr_c[2] ? box->mpSelCldr_c[2]->getPanePtr() : nullptr;
@@ -4532,16 +4689,18 @@ static void choice_box_draw_post(ModContext*, void* args, void*, void*) {
 
     char* words = text->getStringPtr();
     size_t room = text->getStringAllocByte();
-    char saved[64];
+    char saved[64], ours[64];
     snprintf(saved, sizeof saved, "%s", words);
+    follow_words(text, ours, sizeof ours);
+    bool fits = room > strlen(ours) && strlen(saved) < sizeof saved;
     JUtility::TColor savedColor = text->getWhite();
 
-    row->translate(pose->getTranslateX(), newY);
-    row->scale(pose->getScaleX(), pose->getScaleY());
-    if (glow) glow->scale(followPicked ? 1.0f : 0.0f, followPicked ? 1.0f : 0.0f);
-    if (glowRim) glowRim->scale(followPicked ? 1.0f : 0.0f, followPicked ? 1.0f : 0.0f);
+    move_into_fourth_slot(box);
+    f32 lit = followPicked ? 1.0f : 0.0f;
+    if (glow) glow->scale(lit, lit);
+    if (glowRim) glowRim->scale(lit, lit);
     if (rubyShown) ruby->hide();
-    if (room > sizeof kFollowMe) snprintf(words, room, "%s", kFollowMe);
+    if (fits) snprintf(words, room, "%s", ours);
     text->setWhite(followPicked ? box->mSelMsgCol : box->mSelMsgInactiveCol);
 
     J2DGrafContext* port = dComIfGp_getCurrentGrafPort();
@@ -4550,7 +4709,8 @@ static void choice_box_draw_post(ModContext*, void* args, void*, void*) {
 
     if (!followRowLogged) {
         Vec at = box->mpCursor_c[2]->getGlobalVtxCenter(true, 0);
-        mods::log::info("Follow me row at ({:.0f}, {:.0f}), {:.0f} below the bottom row", at.x, at.y, newY - y);
+        mods::log::info("Follow me row at ({:.0f}, {:.0f}), {:.0f} below the bottom row", at.x, at.y,
+                        row->getTranslateY() - savedPose.y);
         followRowLogged = true;
     }
 
@@ -4567,14 +4727,12 @@ static void choice_box_draw_post(ModContext*, void* args, void*, void*) {
     }
 
     // everything back as the game had it
-    if (room > sizeof kFollowMe) snprintf(words, room, "%s", saved);
+    if (fits) snprintf(words, room, "%s", saved);
     text->setWhite(savedColor);
     if (rubyShown) ruby->show();
     if (glow) glow->scale(glowX, glowY);
     if (glowRim) glowRim->scale(rimX, rimY);
-    row->scale(sx, sy);
-    row->translate(x, y);
-    row->draw(0.0f, 0.0f, port, false, false);  // just re-places it (nothing drawn), so the mouse finds row three where it is
+    back_into_third_slot(box);
 }
 
 // After "Follow me": once the talk has wrapped up she comes out. While she's out, her button
@@ -4597,8 +4755,8 @@ static void follow_me_tick(daAlink_c* lnk) {
 
 static void follow_me_init() {
     bool ok = post_hook(ChoiceBoxOpen, choice_box_open_post) && post_hook(ChoiceBoxDraw, choice_box_draw_post) &&
-              pre_hook(ChoiceCursor, choice_cursor_pre) && pre_hook(ChoiceConfirm, choice_confirm_pre) &&
-              post_hook(ChoiceConfirm, choice_confirm_post);
+              pre_hook(ChoicePointer, choice_pointer_pre) && pre_hook(ChoiceCursor, choice_cursor_pre) &&
+              pre_hook(ChoiceConfirm, choice_confirm_pre) && post_hook(ChoiceConfirm, choice_confirm_post);
     if (!ok) mods::log::warn("\"Follow me\" won't show in Midna's call");
 }
 
