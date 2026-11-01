@@ -1,5 +1,6 @@
 // std headers before any game header: aurora defines nullptr as NULL when msvc reports old __cplusplus
 #include <cctype>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -5219,20 +5220,44 @@ static bool shown(J2DPane* pane) {
 struct EndPiece {
     J2DPane* pane;
     f32 x0, y0, sx, sy;
-    bool hidden;  // by us
+    f32 lastX, lastY;  // where we last put it
+    bool placed;       // we've put it somewhere
+    bool hidden;       // by us
+    bool otherMod;     // another mod moves or hides it itself: it's left entirely to that mod
 };
 static EndPiece endHeart, endMask, endHeartCell;
 
+static bool same_spot(f32 a, f32 b) { return std::fabs(a - b) < 0.01f; }
+
+// Another mod that rearranges this page (moving or hiding the heart or the Fused Shadows itself)
+// is left to do so: as soon as one of them is somewhere we didn't put it (and not just back where
+// the game had it, which the game does every frame), or hidden when we didn't hide it, we stop
+// touching it and give back anything we'd changed.
+static bool other_mod_owns(EndPiece& end) {
+    if (!end.pane) return true;
+    if (end.otherMod) return true;
+    f32 x = end.pane->getTranslateX(), y = end.pane->getTranslateY();
+    bool movedByOther = end.placed && !(same_spot(x, end.lastX) && same_spot(y, end.lastY)) &&
+                        !(same_spot(x, end.x0) && same_spot(y, end.y0));
+    bool hiddenByOther = !end.hidden && !end.pane->isVisible();
+    if (!movedByOther && !hiddenByOther) return false;
+    end.otherMod = true;
+    if (end.hidden) end.pane->show(), end.hidden = false;
+    mods::log::info("another mod arranges {} on this page itself, it's left to that mod", tag_text(end.pane->mInfoTag));
+    return true;
+}
+
 static void keep_end_piece(EndPiece& end, int slots, bool away) {
-    if (!end.pane) return;
+    if (other_mod_owns(end)) return;
     if (away) {
         if (end.pane->isVisible()) end.pane->hide(), end.hidden = true;
-        // what's drawn in 3D for it goes by where it is, so it's sent well off the screen too
-        end.pane->translate(end.x0 + end.sx * 40.0f, end.y0 + end.sy * 40.0f);
-        return;
+        end.lastX = end.x0, end.lastY = end.y0;
+    } else {
+        if (end.hidden) end.pane->show(), end.hidden = false;
+        end.lastX = end.x0 + end.sx * slots, end.lastY = end.y0 + end.sy * slots;
     }
-    if (end.hidden) end.pane->show(), end.hidden = false;
-    end.pane->translate(end.x0 + end.sx * slots, end.y0 + end.sy * slots);
+    end.pane->translate(end.lastX, end.lastY);
+    end.placed = true;
 }
 
 static void remember_end_piece(CPaneMgr* measure, EndPiece& end, J2DPane* pane, f32 stepX, f32 stepY) {
@@ -5243,7 +5268,8 @@ static void remember_end_piece(CPaneMgr* measure, EndPiece& end, J2DPane* pane, 
     screen_to_local(measure, pane, stepX, stepY, &end.sx, &end.sy);
 }
 
-static bool endsAway;  // the heart and the Fused Shadows are put away
+static bool endsAway;      // the heart and the Fused Shadows are put away
+static f32 maskRoom;       // how many slots the Fused Shadows can move right before reaching the page's edge
 
 static void point_cursor_at(dMenu_Collect2D_c* m, int x, int y);  // with the cursor, further down
 static bool is_ours(int x, int y);  // with the cursor, further down
@@ -5310,7 +5336,18 @@ static void gear_build(dMenu_Collect2D_c* m) {
         remember_end_piece(measure, endHeart, heart, top.stepX, top.stepY);
         if (heartCell && !(heart && holds(heart, heartCell)))
             remember_end_piece(measure, endHeartCell, heartCell, top.stepX, top.stepY);
-        remember_end_piece(measure, endMask, m->mpScreen->search(MULTI_CHAR('kamen_n')), top.stepX, top.stepY);
+        J2DPane* mask = m->mpScreen->search(MULTI_CHAR('kamen_n'));
+        remember_end_piece(measure, endMask, mask, top.stepX, top.stepY);
+        // room to the right of the Fused Shadows, up to the edge of the page, in slots (what's
+        // drawn there in 3D is about half again as wide as its spot)
+        maskRoom = 0.0f;
+        if (mask && std::fabs(top.stepX) > 1.0f) {
+            ScreenBox page = screen_box(measure, m->mpScreen);
+            ScreenBox at = screen_box(measure, mask);
+            f32 maskWidth = at.w > std::fabs(top.stepX) ? at.w : std::fabs(top.stepX);
+            maskRoom = ((page.x + page.w * 0.5f) - (at.x + maskWidth * 0.75f)) / std::fabs(top.stepX);
+        }
+        mods::log::info("room for the Fused Shadows to move right: {:.1f} slots", maskRoom);
     }
     keep_moved();
     if (movedCount) mods::log::info("moved {} of the game's gear panes one slot right for the Ordon slots", movedCount);
@@ -5340,60 +5377,74 @@ static bool game_gear_tag(int row, u64 tag) {
 
 
 // Every gear row with an Ordon slot is laid out the same way, every frame, whoever adds what:
-// starting at the game's first slot, other mods' cells that sit left of the game's items, then
-// ours, then the game's items, then other mods' cells that sit right of them. Other mods' cells are
-// moved to their place (only ones showing; a mod's switched-off cells are left alone). This runs
-// after the other mods have placed their own cells for the frame, so the line-up always holds.
-// The heart and the Fused Shadows / Mirror move one slot right if the top rows need it, and are
+// starting at the game's first slot, other mods' cells that sit left of the game's items (moved to
+// their place; a mod's switched-off cells are left alone), then ours, then the game's items. Other
+// mods' cells right of the game's items place themselves after the game's last item, so they're
+// left to do that. This runs after the other mods have placed their own cells for the frame.
+// The heart and the Fused Shadows / Mirror move one slot right if the top rows reach them, and are
 // put away if they'd have to go further.
 static void line_up_gear_rows(dMenu_Collect2D_c* m) {
     if (!movedCount || !gear_built_for(m)) return;
     CPaneMgr* measure = any_cell(m);
     if (!measure) return;
-    static const int kGameCells[GEAR_ROWS] = {2, 2, 3};
-    int lastUsed[GEAR_ROWS] = {1, 1, 2};  // the last slot used in each row, counting from the game's first
     for (int row = 0; row < GEAR_ROWS; row++) {
         GearSlot& slot = gearSlot[row];
-        J2DPane* lefts[7];
-        J2DPane* rights[7];
-        int nLeft = 0, nRight = 0;
-        for (int x = 0; x < 7; x++) {
+        if (!slot.anchor) continue;
+        J2DPane* lefts[3];
+        int nLeft = 0;
+        for (int x = 0; x < 3; x++) {
             if (is_ours(x, row)) continue;
             u64 tag = cell_tag(m, x, row);
             if (!tag || game_gear_tag(row, tag)) continue;
             J2DPane* other = m->mpScreen->search(tag);
-            if (!other || !shown(other)) continue;
-            if (x < 3)
-                lefts[nLeft++] = other;
-            else
-                rights[nRight++] = other;
-        }
-        if (!slot.anchor) {
-            lastUsed[row] = kGameCells[row] - 1 + nRight;  // not ours to lay out; just counted
-            continue;
+            if (other && shown(other)) lefts[nLeft++] = other;
         }
         rowOurs[row] = nLeft;
         rowShift[row] = nLeft + 1;
-        auto place = [&](J2DPane* pane, int at) {
-            Vec now = screen_middle(measure, pane);
-            f32 wantX = slot.originX + slot.stepX * at, wantY = slot.originY + slot.stepY * at;
-            f32 dx = wantX - now.x, dy = wantY - now.y;
-            if (dx * dx + dy * dy < 0.25f) return;
+        for (int i = 0; i < nLeft; i++) {
+            Vec now = screen_middle(measure, lefts[i]);
+            f32 dx = slot.originX + slot.stepX * i - now.x, dy = slot.originY + slot.stepY * i - now.y;
+            if (dx * dx + dy * dy < 0.25f) continue;
             f32 lx, ly;
-            screen_to_local(measure, pane, dx, dy, &lx, &ly);
-            pane->translate(pane->getTranslateX() + lx, pane->getTranslateY() + ly);
-        };
-        for (int i = 0; i < nLeft; i++) place(lefts[i], i);
-        int after = rowShift[row] + kGameCells[row];
-        for (int i = 0; i < nRight; i++) place(rights[i], after + i);
-        lastUsed[row] = after - 1 + nRight;
+            screen_to_local(measure, lefts[i], dx, dy, &lx, &ly);
+            lefts[i]->translate(lefts[i]->getTranslateX() + lx, lefts[i]->getTranslateY() + ly);
+        }
     }
     keep_moved();
 
-    // the heart sits at the game's third slot of the top two rows, the Fused Shadows at the fourth
-    int needed = (lastUsed[0] > lastUsed[1] ? lastUsed[0] : lastUsed[1]) + 1 - 2;
-    bool away = needed > 1;
+    // how far right the top two rows reach now, in slots from the game's first, by what's actually
+    // on screen in them (the game's items, ours, and anyone else's)
+    GearSlot* top = gearSlot[0].anchor ? &gearSlot[0] : gearSlot[1].anchor ? &gearSlot[1] : nullptr;
+    if (!top || std::fabs(top->stepX) < 1.0f) return;
+    int reach = 1;
+    for (int row = 0; row < 2; row++)
+        for (int x = 0; x < 7; x++) {
+            u64 tag = is_ours(x, row) ? gearSlot[row].tag : cell_tag(m, x, row);
+            if (!tag || tag == MULTI_CHAR('heart_kn') || tag == MULTI_CHAR('kamen_n')) continue;
+            J2DPane* pane = m->mpScreen->search(tag);
+            if (!pane || !shown(pane)) continue;
+            int at = (int)std::lround((screen_middle(measure, pane).x - top->originX) / top->stepX);
+            if (at > reach && at < 12) reach = at;
+        }
+    // The heart sits at the game's third slot of the top two rows, the Fused Shadows at the fourth.
+    // They move over one slot if the rows reach them; if they'd have to go further, or the Fused
+    // Shadows would reach the edge of the page, both are put away (together, never just one).
+    int needed = reach + 1 - 2;
+    bool away = needed > 1 || (needed > 0 && maskRoom < (f32)needed);
     int slots = needed > 0 ? needed : 0;
+    // the heart and the Fused Shadows go together: if another mod handles either, it has both
+    bool handedOver = (endHeart.pane && other_mod_owns(endHeart)) || (endHeartCell.pane && other_mod_owns(endHeartCell)) ||
+                      (endMask.pane && other_mod_owns(endMask));
+    if (handedOver) {
+        for (EndPiece* end : {&endHeart, &endHeartCell, &endMask})
+            if (end->pane && !end->otherMod) {
+                end->otherMod = true;
+                if (end->hidden) end->pane->show(), end->hidden = false;
+                end->pane->translate(end->x0, end->y0);
+            }
+        endsAway = false;
+        return;
+    }
     if (away != endsAway) {
         if (away)
             mods::log::info("the gear rows are too long for the heart and the Fused Shadows, they're put away");
@@ -5520,21 +5571,38 @@ static void gear_cursor(dMenu_Collect2D_c* m) {
         f32 step = 40.0f;
         if (cell_middle(m, 3, y0, &firstAt) && cell_middle(m, 4, y0, &nextAt)) step = std::fabs(nextAt.x - firstAt.x);
         f32 best = 0.0f;
-        for (int x = 0; x < 7; x++) {
-            if (x == x0 || !cell_reachable(m, x, y0)) continue;
-            Vec at;
-            if (!cell_middle(m, x, y0, &at)) continue;
-            f32 along = (at.x - from.x) * way;
-            if (along < 0.3f * step) continue;  // not that way (or on top of this one)
-            if (toX < 0 || along < best) toX = x, best = along;
-        }
+        // any gear cell drawn in this row counts, whichever grid row it's filed under
+        for (int y = 0; y < GEAR_ROWS; y++)
+            for (int x = 0; x < 7; x++) {
+                if ((x == x0 && y == y0) || !cell_reachable(m, x, y)) continue;
+                Vec at;
+                if (!cell_middle(m, x, y, &at)) continue;
+                f32 along = (at.x - from.x) * way;
+                if (along < 0.3f * step) continue;                    // not that way (or on top of this one)
+                if (std::fabs(at.y - from.y) > 0.5f * step) continue;  // drawn in another row
+                if (toX < 0 || along < best) toX = x, toY = y, best = along;
+            }
         // nothing further that way in the row: the game's own move stands (it may go up to the
         // heart, say)
-    } else if (upDown && is_ours(x0, y0) && (dir & (STControl::TRIG_UP | STControl::TRIG_DOWN))) {
-        int step = (dir & STControl::TRIG_UP) ? -1 : 1;
-        for (int y = y0 + step; y >= 0 && y < GEAR_ROWS && toX < 0; y += step)
-            if (is_ours(gearCol, y)) toX = gearCol, toY = y;
-        // past our last slot the game's own move stands
+    } else if (upDown && y0 < GEAR_ROWS && (dir & (STControl::TRIG_UP | STControl::TRIG_DOWN))) {
+        // up and down between the gear rows go to the cell drawn straight above or below
+        int way = (dir & STControl::TRIG_UP) ? -1 : 1;
+        Vec from, firstAt, nextAt;
+        if (!cell_middle(m, x0, y0, &from)) return;
+        f32 step = 40.0f;
+        if (cell_middle(m, 3, y0, &firstAt) && cell_middle(m, 4, y0, &nextAt)) step = std::fabs(nextAt.x - firstAt.x);
+        f32 best = 0.0f;
+        for (int y = 0; y < GEAR_ROWS; y++)
+            for (int x = 0; x < 7; x++) {
+                if ((x == x0 && y == y0) || !cell_reachable(m, x, y)) continue;
+                Vec at;
+                if (!cell_middle(m, x, y, &at)) continue;
+                f32 down = (at.y - from.y) * way;
+                if (down < 0.5f * step || down > 1.6f * step) continue;  // the next row that way only
+                f32 off = std::fabs(at.x - from.x) + down * 0.01f;
+                if (toX < 0 || off < best) toX = x, toY = y, best = off;
+            }
+        // no gear row that way (down into the items, up off the top): the game's own move stands
     }
     // somewhere it can't be (a switched-off cell, the heart while it's put away): back where it was
     if (toX < 0 && (m->mCursorX != x0 || m->mCursorY != y0) && !cell_reachable(m, m->mCursorX, m->mCursorY))
@@ -6091,6 +6159,27 @@ DEFINE_HOOK(&dMenu_Collect2D_c::_create, CollectCreate);
 DEFINE_HOOK(&dMenu_Collect2D_c::getItemTag, CollectItemTag);
 DEFINE_HOOK(&dMenu_Collect2D_c::wait_proc, CollectWait);
 DEFINE_HOOK(&dMenu_Collect2D_c::menuCollectWide, CollectWide);
+DEFINE_HOOK(&dMenu_Collect3D_c::draw, Collect3DDraw);
+
+// the Fused Shadows / Mirror is drawn in 3D apart from its spot on the page: while it's put away,
+// it isn't drawn
+static J3DModel* maskModelHeld;
+
+static HookAction mask_draw_pre(ModContext*, void* args, void*, void*) {
+    auto* menu3d = mods::arg<dMenu_Collect3D_c*>(args, 0);
+    maskModelHeld = nullptr;
+    if (endsAway && !endMask.otherMod && menu3d->mpModel) {
+        maskModelHeld = menu3d->mpModel;
+        menu3d->mpModel = nullptr;
+    }
+    return HOOK_CONTINUE;
+}
+
+static void mask_draw_post(ModContext*, void* args, void*, void*) {
+    if (!maskModelHeld) return;
+    mods::arg<dMenu_Collect3D_c*>(args, 0)->mpModel = maskModelHeld;
+    maskModelHeld = nullptr;
+}
 DEFINE_HOOK(&dMenu_Collect2D_c::pointerActivateCurrent, CollectClick);
 DEFINE_HOOK(&dMenu_Collect2D_c::setEquipItemFrameColorSword, CollectRingSword);
 DEFINE_HOOK(&dMenu_Collect2D_c::setEquipItemFrameColorShield, CollectRingShield);
@@ -6114,14 +6203,19 @@ static void gear_init() {
     first.priority = 100;
     if (!hooked(mods::hook::add_pre<CollectItemTag>(gear_tag_pre, &first), "pre"))
         mods::log::info("the game's grid code won't know the Ordon slots (the mod moves the cursor onto them itself)");
+    // and the cursor is ours to settle last, after any other mod has moved it this frame
+    HookOptions settleLast = HOOK_OPTIONS_INIT;
+    settleLast.priority = -1000;
     bool pressOk = hooked(mods::hook::add_pre<CollectWait>(gear_wait_pre, &first), "pre") &&
-                   post_hook(CollectWait, gear_wait_post) &&
+                   hooked(mods::hook::add_post<CollectWait>(gear_wait_post, &settleLast), "post") &&
                    hooked(mods::hook::add_pre<CollectClick>(gear_click_pre, &first), "pre");
     if (!pressOk) mods::log::warn("no Ordon gear slots on the collection screen");
     bool ringsOk = post_hook(CollectRingSword, gear_rings_post) && post_hook(CollectRingShield, gear_rings_post) &&
                    post_hook(CollectRingClothes, gear_rings_post);
     if (!ringsOk) mods::log::warn("the worn-gear rings may light the wrong slot");
     if (!pre_hook(CursorDraw, gear_draw)) mods::log::warn("the Ordon gear slots can't be drawn");
+    if (!(pre_hook(Collect3DDraw, mask_draw_pre) && post_hook(Collect3DDraw, mask_draw_post)))
+        mods::log::warn("the Fused Shadows may still show when they're put away");
     // after every other mod's hook on it, so the line-up is the last word each frame
     HookOptions last = HOOK_OPTIONS_INIT;
     last.priority = -1000;
