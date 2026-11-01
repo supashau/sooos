@@ -4162,8 +4162,8 @@ static void check_button(ModContext*, void*) {
 }
 
 // ======================== Midna Companion ========================
-// Clicking the left stick in human form brings Midna up out of Link's shadow to float along beside
-// him; clicking it again sends her back down into it. She runs on the game's own "wait at a spot"
+// Picking "Follow me" when calling Midna in human form brings her up out of Link's shadow to float
+// along beside him; her button sends her back down into it. She runs on the game's own "wait at a spot"
 // mode (the one that has her float ahead of wolf Link), which gives her floating-move and floating
 // idle animations; we just move that spot along beside Link at his pace.
 //
@@ -4176,14 +4176,13 @@ DEFINE_HOOK(&daMidna_c::setMidnaNoDrawFlg, MidnaNoDraw);
 
 enum MidnaPhase { MIDNA_HIDDEN, MIDNA_RISING, MIDNA_FOLLOWING, MIDNA_LEAVING, MIDNA_DIVING };
 static MidnaPhase midnaPhase = MIDNA_HIDDEN;
-static bool midnaWanted;     // L3 has called her out (she may still be away for a cutscene)
+static bool midnaWanted;     // "Follow me" has called her out (she may still be away for a cutscene)
 static bool midnaMoving;     // flying to catch up, rather than hanging in place
 static bool midnaShadowForced;  // we turned on her shadow-form state (see midna_draw_post)
 static bool midnaShowsReal;     // her real body is what's actually drawn
 static s16 midnaFacing;      // where she looks while hanging in place
 static cXyz midnaGoal;       // where she's flying to
 static cXyz midnaSpot;       // the spot we're steering her wait mode to this frame
-static u32 lastExtButtons;
 static void trail_wanted();  // her flying trail, further down
 
 static const f32 kMidnaSide = 90.0f;      // to Link's left
@@ -4333,12 +4332,6 @@ static void forget_body(daMidna_c* midna) {
     midna->mpRightHandShape = nullptr;
 }
 
-static bool l3_pressed() {
-    u32 now = JUTGamePad::mPadStatus[PAD_1].extButton;
-    bool pressed = (now & PAD_BUTTON_LEFT_STICK) && !(lastExtButtons & PAD_BUTTON_LEFT_STICK);
-    lastExtButtons = now;
-    return pressed;
-}
 
 // the spot beside Link she likes to float at
 static cXyz midna_home(daAlink_c* lnk) {
@@ -4759,18 +4752,9 @@ static void follow_me_init() {
 
 static void midna_follow_tick() {
     auto* lnk = (daAlink_c*)dComIfGp_getPlayer(0);
-    bool pressed = l3_pressed();
     hook_midna_trail(midnaWanted || midnaPhase != MIDNA_HIDDEN);
     if (!lnk) return;
     follow_me_tick(lnk);
-    if (pressed) {
-        if (midnaWanted) {
-            midnaWanted = false;  // she flies back and dives in (see midna_exec_pre)
-        } else if (midna_allowed(lnk)) {
-            midnaWanted = true;
-            trail_wanted();
-        }
-    }
     // turning into the wolf or switching the setting off ends it for good
     if (midnaWanted && (lnk->checkWolf() || !cfgOn(vMidnaFollow, true))) {
         midnaWanted = false;
