@@ -4901,6 +4901,46 @@ static void screen_to_local(CPaneMgr* measure, J2DPane* pane, f32 x, f32 y, f32*
     *outY = (a * y - c * x) / det;
 }
 
+// With the game's own layout, each row with an Ordon slot has the game's items moved one slot
+// right, and ours takes the game's first slot: same frame, same strip, same spot as the game
+// would put an item there. These are the game's panes moved, with where they started.
+struct MovedPane {
+    J2DPane* pane;
+    f32 x0, y0;  // where the game had it
+    f32 dx, dy;  // one slot right, in its parent's units
+};
+static MovedPane movedPanes[64];
+static int movedCount;
+
+static void move_aside(CPaneMgr* measure, J2DPane* pane, f32 stepX, f32 stepY) {
+    for (int i = 0; i < movedCount; i++)
+        if (movedPanes[i].pane == pane) return;
+    if (movedCount >= 64) return;
+    MovedPane& moved = movedPanes[movedCount++];
+    moved.pane = pane;
+    moved.x0 = pane->getTranslateX();
+    moved.y0 = pane->getTranslateY();
+    screen_to_local(measure, pane, stepX, stepY, &moved.dx, &moved.dy);
+}
+
+// Puts the moved panes where they belong. The game puts some of them back every frame before
+// drawing (for widescreen), so this runs after it each time.
+static void keep_moved() {
+    for (int i = 0; i < movedCount; i++) {
+        MovedPane& moved = movedPanes[i];
+        moved.pane->translate(moved.x0 + moved.dx, moved.y0 + moved.dy);
+    }
+}
+
+// the pieces of one of the game's cells (see collect_pieces)
+static void find_cell_pieces(CPaneMgr* measure, J2DScreen* scr, J2DPane* cell, f32 step, GearSlot* into) {
+    Vec middle = screen_middle(measure, cell);
+    SlotSearch find{measure, middle, step, cell, into};
+    while (find.unit->getParentPane() && stays_in_slot(measure, find.unit->getParentPane(), middle, step))
+        find.unit = find.unit->getParentPane();
+    collect_pieces(find, scr);
+}
+
 // Our slot is a copy of the game's first slot in the row (its frame, ring and icons, whatever the
 // screen or a texture pack makes them), one slot's step left of the leftmost cell in use. It's our
 // own: whatever another mod puts in the row stays as it is beside it.
@@ -4930,6 +4970,7 @@ static void build_gear_slot(dMenu_Collect2D_c* m, int row, CPaneMgr* measure) {
     Vec leftAt = screen_middle(measure, leftPane);
     f32 stepX = nextAt.x - homeAt.x, stepY = nextAt.y - homeAt.y;
     f32 targetX = leftAt.x - stepX * (left - gearCol), targetY = leftAt.y - stepY * (left - gearCol);
+    if (gameLayout) targetX = homeAt.x, targetY = homeAt.y;  // the game's first slot is ours
     f32 moveX = targetX - homeAt.x, moveY = targetY - homeAt.y;
     mods::log::info("gear row {}: leftmost cell {} ({}), game slot at {:.0f},{:.0f}, ours at {:.0f},{:.0f}", row,
                     left, tag_text(leftPane->mInfoTag), homeAt.x, homeAt.y, targetX, targetY);
@@ -4947,6 +4988,30 @@ static void build_gear_slot(dMenu_Collect2D_c* m, int row, CPaneMgr* measure) {
     }
     mods::log::info("gear row {} slot is drawn from: {}", row, names);
 
+    if (gameLayout) {
+        // The game's items in this row move one slot right (the first slot's pieces included,
+        // which ours borrows back at their old spot when it's drawn).
+        static const u64 kRowCells[GEAR_ROWS][3] = {
+            {MULTI_CHAR('ken_n0'), MULTI_CHAR('ken_n1'), 0},
+            {MULTI_CHAR('tate_n0'), MULTI_CHAR('tate_n1'), 0},
+            {MULTI_CHAR('fuku_n0'), MULTI_CHAR('fuku_n1'), MULTI_CHAR('fuku_n2')},
+        };
+        for (int i = 0; i < slot.pieceCount; i++) {
+            SlotPiece& piece = slot.pieces[i];
+            move_aside(measure, piece.pane, stepX, stepY);
+            f32 dx, dy;
+            screen_to_local(measure, piece.pane, stepX, stepY, &dx, &dy);
+            piece.dx = -dx, piece.dy = -dy;  // drawn back where it was
+        }
+        for (u64 tag : kRowCells[row]) {
+            J2DPane* cell = tag && tag != info.home ? scr->search(tag) : nullptr;
+            if (!cell) continue;
+            GearSlot scratch{};
+            find_cell_pieces(measure, scr, cell, find.step, &scratch);
+            for (int i = 0; i < scratch.pieceCount; i++) move_aside(measure, scratch.pieces[i].pane, stepX, stepY);
+        }
+    }
+
     // the slot's frame (its biggest piece) and our cell, on screen
     for (int i = 0; i < slot.pieceCount; i++) {
         ScreenBox b = screen_box(measure, slot.pieces[i].pane);
@@ -4956,12 +5021,14 @@ static void build_gear_slot(dMenu_Collect2D_c* m, int row, CPaneMgr* measure) {
     slot.w = std::fabs(stepX) > 1.0f ? std::fabs(stepX) : find.step;
     slot.h = slot.w;
 
+    // Away from the game's own layout (another mod has moved its cells), ours is out to the left.
     // The strip the row's slots sit on runs behind the game's cells and stops where the menu's
     // left-hand panel starts. Whatever of it is under the game's first slot is drawn again under
     // ours, so ours sits on the same strip instead of on that panel.
+    if (gameLayout) slot.frameW = slot.frameH = 0.0f;  // sitting in the game's own slot, nothing to add
     std::string bandNames;
     std::vector<J2DPane*> stack{scr};
-    while (!stack.empty() && slot.bandCount < 4) {
+    while (!gameLayout && !stack.empty() && slot.bandCount < 4) {
         J2DPane* p = stack.back();
         stack.pop_back();
         if (p != scr && !is_our_pane(p) && !holds(p, find.unit)) {
@@ -4985,7 +5052,8 @@ static void build_gear_slot(dMenu_Collect2D_c* m, int row, CPaneMgr* measure) {
         for (J2DPane* kid = p->getFirstChildPane(); kid; kid = kid->getNextChildPane()) kids.push_back(kid);
         for (auto it = kids.rbegin(); it != kids.rend(); ++it) stack.push_back(*it);
     }
-    mods::log::info("gear row {} strip under the slots: {}", row, bandNames.empty() ? "none found" : bandNames);
+    if (!gameLayout)
+        mods::log::info("gear row {} strip under the slots: {}", row, bandNames.empty() ? "none found" : bandNames);
 
     // our cell: an empty pane the size of the game's slot, where ours is drawn
     slot.tag = gear_tag(row, 0xFFFF);
@@ -5034,26 +5102,27 @@ static void paint_ring(J2DPane* ring, bool worn) {
                                                                                      : JUtility::TColor(107, 107, 107, 255));
 }
 
-// the rings after the game has painted them: the game's first slot only lights for what it now
-// holds (ours lights for the Ordon gear when it's drawn), and nothing lights while the clothes
-// are off
+static u8 game_cell_item(int x, int y);  // with A on a gear cell, further down
+static bool gear_worn(int row, u8 item);  // with putting things on, further down
+
+// The worn rings on the game's gear cells, lit for exactly what Link has on (and nothing in the
+// clothes row while he's in the sumo outfit). Painted every frame and after every change, so a
+// ring is never left showing something from before. Ours is lit when it's drawn.
 static void paint_gear_rings(dMenu_Collect2D_c* m) {
     if (m != gearMenu || !m->mpScreen || !gameLayout) return;
-    J2DScreen* scr = m->mpScreen;
-    u8 sword = dComIfGs_getSelectEquipSword();
-    u8 shield = dComIfGs_getSelectEquipShield();
-    u8 clothes = dComIfGs_getSelectEquipClothes();
-    bool bare = clothes_off();
-
-    if (gearSlot[GEAR_SWORD].anchor)
-        paint_ring(scr->search(MULTI_CHAR('ken_g_0')), sword == dItemNo_SWORD_e && m->field_0x22d[3][0]);
-    if (gearSlot[GEAR_SHIELD].anchor)
-        paint_ring(scr->search(MULTI_CHAR('tate_g_0')), shield == dItemNo_SHIELD_e && m->field_0x22d[3][1]);
-    if (gearSlot[GEAR_CLOTHES].anchor || bare) {
-        static const u64 rings[3] = {MULTI_CHAR('fuku_g_0'), MULTI_CHAR('fuku_g_1'), MULTI_CHAR('fuku_g_2')};
-        static const u8 wear[3] = {dItemNo_WEAR_KOKIRI_e, dItemNo_WEAR_ZORA_e, dItemNo_ARMOR_e};
-        for (int i = 0; i < 3; i++) paint_ring(scr->search(rings[i]), !bare && clothes == wear[i] && m->field_0x22d[i + 3][2]);
-    }
+    static const u64 kRings[GEAR_ROWS][3] = {
+        {MULTI_CHAR('ken_g_0'), MULTI_CHAR('ken_g_1'), 0},
+        {MULTI_CHAR('tate_g_0'), MULTI_CHAR('tate_g_1'), 0},
+        {MULTI_CHAR('fuku_g_0'), MULTI_CHAR('fuku_g_1'), MULTI_CHAR('fuku_g_2')},
+    };
+    for (int row = 0; row < GEAR_ROWS; row++)
+        for (int i = 0; i < 3; i++) {
+            J2DPane* ring = kRings[row][i] ? m->mpScreen->search(kRings[row][i]) : nullptr;
+            if (!ring || ring->getTypeID() != 18) continue;
+            int x = 3 + i;
+            u8 item = game_cell_item(x, row);
+            paint_ring(ring, item && m->field_0x22d[x][row] && gear_worn(row, item));
+        }
 }
 
 static void show_tag(J2DScreen* scr, u64 tag, bool show) {
@@ -5129,11 +5198,14 @@ static void forget_our_cells() {
     }
 }
 
+static void point_cursor_at(dMenu_Collect2D_c* m, int x, int y);  // with the cursor, further down
+
 static void gear_build(dMenu_Collect2D_c* m) {
     if (!m || !m->mpScreen || gear_built_for(m)) return;
     gearMenu = nullptr;
     gearScreen = nullptr;
     for (GearSlot& slot : gearSlot) slot = GearSlot{};
+    movedCount = 0;  // the last menu's panes are gone
     CPaneMgr* measure = any_cell(m);
     if (!measure) return;  // the screen isn't set up yet
 
@@ -5177,8 +5249,18 @@ static void gear_build(dMenu_Collect2D_c* m) {
 
     gearMenu = m;
     gearScreen = m->mpScreen;
+    keep_moved();
+    if (movedCount) mods::log::info("moved {} of the game's gear panes one slot right for the Ordon slots", movedCount);
+    // the cursor was put on the screen before anything moved
+    if (movedCount && m->mCursorX < 7 && m->mCursorY < GEAR_ROWS) point_cursor_at(m, m->mCursorX, m->mCursorY);
     fill_gear_column(m);
     paint_gear_rings(m);
+}
+
+// the game puts some of the moved panes back every frame just before drawing; they go right back
+static void gear_wide_post(ModContext*, void* args, void*, void*) {
+    auto* m = mods::arg<dMenu_Collect2D_c*>(args, 0);
+    if (gear_built_for(m)) keep_moved();
 }
 
 static void gear_screen_post(ModContext*, void* args, void*, void*) {
@@ -5240,8 +5322,17 @@ static void move_cursor(dMenu_Collect2D_c* m, int x, int y) {
 // reads the stick earlier in the frame and they're gone by the time we look.)
 static bool stick_stepped(s16 before, s16 now) { return now > 0 && now >= before; }
 
-// Left into our column from the cell beside it, right back out, and up/down between our own
-// slots. Only fills in what the grid code didn't do itself this frame.
+// another mod's cell left of the game's gear in this row: the nearest one to the game's first slot
+static int other_cell_left(dMenu_Collect2D_c* m, int y) {
+    for (int x = 2; x >= 0; x--)
+        if (!is_ours(x, y) && cell_tag(m, x, y)) return x;
+    return -1;
+}
+
+// Left and right follow what's on screen: [other mods' cells] [ours] [the game's items]. Without
+// other mods that's just the grid's own order; with them, ours sits further left in the grid than
+// it's drawn, so steps across it are put right here. Up and down from ours go to our other slots.
+// Only fills in what the grid code didn't do itself this frame.
 static void gear_cursor(dMenu_Collect2D_c* m) {
     STControl* stick = m->mpStick;
     if (!stick) return;
@@ -5251,22 +5342,36 @@ static void gear_cursor(dMenu_Collect2D_c* m) {
     u8 dir = stick->mDirectionTrig;
     int x0 = waitX, y0 = waitY;
     bool moved = m->mCursorX != x0 || m->mCursorY != y0;
-    int toX = -1, toY = -1;
+    bool left = sideways && (dir & STControl::TRIG_LEFT), right = sideways && (dir & STControl::TRIG_RIGHT);
+    int toX = -1, toY = y0;
 
-    if (sideways && (dir & STControl::TRIG_LEFT) && !moved && x0 > gearCol && is_ours(gearCol, y0)) {
-        // nothing in use between the cursor and our slot
-        bool clear = true;
-        for (int x = gearCol + 1; x < x0 && clear; x++) clear = !cell_tag(m, x, y0);
-        if (clear) toX = gearCol, toY = y0;
-    } else if (sideways && (dir & STControl::TRIG_RIGHT) && !moved && is_ours(x0, y0)) {
-        for (int x = x0 + 1; x <= 6 && toX < 0; x++)
-            if (m->mpSelPm[x][y0] && cell_tag(m, x, y0)) toX = x, toY = y0;
-    } else if (upDown && is_ours(x0, y0) && (dir & (STControl::TRIG_UP | STControl::TRIG_DOWN))) {
-        // from one of ours, up and down go to our other slots first, whatever the grid code did
-        int step = (dir & STControl::TRIG_UP) ? -1 : 1;
-        for (int y = y0 + step; y >= 0 && y < GEAR_ROWS && toX < 0; y += step)
-            if (is_ours(gearCol, y)) toX = gearCol, toY = y;
-        // past our last slot the game's own move stands
+    if (is_ours(x0, y0)) {
+        if (left) {
+            toX = other_cell_left(m, y0);
+            if (toX < 0) toX = x0;  // nothing further left: stay
+        } else if (right) {
+            for (int x = 3; x <= 6 && toX < 0; x++)
+                if (m->mpSelPm[x][y0] && cell_tag(m, x, y0)) toX = x;
+        } else if (upDown && (dir & (STControl::TRIG_UP | STControl::TRIG_DOWN))) {
+            int step = (dir & STControl::TRIG_UP) ? -1 : 1;
+            for (int y = y0 + step; y >= 0 && y < GEAR_ROWS && toX < 0; y += step)
+                if (is_ours(gearCol, y)) toX = gearCol, toY = y;
+            // past our last slot the game's own move stands
+        }
+    } else if (y0 < GEAR_ROWS && is_ours(gearCol, y0)) {
+        if (left && x0 >= 3 && (!moved || m->mCursorX < 3) && gameLayout) {
+            // from the game's first item (drawn right beside ours) left lands on ours
+            bool firstItem = true;
+            for (int x = 3; x < x0 && firstItem; x++) firstItem = !cell_tag(m, x, y0);
+            if (firstItem) toX = gearCol;
+        } else if (left && !moved && x0 > gearCol && !gameLayout) {
+            bool clear = true;
+            for (int x = gearCol + 1; x < x0 && clear; x++) clear = !cell_tag(m, x, y0);
+            if (clear) toX = gearCol;
+        } else if (right && x0 < 3 && gameLayout && (m->mCursorX >= 3 || !moved)) {
+            // from another mod's cell, right lands on ours before the game's items
+            toX = gearCol;
+        }
     }
     if (toX < 0 || (toX == m->mCursorX && toY == m->mCursorY)) return;
     move_cursor(m, toX, toY);
@@ -5467,6 +5572,13 @@ static bool gear_worn(int row, u8 item) {
     }
 }
 
+// Out of the sumo outfit: while its flags are up, the game's next clothes change only rebuilds
+// Link from the clothes files already loaded (the ones he had on before), which goes wrong if
+// different clothes were picked. With them down, the change loads the new clothes properly.
+static void leave_sumo(daAlink_c* lnk) {
+    if (lnk) lnk->offNoResetFlg2((daPy_py_c::daPy_FLG2)(daPy_py_c::FLG2_UNK_80000 | daPy_py_c::FLG2_UNK_200000));
+}
+
 static void put_on(dMenu_Collect2D_c* m, int row, u8 item) {
     daPy_py_c* pl = daPy_getPlayerActorClass();
     auto* lnk = (daAlink_c*)dComIfGp_getPlayer(0);
@@ -5481,6 +5593,7 @@ static void put_on(dMenu_Collect2D_c* m, int row, u8 item) {
     default:
         wrBlob("gearClothesOff", 0);
         dMeter2Info_setCloth(item, false);
+        leave_sumo(lnk);
         if (pl) pl->setClothesChange(0);
         break;
     }
@@ -5593,7 +5706,10 @@ static void after_press(dMenu_Collect2D_c* m) {
     if (now.sword != wornBefore.sword || now.shield != wornBefore.shield || now.clothes != wornBefore.clothes ||
         now.bare != wornBefore.bare) {
         // new clothes picked while in the sumo outfit: the game's change has put him back in clothes
-        if (now.clothes != wornBefore.clothes && wornBefore.bare && now.bare) wrBlob("gearClothesOff", 0);
+        if (now.clothes != wornBefore.clothes && wornBefore.bare && now.bare) {
+            wrBlob("gearClothesOff", 0);
+            leave_sumo(daAlink_getAlinkActorClass());  // before the game's change gets to the model
+        }
         return;
     }
     u8 item = game_cell_item(x, y);
@@ -5640,6 +5756,7 @@ static void gear_wait_post(ModContext*, void* args, void*, void*) {
     if (!gear_built_for(m)) return;
     gear_cursor(m);
     gear_follow_screen(m);
+    paint_gear_rings(m);
     int x = m->mCursorX, y = m->mCursorY;
     if (!is_ours(x, y)) return;
     // the game only offers "Equip" on its own gear cells
@@ -5693,6 +5810,10 @@ static void table_shield_tick() {
     csXyz facing(0, 0, 0);
     tableShield = fopAcM_createItem(&kTableSpot, dItemNo_WOOD_SHIELD_e, -1, kTableRoom, &facing, nullptr,
                                     daItem_c::TYPE_FIXED_PLACE_e);
+    if (tableShield == fpcM_ERROR_PROCESS_ID_e)
+        mods::log::warn("couldn't put the Ordon Shield on the table");
+    else
+        mods::log::info("the Ordon Shield is on the table");
 }
 
 // walking into it plays the game's own "you got the Ordon Shield" scene, like the first time
@@ -5726,7 +5847,10 @@ static void ordon_shield_tick(daAlink_c* lnk) {
         if (rdBlob("gearShieldOnTable")) wrBlob("gearShieldOnTable", 0);
         return;
     }
-    if (burnt) wrBlob("gearShieldOnTable", 1);
+    if (burnt) {
+        wrBlob("gearShieldOnTable", 1);
+        mods::log::info("the Ordon Shield burned up; it's waiting on the table in Link's house");
+    }
     if (have && rdBlob("gearShieldOnTable")) wrBlob("gearShieldOnTable", 0);
 }
 
@@ -5737,7 +5861,10 @@ static void clothes_tick(daAlink_c* lnk) {
     if (!unequip_on()) {
         if (bare) {
             wrBlob("gearClothesOff", 0);
-            if (!lnk->checkWolf()) lnk->setClothesChange(0);
+            if (!lnk->checkWolf()) {
+                leave_sumo(lnk);
+                lnk->setClothesChange(0);
+            }
         }
         return;
     }
@@ -5798,6 +5925,7 @@ DEFINE_HOOK(&dMenu_Collect2D_c::screenSet, CollectScreenSet);
 DEFINE_HOOK(&dMenu_Collect2D_c::_create, CollectCreate);
 DEFINE_HOOK(&dMenu_Collect2D_c::getItemTag, CollectItemTag);
 DEFINE_HOOK(&dMenu_Collect2D_c::wait_proc, CollectWait);
+DEFINE_HOOK(&dMenu_Collect2D_c::menuCollectWide, CollectWide);
 DEFINE_HOOK(&dMenu_Collect2D_c::pointerActivateCurrent, CollectClick);
 DEFINE_HOOK(&dMenu_Collect2D_c::setEquipItemFrameColorSword, CollectRingSword);
 DEFINE_HOOK(&dMenu_Collect2D_c::setEquipItemFrameColorShield, CollectRingShield);
@@ -5829,6 +5957,7 @@ static void gear_init() {
                    post_hook(CollectRingClothes, gear_rings_post);
     if (!ringsOk) mods::log::warn("the worn-gear rings may light the wrong slot");
     if (!pre_hook(CursorDraw, gear_draw)) mods::log::warn("the Ordon gear slots can't be drawn");
+    if (!post_hook(CollectWide, gear_wide_post)) mods::log::warn("the game's gear may slide back over the Ordon slots");
     if (!pre_hook(ItemPickup, table_shield_pickup)) mods::log::warn("the Ordon Shield on the table won't play its pickup scene");
 }
 
