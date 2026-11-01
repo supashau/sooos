@@ -118,7 +118,7 @@ static const char* const shopNames[] = {"Off", "Semi-Default", "Partial-Default"
 static ConfigVarHandle shopOption;
 static ConfigVarHandle bridgeJump;
 static ConfigVarHandle vDialogueFix;  // Dialogue Correction
-static ConfigVarHandle vMidnaFollow;  // L3 Midna Follow
+static ConfigVarHandle vMidnaFollow;  // Midna Companion
 static ConfigVarHandle vMidnaTrailFile;  // which area particle file has her flying trail (found once)
 
 // shop + ice leaf (0 if registering failed)
@@ -4161,7 +4161,7 @@ static void check_button(ModContext*, void*) {
     check_for_updates();
 }
 
-// ======================== L3 Midna Follow ========================
+// ======================== Midna Companion ========================
 // Clicking the left stick in human form brings Midna up out of Link's shadow to float along beside
 // him; clicking it again sends her back down into it. She runs on the game's own "wait at a spot"
 // mode (the one that has her float ahead of wolf Link), which gives her floating-move and floating
@@ -5183,7 +5183,7 @@ static void midna_follow_init() {
               post_hook(MidnaNoDraw, midna_draw_post) &&
               pre_hook(MidnaDraw, real_body_for_drawing) && post_hook(MidnaDraw, shadow_form_after_drawing) &&
               pre_hook(LinkShadowDraw, real_body_for_drawing) && post_hook(LinkShadowDraw, shadow_form_after_drawing);
-    if (!ok) mods::log::warn("L3 Midna Follow won't work");
+    if (!ok) mods::log::warn("Midna Companion won't work");
     follow_me_init();
 }
 
@@ -5358,7 +5358,7 @@ static void quality_rows() {
     toggle("Chudleys/Malomart Changes", vChud);
 
     heading("Midna");
-    toggle("L3 Midna Follow", vMidnaFollow);
+    toggle("Midna Companion", vMidnaFollow);
 }
 
 static const char* const damageNames[] = {"x0.5 Wooden Sword", "x1 Ordon Sword", "x2 Master Sword", "x4 Light Sword"};
@@ -5685,7 +5685,7 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     add_bool_option("itemPages", true, &vItemPages);
     item_pages_init();
 
-    // --- Midna: L3 Midna Follow ---
+    // --- Midna: Midna Companion ---
     add_bool_option("midnaFollow", true, &vMidnaFollow);
     add_int_option("midnaTrailFile", -1, &vMidnaTrailFile);
     midna_follow_init();
