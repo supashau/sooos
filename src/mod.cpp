@@ -4759,7 +4759,8 @@ static ResTIMG* ordon_cloth_texture() { return ordonClothSwap ? &ordonClothTex.h
 // ours, in its own parent's units
 struct SlotPiece {
     J2DPane* pane;
-    f32 dx, dy;
+    f32 dx, dy;  // to ours (away from the game's own layout)
+    f32 sx, sy;  // one slot right (with the game's own layout)
 };
 
 static const int kMaxSlotPieces = 12;
@@ -4777,7 +4778,15 @@ struct GearSlot {
     int bandCount;
     f32 x, y, w, h;         // our cell on screen (its middle and one step's size)
     f32 frameW, frameH;     // the slot's frame on screen, for the dark inside
+    f32 anchorX0, anchorY0, anchorSx, anchorSy;  // where our cell starts, and one slot right
 };
+
+// With the game's own layout: how many slots right the game's items in each row have moved, and
+// which slot (counting from the game's first) is ours. Another mod's cells in the row are kept
+// clear of both (see clear_other_mods).
+static int rowShift[GEAR_ROWS];
+static int rowOurs[GEAR_ROWS];
+static bool rowTriedShift[GEAR_ROWS];
 
 static GearSlot gearSlot[GEAR_ROWS];
 static dMenu_Collect2D_c* gearMenu;  // the menu our slots belong to
@@ -4906,21 +4915,23 @@ static void screen_to_local(CPaneMgr* measure, J2DPane* pane, f32 x, f32 y, f32*
 // would put an item there. These are the game's panes moved, with where they started.
 struct MovedPane {
     J2DPane* pane;
+    int row;
     f32 x0, y0;  // where the game had it
-    f32 dx, dy;  // one slot right, in its parent's units
+    f32 sx, sy;  // one slot right, in its parent's units
 };
 static MovedPane movedPanes[64];
 static int movedCount;
 
-static void move_aside(CPaneMgr* measure, J2DPane* pane, f32 stepX, f32 stepY) {
+static void move_aside(CPaneMgr* measure, J2DPane* pane, int row, f32 stepX, f32 stepY) {
     for (int i = 0; i < movedCount; i++)
         if (movedPanes[i].pane == pane) return;
     if (movedCount >= 64) return;
     MovedPane& moved = movedPanes[movedCount++];
     moved.pane = pane;
+    moved.row = row;
     moved.x0 = pane->getTranslateX();
     moved.y0 = pane->getTranslateY();
-    screen_to_local(measure, pane, stepX, stepY, &moved.dx, &moved.dy);
+    screen_to_local(measure, pane, stepX, stepY, &moved.sx, &moved.sy);
 }
 
 // Puts the moved panes where they belong. The game puts some of them back every frame before
@@ -4928,7 +4939,13 @@ static void move_aside(CPaneMgr* measure, J2DPane* pane, f32 stepX, f32 stepY) {
 static void keep_moved() {
     for (int i = 0; i < movedCount; i++) {
         MovedPane& moved = movedPanes[i];
-        moved.pane->translate(moved.x0 + moved.dx, moved.y0 + moved.dy);
+        f32 k = (f32)rowShift[moved.row];
+        moved.pane->translate(moved.x0 + moved.sx * k, moved.y0 + moved.sy * k);
+    }
+    for (int row = 0; row < GEAR_ROWS; row++) {
+        GearSlot& slot = gearSlot[row];
+        f32 o = (f32)rowOurs[row];
+        if (slot.anchor && movedCount) slot.anchor->translate(slot.anchorX0 + slot.anchorSx * o, slot.anchorY0 + slot.anchorSy * o);
     }
 }
 
@@ -4998,17 +5015,15 @@ static void build_gear_slot(dMenu_Collect2D_c* m, int row, CPaneMgr* measure) {
         };
         for (int i = 0; i < slot.pieceCount; i++) {
             SlotPiece& piece = slot.pieces[i];
-            move_aside(measure, piece.pane, stepX, stepY);
-            f32 dx, dy;
-            screen_to_local(measure, piece.pane, stepX, stepY, &dx, &dy);
-            piece.dx = -dx, piece.dy = -dy;  // drawn back where it was
+            move_aside(measure, piece.pane, row, stepX, stepY);
+            screen_to_local(measure, piece.pane, stepX, stepY, &piece.sx, &piece.sy);
         }
         for (u64 tag : kRowCells[row]) {
             J2DPane* cell = tag && tag != info.home ? scr->search(tag) : nullptr;
             if (!cell) continue;
             GearSlot scratch{};
             find_cell_pieces(measure, scr, cell, find.step, &scratch);
-            for (int i = 0; i < scratch.pieceCount; i++) move_aside(measure, scratch.pieces[i].pane, stepX, stepY);
+            for (int i = 0; i < scratch.pieceCount; i++) move_aside(measure, scratch.pieces[i].pane, row, stepX, stepY);
         }
     }
 
@@ -5067,7 +5082,9 @@ static void build_gear_slot(dMenu_Collect2D_c* m, int row, CPaneMgr* measure) {
     slot.anchor->mRotateOffsetY = home->mRotateOffsetY;
     f32 dx, dy;
     screen_to_local(measure, home, moveX, moveY, &dx, &dy);
-    slot.anchor->translate(home->getTranslateX() + dx, home->getTranslateY() + dy);
+    slot.anchorX0 = home->getTranslateX() + dx, slot.anchorY0 = home->getTranslateY() + dy;
+    screen_to_local(measure, home, stepX, stepY, &slot.anchorSx, &slot.anchorSy);
+    slot.anchor->translate(slot.anchorX0, slot.anchorY0);
     slot.home = home;
 
     slot.ring = scr->search(info.ring);
@@ -5189,14 +5206,6 @@ static bool gear_built_for(dMenu_Collect2D_c* m) {
 // The menu's own memory is sized for the game's own panes and can be full, so our panes and cell
 // managers live in a small heap of the mod's own (the screen still frees the panes with it).
 static JKRHeap* gearHeap;
-static CPaneMgr* ourCells[GEAR_ROWS];
-
-static void forget_our_cells() {
-    for (CPaneMgr*& cell : ourCells) {
-        if (cell) JKR_DELETE(cell);
-        cell = nullptr;
-    }
-}
 
 static void point_cursor_at(dMenu_Collect2D_c* m, int x, int y);  // with the cursor, further down
 
@@ -5206,6 +5215,7 @@ static void gear_build(dMenu_Collect2D_c* m) {
     gearScreen = nullptr;
     for (GearSlot& slot : gearSlot) slot = GearSlot{};
     movedCount = 0;  // the last menu's panes are gone
+    for (int row = 0; row < GEAR_ROWS; row++) rowShift[row] = 1, rowOurs[row] = 0, rowTriedShift[row] = false;
     CPaneMgr* measure = any_cell(m);
     if (!measure) return;  // the screen isn't set up yet
 
@@ -5225,7 +5235,6 @@ static void gear_build(dMenu_Collect2D_c* m) {
     }
     mods::log::info("Ordon gear slots go in column {}", gearCol);
 
-    forget_our_cells();  // the last menu's, its panes are gone
     if (!gearHeap) gearHeap = trail_make_heap(0x40000);
     if (!gearHeap) {
         mods::log::warn("no memory for the Ordon gear slots");
@@ -5240,9 +5249,13 @@ static void gear_build(dMenu_Collect2D_c* m) {
             mods::log::warn("Ordon gear slot for row {} couldn't be made", row);
             continue;
         }
-        if (!m->mpSelPm[gearCol][row]) {
-            ourCells[row] = JKR_NEW CPaneMgr(m->mpScreen, slot.tag, 0, nullptr);
-            m->mpSelPm[gearCol][row] = ourCells[row];
+        // Our cell's manager goes in the menu's grid, which deletes it with the rest when the
+        // menu closes. One the menu made itself for our cell (asked before ours existed) points at
+        // nothing, so it's swapped for ours.
+        CPaneMgr*& cell = m->mpSelPm[gearCol][row];
+        if (!cell || cell->getPanePtr() != slot.anchor) {
+            if (cell) delete cell;
+            cell = JKR_NEW CPaneMgr(m->mpScreen, slot.tag, 0, nullptr);
         }
     }
     mDoExt_setCurrentHeap(was);
@@ -5263,6 +5276,73 @@ static void gear_wide_post(ModContext*, void* args, void*, void*) {
     if (gear_built_for(m)) keep_moved();
 }
 
+static bool game_gear_tag(int row, u64 tag) {
+    static const u64 kGame[GEAR_ROWS][4] = {
+        {MULTI_CHAR('ken_n0'), MULTI_CHAR('ken_n1'), MULTI_CHAR('heart_kn'), MULTI_CHAR('kamen_n')},
+        {MULTI_CHAR('tate_n0'), MULTI_CHAR('tate_n1'), 0, 0},
+        {MULTI_CHAR('fuku_n0'), MULTI_CHAR('fuku_n1'), MULTI_CHAR('fuku_n2'), 0},
+    };
+    for (u64 game : kGame[row])
+        if (game && game == tag) return true;
+    return false;
+}
+
+// Another mod's own cells in a gear row (its own Ordon slots, say) never end up under ours or
+// under the game's moved items. Where they are is looked at every frame, since a mod may place
+// its cells by the game's own: if one of them sits on ours or on one of the game's items, the
+// game's items in that row move one more slot right; if one still sits on ours after that (it
+// doesn't follow the game's items), ours moves right too. Either way both sets of slots show,
+// side by side.
+static void clear_other_mods(dMenu_Collect2D_c* m) {
+    if (!movedCount || !gear_built_for(m)) return;
+    CPaneMgr* measure = any_cell(m);
+    if (!measure) return;
+    bool changed = false;
+    for (int row = 0; row < GEAR_ROWS; row++) {
+        GearSlot& slot = gearSlot[row];
+        if (!slot.anchor || rowShift[row] >= 4) continue;
+        Vec ours = screen_middle(measure, slot.anchor);
+        Vec homeAt = screen_middle(measure, slot.home);
+        J2DPane* next = m->mpScreen->search(kGearRows[row].next);
+        if (!next) continue;
+        Vec nextAt = screen_middle(measure, next);  // the game's items keep their spacing as they move
+        f32 step = std::sqrt((nextAt.x - homeAt.x) * (nextAt.x - homeAt.x) + (nextAt.y - homeAt.y) * (nextAt.y - homeAt.y));
+        f32 near = 0.45f * step;
+        auto close = [&](const Vec& a, const Vec& b) {
+            return (a.x - b.x) * (a.x - b.x) + (a.y - b.y) * (a.y - b.y) < near * near;
+        };
+        bool onOurs = false, onGame = false;
+        for (int x = 0; x < 7; x++) {
+            u64 tag = cell_tag(m, x, row);
+            if (!tag || game_gear_tag(row, tag)) continue;
+            J2DPane* other = m->mpScreen->search(tag);
+            if (!other) continue;
+            Vec at = screen_middle(measure, other);
+            if (close(at, ours)) onOurs = true;
+            for (int c = 0; c < 3 && !onGame; c++) {
+                J2DPane* game = c == 0 ? slot.home : m->mpScreen->search(c == 1 ? kGearRows[row].next : MULTI_CHAR('fuku_n2'));
+                if (game && (c < 2 || row == GEAR_CLOTHES) && close(at, screen_middle(measure, game))) onGame = true;
+            }
+        }
+        if (!onOurs && !onGame) {
+            rowTriedShift[row] = false;
+            continue;
+        }
+        if (onOurs && rowTriedShift[row]) {
+            rowOurs[row]++;  // it stays put: ours moves past it
+            if (rowShift[row] < rowOurs[row] + 1) rowShift[row] = rowOurs[row] + 1;
+            rowTriedShift[row] = false;
+        } else {
+            rowShift[row]++;
+            rowTriedShift[row] = onOurs;
+        }
+        mods::log::info("another mod's slot is in the way in gear row {}: the game's items there move {} slots right, ours is slot {}",
+                        row, rowShift[row], rowOurs[row] + 1);
+        changed = true;
+    }
+    if (changed) keep_moved();
+}
+
 static void gear_screen_post(ModContext*, void* args, void*, void*) {
     gear_build(mods::arg<dMenu_Collect2D_c*>(args, 0));
 }
@@ -5272,7 +5352,8 @@ static HookAction gear_tag_pre(ModContext*, void* args, void* retval, void*) {
     if (gearAsking || !retval) return HOOK_CONTINUE;
     auto* m = mods::arg<dMenu_Collect2D_c*>(args, 0);
     int x = mods::arg<int>(args, 1), y = mods::arg<int>(args, 2);
-    if (m != gearMenu || x != gearCol || y < 0 || y >= GEAR_ROWS || !gearSlot[y].anchor) return HOOK_CONTINUE;
+    if (m != gearMenu || x != gearCol || y < 0 || y >= GEAR_ROWS || !gearSlot[y].anchor || !gear_built_for(m))
+        return HOOK_CONTINUE;
     *static_cast<u64*>(retval) = gearSlot[y].tag;
     return HOOK_SKIP_ORIGINAL;
 }
@@ -5291,27 +5372,25 @@ static bool is_ours(int x, int y) { return x == gearCol && y >= 0 && y < GEAR_RO
 // the cursor's frame around a cell, as the game draws it around its gear
 static void point_cursor_at(dMenu_Collect2D_c* m, int x, int y) {
     CPaneMgr* cell = m->mpSelPm[x][y];
-    if (!cell || !m->mpDrawCursor) return;
-    Vec at = cell->getGlobalVtxCenter(false, 0);
+    CPaneMgr* measure = cell ? cell : any_cell(m);
+    J2DPane* pane = cell ? cell->getPanePtr() : nullptr;
+    if (!pane) {
+        u64 tag = cell_tag(m, x, y);  // another mod's cell with no manager of its own
+        pane = tag ? m->mpScreen->search(tag) : nullptr;
+    }
+    if (!pane || !measure || !m->mpDrawCursor) return;
+    Vec at = measure->getGlobalVtxCenter(pane, false, 0);
     m->mpDrawCursor->setAlphaRate(1.0f);
-    m->mpDrawCursor->setPos(at.x, at.y, cell->getPanePtr(), false);
+    m->mpDrawCursor->setPos(at.x, at.y, pane, false);
     m->mpDrawCursor->setParam(1.0f, 1.0f, 0.1f, 0.7f, 0.7f);
 }
 
-static void size_cell(dMenu_Collect2D_c* m, int x, int y, bool picked) {
-    if (x < 0 || x > 6 || y < 0 || y > 4 || (x == 6 && y == 0) || !m->mpSelPm[x][y]) return;
-    f32 size = picked ? g_drawHIO.mCollectScreen.mSelectItemScale : g_drawHIO.mCollectScreen.mUnselectItemScale;
-    m->mpSelPm[x][y]->getPanePtr()->scale(size, size);
-}
-
 static void move_cursor(dMenu_Collect2D_c* m, int x, int y) {
-    size_cell(m, m->mCursorX, m->mCursorY, false);
     m->field_0x259 = waitX;
     m->field_0x25a = waitY;
     m->mCursorX = x;
     m->mCursorY = y;
     mDoAud_seStart(Z2SE_SY_CURSOR_ITEM, nullptr, 0, 0);
-    size_cell(m, x, y, true);
     point_cursor_at(m, x, y);
     m->setItemNameString(x, y);
 }
@@ -5322,17 +5401,23 @@ static void move_cursor(dMenu_Collect2D_c* m, int x, int y) {
 // reads the stick earlier in the frame and they're gone by the time we look.)
 static bool stick_stepped(s16 before, s16 now) { return now > 0 && now >= before; }
 
-// another mod's cell left of the game's gear in this row: the nearest one to the game's first slot
-static int other_cell_left(dMenu_Collect2D_c* m, int y) {
-    for (int x = 2; x >= 0; x--)
-        if (!is_ours(x, y) && cell_tag(m, x, y)) return x;
-    return -1;
+// the middle of a cell on screen (ours, the game's, or another mod's)
+static bool cell_middle(dMenu_Collect2D_c* m, int x, int y, Vec* out) {
+    CPaneMgr* measure = any_cell(m);
+    J2DPane* pane = m->mpSelPm[x][y] ? m->mpSelPm[x][y]->getPanePtr() : nullptr;
+    if (!pane) {
+        u64 tag = is_ours(x, y) ? gearSlot[y].tag : cell_tag(m, x, y);
+        pane = tag ? m->mpScreen->search(tag) : nullptr;
+    }
+    if (!pane || !measure) return false;
+    *out = screen_middle(measure, pane);
+    return true;
 }
 
-// Left and right follow what's on screen: [other mods' cells] [ours] [the game's items]. Without
-// other mods that's just the grid's own order; with them, ours sits further left in the grid than
-// it's drawn, so steps across it are put right here. Up and down from ours go to our other slots.
-// Only fills in what the grid code didn't do itself this frame.
+// In the gear rows, left and right go to the next cell along on screen, whoever's it is and
+// wherever it sits in the grid: ours, the game's (moved over) and other mods' cells all line up
+// as they're drawn. Up and down from ours go to our other slots; everything else up and down is
+// the game's own. Only fills in what the grid code didn't do itself this frame.
 static void gear_cursor(dMenu_Collect2D_c* m) {
     STControl* stick = m->mpStick;
     if (!stick) return;
@@ -5341,37 +5426,31 @@ static void gear_cursor(dMenu_Collect2D_c* m) {
     if (!sideways && !upDown) return;
     u8 dir = stick->mDirectionTrig;
     int x0 = waitX, y0 = waitY;
-    bool moved = m->mCursorX != x0 || m->mCursorY != y0;
-    bool left = sideways && (dir & STControl::TRIG_LEFT), right = sideways && (dir & STControl::TRIG_RIGHT);
     int toX = -1, toY = y0;
 
-    if (is_ours(x0, y0)) {
-        if (left) {
-            toX = other_cell_left(m, y0);
-            if (toX < 0) toX = x0;  // nothing further left: stay
-        } else if (right) {
-            for (int x = 3; x <= 6 && toX < 0; x++)
-                if (m->mpSelPm[x][y0] && cell_tag(m, x, y0)) toX = x;
-        } else if (upDown && (dir & (STControl::TRIG_UP | STControl::TRIG_DOWN))) {
-            int step = (dir & STControl::TRIG_UP) ? -1 : 1;
-            for (int y = y0 + step; y >= 0 && y < GEAR_ROWS && toX < 0; y += step)
-                if (is_ours(gearCol, y)) toX = gearCol, toY = y;
-            // past our last slot the game's own move stands
+    if (sideways && y0 < GEAR_ROWS && (dir & (STControl::TRIG_LEFT | STControl::TRIG_RIGHT))) {
+        int way = (dir & STControl::TRIG_RIGHT) ? 1 : -1;
+        Vec from;
+        if (!cell_middle(m, x0, y0, &from)) return;
+        Vec firstAt, nextAt;
+        f32 step = 40.0f;
+        if (cell_middle(m, 3, y0, &firstAt) && cell_middle(m, 4, y0, &nextAt)) step = std::fabs(nextAt.x - firstAt.x);
+        f32 best = 0.0f;
+        for (int x = 0; x < 7; x++) {
+            if (x == x0 || !(is_ours(x, y0) || cell_tag(m, x, y0))) continue;
+            Vec at;
+            if (!cell_middle(m, x, y0, &at)) continue;
+            f32 along = (at.x - from.x) * way;
+            if (along < 0.3f * step) continue;  // not that way (or on top of this one)
+            if (toX < 0 || along < best) toX = x, best = along;
         }
-    } else if (y0 < GEAR_ROWS && is_ours(gearCol, y0)) {
-        if (left && x0 >= 3 && (!moved || m->mCursorX < 3) && gameLayout) {
-            // from the game's first item (drawn right beside ours) left lands on ours
-            bool firstItem = true;
-            for (int x = 3; x < x0 && firstItem; x++) firstItem = !cell_tag(m, x, y0);
-            if (firstItem) toX = gearCol;
-        } else if (left && !moved && x0 > gearCol && !gameLayout) {
-            bool clear = true;
-            for (int x = gearCol + 1; x < x0 && clear; x++) clear = !cell_tag(m, x, y0);
-            if (clear) toX = gearCol;
-        } else if (right && x0 < 3 && gameLayout && (m->mCursorX >= 3 || !moved)) {
-            // from another mod's cell, right lands on ours before the game's items
-            toX = gearCol;
-        }
+        // nothing further that way in the row: the game's own move stands (it may go up to the
+        // heart, say)
+    } else if (upDown && is_ours(x0, y0) && (dir & (STControl::TRIG_UP | STControl::TRIG_DOWN))) {
+        int step = (dir & STControl::TRIG_UP) ? -1 : 1;
+        for (int y = y0 + step; y >= 0 && y < GEAR_ROWS && toX < 0; y += step)
+            if (is_ours(gearCol, y)) toX = gearCol, toY = y;
+        // past our last slot the game's own move stands
     }
     if (toX < 0 || (toX == m->mCursorX && toY == m->mCursorY)) return;
     move_cursor(m, toX, toY);
@@ -5477,10 +5556,16 @@ static void draw_slot(dMenu_Collect2D_c* m, int row, J2DGrafContext* graf) {
         was[i] = {p->getTranslateX(), p->getTranslateY(), p->getAlpha(), p->mIsInfluencedAlpha};
         p->mIsInfluencedAlpha = false;
         p->setAlpha((u8)(was[i].alpha * fade / 255));
-        p->translate(was[i].x + piece.dx, was[i].y + piece.dy);
+        if (movedCount) {
+            // the game's first slot has been moved along with its row; ours is drawn at our slot
+            f32 back = (f32)(rowOurs[row] - rowShift[row]);
+            p->translate(was[i].x + piece.sx * back, was[i].y + piece.sy * back);
+        } else {
+            p->translate(was[i].x + piece.dx, was[i].y + piece.dy);
+        }
     }
     set_shown(home, owned);
-    home->scale(slot.anchor->getScaleX(), slot.anchor->getScaleY());  // bigger while picked, like the game's
+    home->scale(1.0f, 1.0f);  // never grown, like the game's gear on this page
     set_shown(slot.icon, true);
     set_shown(slot.drop, false);
     const ResTIMG* gameIcon = nullptr;
@@ -5526,12 +5611,6 @@ static HookAction gear_draw(ModContext*, void* args, void*, void*) {
     for (int row = 0; row < GEAR_ROWS; row++)
         if (gearSlot[row].anchor) draw_slot(m, row, graf);
     return HOOK_CONTINUE;
-}
-
-// our cells grow when picked, like the game's
-static void gear_follow_screen(dMenu_Collect2D_c* m) {
-    for (int row = 0; row < GEAR_ROWS; row++)
-        if (gearSlot[row].anchor) size_cell(m, gearCol, row, m->mCursorX == gearCol && m->mCursorY == row);
 }
 
 // --- putting things on and taking them off ---
@@ -5754,8 +5833,8 @@ static void gear_wait_post(ModContext*, void* args, void*, void*) {
         after_press(m);
     }
     if (!gear_built_for(m)) return;
+    clear_other_mods(m);
     gear_cursor(m);
-    gear_follow_screen(m);
     paint_gear_rings(m);
     int x = m->mCursorX, y = m->mCursorY;
     if (!is_ours(x, y)) return;
