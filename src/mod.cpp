@@ -2619,23 +2619,21 @@ static void redraw_buttons() {
 DEFINE_HOOK(&dMenu_Ring_c::isMixItemOn, RingCanMix);
 DEFINE_HOOK(&dMenu_Ring_c::isMixItemOff, RingCanSplit);
 
-// The same Hawkeye-swap trick that lets the bow combine with the lantern (Fire Arrows) also lets
-// it combine with the Ice Sled leaf (Ice Arrows): while the ring looks at that slot it briefly
-// holds the Hawkeye, so the ring combines it with the bow, then it's put back.
-static int comboPosing = -1;  // slot holding the Hawkeye in place of a combo item, -1 if none
-static u8 comboPosingWas;     // the item that slot really holds (lantern or leaf)
-static bool bow_on_a_button();
-static void watch_indices(const char* where);  // DEBUG
+// The lantern combines with the bow through the game's own combining (Fire Arrows): the Hawkeye-swap
+// trick makes the ring treat the lantern like the Hawkeye for a moment, so it ties it to the bow,
+// then it's put back. The Ice Sled can't go through this path: it's a modded item, and the game
+// silently drops any combo whose partner isn't a real inventory item. Ice Arrows are tracked by a
+// flag of our own instead (see ice_tied below), the same way the Gale-Bomb is.
+static int comboPosing = -1;  // slot holding the Hawkeye in place of the lantern, -1 if none
+static u8 comboPosingWas;     // the item that slot really holds (the lantern)
 
 static HookAction lantern_poses(ModContext*, void* args, void*, void*) {
     if (comboPosing >= 0) return HOOK_CONTINUE;
     auto* ring = mods::arg<dMenu_Ring_c*>(args, 0);
+    if (on_second_page(ring)) return HOOK_CONTINUE;  // no combining on the second page
     u8 slot = ring->mItemSlots[ring->mCurrentSlot];
     u8 item = dComIfGs_getItem(slot, false);
-    bool combos = (item == dItemNo_KANTERA_e && fire_on()) || (item == leafItem && ice_on());
-    watch_indices("ring");  // DEBUG
-    if (on_second_page(ring)) return HOOK_CONTINUE;  // no combining on the second page
-    if (!combos) return HOOK_CONTINUE;
+    if (item != dItemNo_KANTERA_e || !fire_on()) return HOOK_CONTINUE;
     comboPosingWas = item;
     dComIfGs_setItem(slot, dItemNo_HAWK_EYE_e);
     comboPosing = slot;
@@ -2658,28 +2656,7 @@ static void lantern_back_after_mix(ModContext*, void* args, void*, void*) {
     if (lantern_back()) mods::arg<dMenu_Ring_c*>(args, 0)->setJumpItem(false);
 }
 
-// DEBUG: logs the four button indices whenever any of them changes, with a tag for where
-static void watch_indices(const char* where) {
-    static int lastS0 = -2, lastM0 = -2, lastS1 = -2, lastM1 = -2;
-    int s0 = dComIfGs_getSelectItemIndex(0), m0 = dComIfGs_getMixItemIndex(0);
-    int s1 = dComIfGs_getSelectItemIndex(1), m1 = dComIfGs_getMixItemIndex(1);
-    if (s0 == lastS0 && m0 == lastM0 && s1 == lastS1 && m1 == lastM1) return;
-    mods::log::info("[idx@{}] sel0={} mix0={} sel1={} mix1={}", where, s0, m0, s1, m1);
-    lastS0 = s0; lastM0 = m0; lastS1 = s1; lastM1 = m1;
-}
-
-// DEBUG: fires when R is pressed and the ring tries to mix; shows what it sees
-static HookAction mix_log_pre(ModContext*, void* args, void*, void*) {
-    auto* ring = mods::arg<dMenu_Ring_c*>(args, 0);
-    u8 slot = ring->mItemSlots[ring->mCurrentSlot];
-    u8 item = dComIfGs_getItem(slot, false);  // HAWK_EYE now if the swap fired
-    mods::log::info("[mix R] slot={} itemSeen={:#x} | sel0={} mix0={} sel1={} mix1={}",
-                    slot, item, dComIfGs_getSelectItemIndex(0), dComIfGs_getMixItemIndex(0),
-                    dComIfGs_getSelectItemIndex(1), dComIfGs_getMixItemIndex(1));
-    return HOOK_CONTINUE;
-}
-
-// the button with a bow combined with the given slot item (the lantern for fire, the leaf for ice)
+// the button with a bow combined with the given slot item (the lantern, for Fire Arrows)
 static int bow_combo_button(u8 partner) {
     for (int b = 0; b < 2; b++) {
         if (dComIfGp_getSelectItem(b) != dItemNo_BOW_e) continue;
@@ -2690,13 +2667,40 @@ static int bow_combo_button(u8 partner) {
 
 // the button with fire arrows on it: the bow, with the lantern's slot as its partner
 static int fire_button() { return fire_on() ? bow_combo_button(dItemNo_KANTERA_e) : -1; }
-// the button with ice arrows on it: the bow, with the leaf's slot as its partner
-static int ice_button() { return ice_on() ? bow_combo_button(leafItem) : -1; }
 
 static bool bow_on_a_button() {
     for (int b = 0; b < 2; b++)
         if (dComIfGs_getSelectItemIndex(b) == SLOT_4 || dComIfGs_getMixItemIndex(b) == SLOT_4) return true;
     return false;
+}
+
+// a button holding the bow on its own, with nothing tied to it (not a Fire-Arrow or bomb combo).
+// There's only ever the one bow, so at most one button can match.
+static int plain_bow_button() {
+    for (int b = 0; b < 2; b++)
+        if (dComIfGp_getSelectItem(b) == dItemNo_BOW_e && dComIfGs_getMixItemIndex(b) == dItemNo_NONE_e)
+            return b;
+    return -1;
+}
+
+// Ice Arrows are a mode we keep ourselves, stored per save like the Gale-Bomb's tied bag: the game's
+// combining can't hold the modded Ice Sled, so R on the sled just flips this flag on the bow.
+static bool ice_tied() {
+    uint8_t stored = 0;
+    size_t n = 1;
+    if (svc_save->get_blob(mod_ctx, "iceBow", &stored, &n) != MOD_OK || n != 1) return false;
+    return stored != 0;
+}
+
+static void set_ice(bool on) {
+    uint8_t stored = on ? 1 : 0;
+    svc_save->set_blob(mod_ctx, "iceBow", &stored, 1);
+}
+
+// the button with ice arrows on it: the bow, held plain, while the ice flag is on
+static int ice_button() {
+    if (!ice_on() || !ice_tied()) return -1;
+    return plain_bow_button();
 }
 
 // --- the item ring, for the Gale-Bomb combo (the boomerang isn't in the game's combining) ---
@@ -2767,13 +2771,19 @@ static void ring_post(ModContext*, void* args, void*, void*) {
     bool idle = ring->mStatus == dMenu_Ring_c::STATUS_WAIT && !ring->mPlayerIsWolf &&
                 ring->mpItemExplain->getStatus() == 0;
     u8 slot = ring->mItemSlots[ring->mCurrentSlot];
+    u8 item = dComIfGs_getItem(slot, false);
     int change = idle ? ring_r_action(slot) : 0;
+
+    // R on the Ice Sled ties it to the bow, if a plain bow is on a button and nothing else here needs R
+    bool iceHere = idle && change == 0 && ice_on() && item == leafItem && plain_bow_button() >= 0;
+    if (iceHere) change = ice_tied() ? -1 : 1;
+
     ring_prompt(ring, change);
     if (!idle) return;
 
     // putting the boomerang on X or Y by itself splits the bombs off, like re-setting the bow does
     bool setButton = mDoCPd_c::getTrigX(PAD_1) || mDoCPd_c::getTrigY(PAD_1);
-    if (setButton && tied_bag() >= 0 && dComIfGs_getItem(slot, false) == dItemNo_BOOMERANG_e) {
+    if (setButton && tied_bag() >= 0 && item == dItemNo_BOOMERANG_e) {
         tie_bag(-1);
         redraw_buttons();
         return;
@@ -2781,9 +2791,14 @@ static void ring_post(ModContext*, void* args, void*, void*) {
 
     if (change == 0 || !mDoCPd_c::getTrigR(PAD_1)) return;
     bool joining = change > 0;
-    tie_bag(joining ? slot : -1);
     mDoAud_seStart(joining ? Z2SE_SY_ITEM_COMBINE_ON : Z2SE_SY_ITEM_COMBINE_OFF, nullptr, 0, 0);
-    fly_item_icon(ring, boomerang_button(), dComIfGs_getItem(slot, false), joining);
+    if (iceHere) {
+        set_ice(joining);
+        fly_item_icon(ring, plain_bow_button(), item, joining);
+    } else {
+        tie_bag(joining ? slot : -1);
+        fly_item_icon(ring, boomerang_button(), item, joining);
+    }
     redraw_buttons();
 }
 
@@ -5823,7 +5838,6 @@ static void link_update_post(ModContext* ctx, void* args, void* ret, void* user)
     burn_enemies();                     // fire arrows / lantern: whoever's burning
     link_burn_tick(lnk);                // Enemies Deal Burn: Link's own two-hit burn
     freeze_tick();                      // ice arrows: hold frozen enemies, time freezes out
-    watch_indices("game");              // DEBUG
 }
 
 static bool add_bool_option(const char* key, bool def, ConfigVarHandle* out) {
@@ -5970,7 +5984,6 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     // the lantern poses as the Hawkeye wherever the ring decides what R does with it
     int lanternMiss = 0;
     lanternMiss += !pre_hook(RingMixItem, lantern_poses) + !post_hook(RingMixItem, lantern_back_after_mix);
-    pre_hook(RingMixItem, mix_log_pre);  // DEBUG
     lanternMiss += !pre_hook(RingCanMix, lantern_poses) + !post_hook(RingCanMix, lantern_back_post);
     lanternMiss += !pre_hook(RingCanSplit, lantern_poses) + !post_hook(RingCanSplit, lantern_back_post);
     lanternMiss += !pre_hook(RingCursor, lantern_poses) + !post_hook(RingCursor, lantern_back_post);
