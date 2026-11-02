@@ -2624,14 +2624,18 @@ DEFINE_HOOK(&dMenu_Ring_c::isMixItemOff, RingCanSplit);
 // holds the Hawkeye, so the ring combines it with the bow, then it's put back.
 static int comboPosing = -1;  // slot holding the Hawkeye in place of a combo item, -1 if none
 static u8 comboPosingWas;     // the item that slot really holds (lantern or leaf)
+static bool bow_on_a_button();
 
 static HookAction lantern_poses(ModContext*, void* args, void*, void*) {
     if (comboPosing >= 0) return HOOK_CONTINUE;
     auto* ring = mods::arg<dMenu_Ring_c*>(args, 0);
-    if (on_second_page(ring)) return HOOK_CONTINUE;  // no combining on the second page
     u8 slot = ring->mItemSlots[ring->mCurrentSlot];
     u8 item = dComIfGs_getItem(slot, false);
     bool combos = (item == dItemNo_KANTERA_e && fire_on()) || (item == leafItem && ice_on());
+    if (item == leafItem || item == dItemNo_KANTERA_e)
+        mods::log::info("[combo] slot={} item={:#x} leafId={:#x} ice_on={} fire_on={} 2ndpage={} bowBtn={} combos={}",
+                        slot, item, (u8)leafItem, ice_on(), fire_on(), on_second_page(ring), bow_on_a_button(), combos);
+    if (on_second_page(ring)) return HOOK_CONTINUE;  // no combining on the second page
     if (!combos) return HOOK_CONTINUE;
     comboPosingWas = item;
     dComIfGs_setItem(slot, dItemNo_HAWK_EYE_e);
