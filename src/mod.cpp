@@ -2633,8 +2633,10 @@ static HookAction lantern_poses(ModContext*, void* args, void*, void*) {
     u8 item = dComIfGs_getItem(slot, false);
     bool combos = (item == dItemNo_KANTERA_e && fire_on()) || (item == leafItem && ice_on());
     if (item == leafItem || item == dItemNo_KANTERA_e)
-        mods::log::info("[combo] slot={} item={:#x} leafId={:#x} ice_on={} fire_on={} 2ndpage={} bowBtn={} combos={}",
-                        slot, item, (u8)leafItem, ice_on(), fire_on(), on_second_page(ring), bow_on_a_button(), combos);
+        mods::log::info("[combo] slot={} item={:#x} ice_on={} 2ndpage={} bowBtn={} combos={} | sel0={} mix0={} sel1={} mix1={} (SLOT_4={})",
+                        slot, item, ice_on(), on_second_page(ring), bow_on_a_button(), combos,
+                        dComIfGs_getSelectItemIndex(0), dComIfGs_getMixItemIndex(0),
+                        dComIfGs_getSelectItemIndex(1), dComIfGs_getMixItemIndex(1), (int)SLOT_4);
     if (on_second_page(ring)) return HOOK_CONTINUE;  // no combining on the second page
     if (!combos) return HOOK_CONTINUE;
     comboPosingWas = item;
@@ -2657,6 +2659,17 @@ static void lantern_back_post(ModContext*, void*, void*, void*) {
 // after combining, the ring drew the flying icon as the Hawkeye; draw it again as the real item
 static void lantern_back_after_mix(ModContext*, void* args, void*, void*) {
     if (lantern_back()) mods::arg<dMenu_Ring_c*>(args, 0)->setJumpItem(false);
+}
+
+// DEBUG: fires when R is pressed and the ring tries to mix; shows what it sees
+static HookAction mix_log_pre(ModContext*, void* args, void*, void*) {
+    auto* ring = mods::arg<dMenu_Ring_c*>(args, 0);
+    u8 slot = ring->mItemSlots[ring->mCurrentSlot];
+    u8 item = dComIfGs_getItem(slot, false);  // HAWK_EYE now if the swap fired
+    mods::log::info("[mix R] slot={} itemSeen={:#x} | sel0={} mix0={} sel1={} mix1={}",
+                    slot, item, dComIfGs_getSelectItemIndex(0), dComIfGs_getMixItemIndex(0),
+                    dComIfGs_getSelectItemIndex(1), dComIfGs_getMixItemIndex(1));
+    return HOOK_CONTINUE;
 }
 
 // the button with a bow combined with the given slot item (the lantern for fire, the leaf for ice)
@@ -5949,6 +5962,7 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     // the lantern poses as the Hawkeye wherever the ring decides what R does with it
     int lanternMiss = 0;
     lanternMiss += !pre_hook(RingMixItem, lantern_poses) + !post_hook(RingMixItem, lantern_back_after_mix);
+    pre_hook(RingMixItem, mix_log_pre);  // DEBUG
     lanternMiss += !pre_hook(RingCanMix, lantern_poses) + !post_hook(RingCanMix, lantern_back_post);
     lanternMiss += !pre_hook(RingCanSplit, lantern_poses) + !post_hook(RingCanSplit, lantern_back_post);
     lanternMiss += !pre_hook(RingCursor, lantern_poses) + !post_hook(RingCursor, lantern_back_post);
