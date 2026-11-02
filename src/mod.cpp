@@ -2625,6 +2625,7 @@ DEFINE_HOOK(&dMenu_Ring_c::isMixItemOff, RingCanSplit);
 static int comboPosing = -1;  // slot holding the Hawkeye in place of a combo item, -1 if none
 static u8 comboPosingWas;     // the item that slot really holds (lantern or leaf)
 static bool bow_on_a_button();
+static void watch_indices(const char* where);  // DEBUG
 
 static HookAction lantern_poses(ModContext*, void* args, void*, void*) {
     if (comboPosing >= 0) return HOOK_CONTINUE;
@@ -2632,11 +2633,7 @@ static HookAction lantern_poses(ModContext*, void* args, void*, void*) {
     u8 slot = ring->mItemSlots[ring->mCurrentSlot];
     u8 item = dComIfGs_getItem(slot, false);
     bool combos = (item == dItemNo_KANTERA_e && fire_on()) || (item == leafItem && ice_on());
-    if (item == leafItem || item == dItemNo_KANTERA_e)
-        mods::log::info("[combo] slot={} item={:#x} ice_on={} 2ndpage={} bowBtn={} combos={} | sel0={} mix0={} sel1={} mix1={} (SLOT_4={})",
-                        slot, item, ice_on(), on_second_page(ring), bow_on_a_button(), combos,
-                        dComIfGs_getSelectItemIndex(0), dComIfGs_getMixItemIndex(0),
-                        dComIfGs_getSelectItemIndex(1), dComIfGs_getMixItemIndex(1), (int)SLOT_4);
+    watch_indices("ring");  // DEBUG
     if (on_second_page(ring)) return HOOK_CONTINUE;  // no combining on the second page
     if (!combos) return HOOK_CONTINUE;
     comboPosingWas = item;
@@ -2659,6 +2656,16 @@ static void lantern_back_post(ModContext*, void*, void*, void*) {
 // after combining, the ring drew the flying icon as the Hawkeye; draw it again as the real item
 static void lantern_back_after_mix(ModContext*, void* args, void*, void*) {
     if (lantern_back()) mods::arg<dMenu_Ring_c*>(args, 0)->setJumpItem(false);
+}
+
+// DEBUG: logs the four button indices whenever any of them changes, with a tag for where
+static void watch_indices(const char* where) {
+    static int lastS0 = -2, lastM0 = -2, lastS1 = -2, lastM1 = -2;
+    int s0 = dComIfGs_getSelectItemIndex(0), m0 = dComIfGs_getMixItemIndex(0);
+    int s1 = dComIfGs_getSelectItemIndex(1), m1 = dComIfGs_getMixItemIndex(1);
+    if (s0 == lastS0 && m0 == lastM0 && s1 == lastS1 && m1 == lastM1) return;
+    mods::log::info("[idx@{}] sel0={} mix0={} sel1={} mix1={}", where, s0, m0, s1, m1);
+    lastS0 = s0; lastM0 = m0; lastS1 = s1; lastM1 = m1;
 }
 
 // DEBUG: fires when R is pressed and the ring tries to mix; shows what it sees
@@ -5816,6 +5823,7 @@ static void link_update_post(ModContext* ctx, void* args, void* ret, void* user)
     burn_enemies();                     // fire arrows / lantern: whoever's burning
     link_burn_tick(lnk);                // Enemies Deal Burn: Link's own two-hit burn
     freeze_tick();                      // ice arrows: hold frozen enemies, time freezes out
+    watch_indices("game");              // DEBUG
 }
 
 static bool add_bool_option(const char* key, bool def, ConfigVarHandle* out) {
