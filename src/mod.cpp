@@ -129,6 +129,7 @@ enum FlourishMode : int { FLOURISH_ON, FLOURISH_WOODEN, FLOURISH_DEFAULT, FLOURI
 static const char* const flourishNames[] = {"On", "Wooden", "Default", "Off"};
 static ConfigVarHandle flourishOption;
 static ConfigVarHandle vLanternBurn;  // Deal Burn with Lantern
+static ConfigVarHandle vEnemiesBurn;  // Enemies Deal Burn
 static ConfigVarHandle vTrueDamage;   // PVP True Damage
 static ConfigVarHandle vManualShield; // Manual Shielding
 static ConfigVarHandle vFireDamage;     // Deal Burn Damage (fire arrows)
@@ -136,6 +137,7 @@ static ConfigVarHandle vFireDamage;     // Deal Burn Damage (fire arrows)
 // items: which bombs can ride the Gale Boomerang (normal, water, bomblings)
 static ConfigVarHandle galeBombToggle[3];
 static ConfigVarHandle vFireArrows;  // bow + lantern
+static ConfigVarHandle vIceArrows;   // bow + ice sled (leaf)
 static ConfigVarHandle vCombos;  // Enable Combinations, over all of the above
 
 // unarmed combat (0 = registering failed, the default is used)
@@ -2588,6 +2590,7 @@ static int boomerang_button() {
 static bool combos_on() { return cfgOn(vCombos); }
 static bool gale_on(int kind) { return kind >= 0 && combos_on() && cfgOn(galeBombToggle[kind]); }
 static bool fire_on() { return combos_on() && cfgOn(vFireArrows); }
+static bool ice_on() { return combos_on() && cfgOn(vIceArrows, true); }
 
 // the bag that's tied on, still holding bombs of a kind that's switched on; -1 if not
 static int armed_bag() {
@@ -2616,23 +2619,30 @@ static void redraw_buttons() {
 DEFINE_HOOK(&dMenu_Ring_c::isMixItemOn, RingCanMix);
 DEFINE_HOOK(&dMenu_Ring_c::isMixItemOff, RingCanSplit);
 
-static int lanternPosing = -1;  // slot holding the Hawkeye in place of the lantern, -1 if none
+// The same Hawkeye-swap trick that lets the bow combine with the lantern (Fire Arrows) also lets
+// it combine with the Ice Sled leaf (Ice Arrows): while the ring looks at that slot it briefly
+// holds the Hawkeye, so the ring combines it with the bow, then it's put back.
+static int comboPosing = -1;  // slot holding the Hawkeye in place of a combo item, -1 if none
+static u8 comboPosingWas;     // the item that slot really holds (lantern or leaf)
 
 static HookAction lantern_poses(ModContext*, void* args, void*, void*) {
-    if (!fire_on() || lanternPosing >= 0) return HOOK_CONTINUE;
+    if (comboPosing >= 0) return HOOK_CONTINUE;
     auto* ring = mods::arg<dMenu_Ring_c*>(args, 0);
     if (on_second_page(ring)) return HOOK_CONTINUE;  // no combining on the second page
     u8 slot = ring->mItemSlots[ring->mCurrentSlot];
-    if (dComIfGs_getItem(slot, false) != dItemNo_KANTERA_e) return HOOK_CONTINUE;
+    u8 item = dComIfGs_getItem(slot, false);
+    bool combos = (item == dItemNo_KANTERA_e && fire_on()) || (item == leafItem && ice_on());
+    if (!combos) return HOOK_CONTINUE;
+    comboPosingWas = item;
     dComIfGs_setItem(slot, dItemNo_HAWK_EYE_e);
-    lanternPosing = slot;
+    comboPosing = slot;
     return HOOK_CONTINUE;
 }
 
 static bool lantern_back() {
-    if (lanternPosing < 0) return false;
-    dComIfGs_setItem(lanternPosing, dItemNo_KANTERA_e);
-    lanternPosing = -1;
+    if (comboPosing < 0) return false;
+    dComIfGs_setItem(comboPosing, comboPosingWas);
+    comboPosing = -1;
     return true;
 }
 
@@ -2640,20 +2650,24 @@ static void lantern_back_post(ModContext*, void*, void*, void*) {
     lantern_back();
 }
 
-// after combining, the ring drew the flying icon as the Hawkeye; draw it again as the lantern
+// after combining, the ring drew the flying icon as the Hawkeye; draw it again as the real item
 static void lantern_back_after_mix(ModContext*, void* args, void*, void*) {
     if (lantern_back()) mods::arg<dMenu_Ring_c*>(args, 0)->setJumpItem(false);
 }
 
-// the button with fire arrows on it: the bow, with the lantern's slot as its partner
-static int fire_button() {
-    if (!fire_on()) return -1;
+// the button with a bow combined with the given slot item (the lantern for fire, the leaf for ice)
+static int bow_combo_button(u8 partner) {
     for (int b = 0; b < 2; b++) {
         if (dComIfGp_getSelectItem(b) != dItemNo_BOW_e) continue;
-        if (dComIfGs_getItem(dComIfGs_getSelectItemIndex(b), false) == dItemNo_KANTERA_e) return b;
+        if (dComIfGs_getItem(dComIfGs_getSelectItemIndex(b), false) == partner) return b;
     }
     return -1;
 }
+
+// the button with fire arrows on it: the bow, with the lantern's slot as its partner
+static int fire_button() { return fire_on() ? bow_combo_button(dItemNo_KANTERA_e) : -1; }
+// the button with ice arrows on it: the bow, with the leaf's slot as its partner
+static int ice_button() { return ice_on() ? bow_combo_button(leafItem) : -1; }
 
 static bool bow_on_a_button() {
     for (int b = 0; b < 2; b++)
@@ -2759,9 +2773,11 @@ static void ring_post(ModContext*, void* args, void*, void*) {
 static constexpr int comboIconSize = 128;
 static ResourceBuffer galeBombIcon = RESOURCE_BUFFER_INIT;
 static ResourceBuffer fireArrowIcon = RESOURCE_BUFFER_INIT;
+static ResourceBuffer iceArrowIcon = RESOURCE_BUFFER_INIT;
 
 static int galeIconButton = -1;  // button drawing the boomerang with bombs tied on, -1 if none
 static int fireIconButton = -1;  // button drawing the fire-arrow bow, -1 if none
+static int iceIconButton = -1;   // button drawing the ice-arrow bow, -1 if none
 static void* comboIconTex;       // the picture just loaded for that button, to paint ours over
 static J2DPicture* comboIconPic;
 static const ResourceBuffer* comboIcon;
@@ -2778,6 +2794,7 @@ static HookAction button_icon_pre(ModContext*, void* args, void*, void*) {
     u8 shown = mods::arg<u8>(args, 2);
     galeIconButton = shown == dItemNo_BOOMERANG_e && armed_bag() >= 0 ? button : -1;
     fireIconButton = shown == dItemNo_BOW_e && fire_button() == button ? button : -1;
+    iceIconButton = shown == dItemNo_BOW_e && ice_button() == button ? button : -1;
     return HOOK_CONTINUE;
 }
 
@@ -2815,11 +2832,11 @@ static void button_icon_post(ModContext*, void* args, void*, void*) {
     auto* hud = mods::arg<dMeter2Draw_c*>(args, 0);
     int button = mods::arg<int>(args, 1);
     bool itemsShown = mods::arg<bool>(args, 4);
-    int combo = galeIconButton >= 0 ? galeIconButton : fireIconButton;
+    int combo = galeIconButton >= 0 ? galeIconButton : fireIconButton >= 0 ? fireIconButton : iceIconButton;
     // placed like an ordinary item with no tilt or offset of its own (the bomb arrow is one)
     if (combo >= 0 && itemsShown) place_picture(hud, combo, dItemNo_BOMB_ARROW_e);
     if (itemsShown && button >= 0 && button < 2) comboShown[button] = combo >= 0;
-    galeIconButton = fireIconButton = -1;
+    galeIconButton = fireIconButton = iceIconButton = -1;
 }
 
 // After a warp or a new area the HUD is built from scratch, sometimes before the item buttons can
@@ -2834,10 +2851,10 @@ static void keep_combos_drawn() {
     }
     dMeter2Draw_c* hud = dMeter2Info_getMeterClass()->getMeterDrawPtr();
     for (int b = 0; b < 2; b++) {
-        bool combo = fire_button() == b || (armed_bag() >= 0 && boomerang_button() == b);
+        bool combo = fire_button() == b || ice_button() == b || (armed_bag() >= 0 && boomerang_button() == b);
         // drawn as the combination, and our picture is still on the texture it's showing
         bool showing = comboShown[b];
-        const ResourceBuffer& picture = fire_button() == b ? fireArrowIcon : galeBombIcon;
+        const ResourceBuffer& picture = fire_button() == b ? fireArrowIcon : ice_button() == b ? iceArrowIcon : galeBombIcon;
         if (showing && hud != nullptr && picture.data != nullptr)
             showing = icon_painted(hud->mpItemXYTex[b][hud->field_0x76c[b]][0]);
         if (combo && !showing) {
@@ -2855,10 +2872,11 @@ static HookAction combo_tex_pre(ModContext*, void* args, void*, void*) {
     void* front = mods::arg<void*>(args, 2);
     bool gale = galeIconButton >= 0 && item == dItemNo_BOOMERANG_e;
     bool fire = fireIconButton >= 0 && item == dItemNo_BOW_e;
-    if (front == nullptr || (!gale && !fire)) return HOOK_CONTINUE;
+    bool ice = iceIconButton >= 0 && item == dItemNo_BOW_e;
+    if (front == nullptr || (!gale && !fire && !ice)) return HOOK_CONTINUE;
     comboIconTex = front;
     comboIconPic = mods::arg<J2DPicture*>(args, 3);
-    comboIcon = gale ? &galeBombIcon : &fireArrowIcon;
+    comboIcon = gale ? &galeBombIcon : fire ? &fireArrowIcon : &iceArrowIcon;
     return HOOK_CONTINUE;
 }
 
@@ -2969,6 +2987,8 @@ struct BurningArrow {
     u8 blockedNext;
     LIGHT_INFLUENCE glow;
     bool glowing;
+    bool ice;       // an ice arrow (freezes) rather than a fire arrow (burns)
+    bool landSaid;  // the landing ice sound has played
 };
 
 static BurningArrow burning[kArrowMemory];
@@ -3019,7 +3039,7 @@ static int find_burning(fpc_ProcID id) {
     return -1;
 }
 
-static int light_arrow(daArrow_c* arrow, const cXyz& tip) {
+static int light_arrow(daArrow_c* arrow, const cXyz& tip, bool ice = false) {
     int at = burningNext;
     burningNext = (burningNext + 1) % kArrowMemory;
     BurningArrow& fire = burning[at];
@@ -3029,18 +3049,20 @@ static int light_arrow(daArrow_c* arrow, const cXyz& tip) {
     fire.lastTip = tip;
     fire.moved.set(0.0f, 0.0f, 0.0f);
     fire.spread = false;
+    fire.ice = ice;
+    fire.landSaid = false;
     for (int i = 0; i < 4; i++) fire.brushed[i] = fire.blocked[i] = fpcM_ERROR_PROCESS_ID_e;
     fire.blockedNext = 0;
     fire.hitOwner.Init(0xFF, 0xFF, arrow);
     fire.hit.Set(kArrowFireSrc);
     fire.hit.SetStts(&fire.hitOwner);
-    fire.hitReady = true;
+    fire.hitReady = !ice;  // ice arrows don't light torches, burn webs, etc.
 
-    // a warm orange glow, about as strong as the lantern's
+    // a glow around the head, warm orange for fire and a cold blue for ice
     fire.glow.mPosition = tip;
-    fire.glow.mColor.r = 255;
-    fire.glow.mColor.g = 140;
-    fire.glow.mColor.b = 60;
+    fire.glow.mColor.r = ice ? 120 : 255;
+    fire.glow.mColor.g = ice ? 180 : 140;
+    fire.glow.mColor.b = ice ? 255 : 60;
     fire.glow.mPow = 400.0f;
     fire.glow.mFluctuation = 0.0f;
     dKy_plight_set(&fire.glow);
@@ -3225,6 +3247,120 @@ static void burn_enemies() {
     }
 }
 
+// --- Ice Arrows: freeze and shatter ---
+// An ice arrow freezes whoever it hits; a second ice hit while they're still frozen shatters them
+// and deals the burn's after-hit damage (its two scorches' worth). Another player (a Link model)
+// freezes the game's own way from the ice-material hit, on their end. An enemy has no frozen state
+// of its own, so the mod holds it in place with a frost effect over it for the freeze (best-effort;
+// its own animation may still play). The little icy mist on the tip is the same frost, kept small.
+static const u16 kIceMist = 0x85ba;           // a frost puff (freezard's); small on the tip
+static const int kFreezeFrames = 180;         // how long a freeze holds if nothing shatters it
+static const int kShatterPower = 2 * 2;       // the two burn scorches' worth, dealt at once
+
+// the freeze hit: ice material, unguardable, barely any damage (the freeze is the point)
+static const dCcD_SrcCps kIceSrc = {
+    {
+        {0x0, {{AT_TYPE_NORMAL_SWORD, 0x1, 0x1B}, {0x0, 0x0}, 0x0}},
+        {dCcD_SE_NONE, 0x0, dCcG_At_Spl_UNK_C, dCcD_MTRL_ICE, 0x0},
+        {dCcD_SE_NONE, 0x0, 0x0, 0x0, 0x0},
+        {0x0},
+    },
+    {{{0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f}, 60.0f}},
+};
+// the shatter hit: the burn's two after-hits in one, unguardable
+static const dCcD_SrcCps kShatterSrc = {
+    {
+        {0x0, {{AT_TYPE_NORMAL_SWORD, kShatterPower, 0x1B}, {0x0, 0x0}, 0x0}},
+        {dCcD_SE_NONE, 0x0, dCcG_At_Spl_UNK_C, dCcD_MTRL_NONE, 0x0},
+        {dCcD_SE_NONE, 0x0, 0x0, 0x0, 0x0},
+        {0x0},
+    },
+    {{{0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f}, 60.0f}},
+};
+
+struct FrozenTarget {
+    fpc_ProcID id;
+    int framesLeft;
+    bool player;      // another player (a Link model) vs an enemy
+    cXyz holdPos;     // where an enemy is pinned while frozen
+    u32 mist;         // the frost-over-the-body effect
+    dCcD_Stts owner;
+    dCcD_Cps hit;     // the ice or shatter hit
+};
+static FrozenTarget frozen[kMaxBurning];
+
+static void register_hit(FrozenTarget& fz, fopAc_ac_c* actor, const dCcD_SrcCps& src, int atp) {
+    fz.owner.Init(0xFF, 0xFF, daAlink_getAlinkActorClass());
+    fz.hit.Set(src);
+    fz.hit.SetStts(&fz.owner);
+    fz.hit.SetAtAtp(atp);
+    static_cast<cM3dGCps*>(&fz.hit)->Set(actor->current.pos, body_top(actor), 60.0f);
+    fz.hit.CalcAtVec();
+    fz.hit.ResetAtHit();
+    dComIfG_Ccsp()->Set(&fz.hit);
+}
+
+static void thaw(FrozenTarget& fz) {
+    if (fz.mist) { dComIfGp_particle_setStopContinue(fz.mist); fz.mist = 0; }
+    fz.framesLeft = 0;
+    fz.id = fpcM_ERROR_PROCESS_ID_e;
+}
+
+// an ice arrow touched this actor: freeze it, or shatter it if it's already frozen
+static bool ice_hit(fopAc_ac_c* actor) {
+    if (actor == nullptr || fopAcM_GetGroup(actor) != fopAc_ENEMY_e) return false;
+    if (in_water(actor)) return false;
+    fpc_ProcID id = fopAcM_GetID(actor);
+
+    for (FrozenTarget& fz : frozen) {
+        if (fz.framesLeft > 0 && fz.id == id) {                 // already frozen: shatter
+            register_hit(fz, actor, kShatterSrc, kShatterPower);
+            mDoAud_seStart(Z2SE_AL_SNOBO_ICEBREAK, &actor->current.pos, 0, 0);
+            thaw(fz);
+            return true;
+        }
+    }
+    FrozenTarget* slot = nullptr;
+    for (FrozenTarget& fz : frozen) if (fz.framesLeft <= 0) { slot = &fz; break; }
+    if (slot == nullptr) return false;
+
+    slot->id = id;
+    slot->framesLeft = kFreezeFrames;
+    slot->player = is_other_player(actor);
+    slot->holdPos = actor->current.pos;
+    slot->mist = 0;
+    register_hit(*slot, actor, kIceSrc, 1);   // ice material: another player's Link freezes from it
+    mDoAud_seStart(Z2SE_AL_FREEZE, &actor->current.pos, 0, 0);
+    return true;
+}
+
+// each frame: hold frozen enemies still with frost over them, and let a freeze time out
+static void freeze_tick() {
+    for (FrozenTarget& fz : frozen) {
+        if (fz.framesLeft <= 0) continue;
+        fopAc_ac_c* actor = fopAcM_SearchByID(fz.id);
+        if (actor == nullptr || --fz.framesLeft == 0 || in_water(actor)) { thaw(fz); continue; }
+        if (!fz.player) {
+            actor->current.pos = fz.holdPos;          // pin it in place (best-effort)
+            actor->speed.set(0.0f, 0.0f, 0.0f);
+            actor->speedF = 0.0f;
+            cXyz mid = (fz.holdPos + body_top(actor)) * 0.5f;
+            fz.mist = dComIfGp_particle_set(fz.mist, kIceMist, &mid, &actor->shape_angle, nullptr);
+            if (JPABaseEmitter* e = dComIfGp_particle_getEmitter(fz.mist))
+                e->setGlobalScale(JGeometry::TVec3<f32>(1.2f, 1.2f, 1.2f));
+        }
+    }
+}
+
+// an arrow touched this actor: freeze (ice) or burn (fire), by the arrow's element
+static bool arrow_hits_target(BurningArrow& arrow, fopAc_ac_c* actor) {
+    return arrow.ice ? ice_hit(actor) : set_on_fire(actor);
+}
+
+static void ice_shutdown() {
+    for (FrozenTarget& fz : frozen) if (fz.framesLeft > 0) thaw(fz);
+}
+
 // how close a point is to the line from an actor's feet to the top of its body
 static f32 distance_to_body(const cXyz& at, fopAc_ac_c* actor) {
     cXyz feet = actor->current.pos;
@@ -3300,7 +3436,7 @@ static void confirm_brushed(BurningArrow& fire, daArrow_c* arrow) {
                     fire.blockedNext = (fire.blockedNext + 1) % 4;
                 }
             } else if (!blocked_arrow(fire, id)) {
-                set_on_fire(hit);  // a clean hit: no need to wait
+                arrow_hits_target(fire, hit);  // a clean hit: no need to wait
             }
             for (fpc_ProcID& who : fire.brushed)
                 if (who == id) who = fpcM_ERROR_PROCESS_ID_e;
@@ -3311,7 +3447,7 @@ static void confirm_brushed(BurningArrow& fire, daArrow_c* arrow) {
         if (blocked_arrow(fire, fire.brushed[i])) {
             fire.brushed[i] = fpcM_ERROR_PROCESS_ID_e;
         } else if (++fire.brushedFor[i] >= kBlockWait) {
-            set_on_fire(fopAcM_SearchByID(fire.brushed[i]));
+            arrow_hits_target(fire, fopAcM_SearchByID(fire.brushed[i]));
             fire.brushed[i] = fpcM_ERROR_PROCESS_ID_e;
         }
     }
@@ -3324,6 +3460,38 @@ static void lantern_swing_burns(daAlink_c* link) {
     lightingFromLantern = true;
     set_fire_around(&link->mKandelaarFlamePos, 1, link->mAtSph.GetR() + 30.0f);
     lightingFromLantern = false;
+}
+
+// ======================== Enemies Deal Burn ========================
+// A fire hit on Link (a Bulblin's fire arrow, a Dodongo's breath, and so on) normally engulfs him
+// in the game's big fire effect. With this on, that engulf is swapped for the mod's quiet burn:
+// two fire hits over the same few seconds a fire arrow gives a rival, and no big flame. The hit's
+// own damage still lands as usual; this is only the burn after it. We take over the one spot Link
+// would catch fire (initFirePointDamageEffectAll, called only from the fire branch of his damage
+// handling) and start his burn there instead of the engulf.
+DEFINE_HOOK(&daAlink_c::initFirePointDamageEffectAll, LinkCatchFire);
+
+static const int kLinkBurnTick = 2;  // a scorch's worth of damage per hit (half a heart)
+static int linkBurnFrames;           // counts down while Link is burning from a fire hit
+
+static HookAction link_catch_fire(ModContext*, void* args, void*, void*) {
+    if (!cfgOn(vEnemiesBurn, false)) return HOOK_CONTINUE;  // off: the game's own fire engulf
+    auto* lnk = mods::arg<daAlink_c*>(args, 0);
+    if (!lnk || lnk->checkWolf()) return HOOK_CONTINUE;      // wolf Link keeps the game's behaviour
+    linkBurnFrames = kBurnFrames;                            // our two-hit burn, no engulf
+    return HOOK_SKIP_ORIGINAL;
+}
+
+// runs with Link's update: the two hits land on the same frames a scorch would, and water or
+// turning into the wolf puts it out
+static void link_burn_tick(daAlink_c* lnk) {
+    if (linkBurnFrames <= 0) return;
+    if (!lnk || lnk->checkWolf() || in_water(lnk)) { linkBurnFrames = 0; return; }
+    int f = linkBurnFrames--;
+    if (f == kScorchAt[0] || f == kScorchAt[1]) {
+        int life = (int)dComIfGs_getLife() - kLinkBurnTick;
+        dComIfGs_setLife((u16)(life < 0 ? 0 : life));
+    }
 }
 
 
@@ -3365,21 +3533,30 @@ static void arrow_post(ModContext*, void* args, void*, void*) {
         tip = arrow->current.pos;
     }
 
+    // which element the bow on the button is: ice if it's combined with the leaf, fire if with the
+    // lantern. If somehow both are set up on two bow buttons at once, fire wins (we can't tell from
+    // the arrow which button fired it).
+    bool wantIce = fire_button() < 0 && ice_button() >= 0;
+    bool canLight = wantIce ? true : can_fire();  // ice arrows cost nothing; fire needs oil
+
     int fire = find_burning(id);
-    // nocked: burns while there's oil for a shot, goes out if there isn't
+    // nocked: lit while it can be (oil for a fire shot; always for ice), goes out if it can't
     if (nocked) {
-        if (fire < 0 && can_fire()) fire = light_arrow(arrow, tip);
-        if (fire >= 0 && !can_fire()) {
+        if (fire < 0 && canLight) {
+            fire = light_arrow(arrow, tip, wantIce);
+            if (wantIce && fire >= 0) mDoAud_seStart(Z2SE_AL_FREEZE, &tip, 0, 0);  // pulled out
+        }
+        if (fire >= 0 && !canLight) {
             put_out(burning[fire]);
             fire = -1;
         }
     }
-    // the shot: pays for the flame (or lights one it didn't have yet), once
+    // the shot: a fire arrow pays its oil (or lights one it didn't have yet), once
     if (flying && !was_judged(id)) {
         judgedArrows[judgedNext] = id;
         judgedNext = (judgedNext + 1) % kArrowMemory;
-        if (fire < 0 && can_fire()) fire = light_arrow(arrow, tip);
-        if (fire >= 0) dComIfGp_setItemOilCount(-fire_arrow_cost());
+        if (fire < 0 && canLight) fire = light_arrow(arrow, tip, wantIce);
+        if (fire >= 0 && !burning[fire].ice) dComIfGp_setItemOilCount(-fire_arrow_cost());
     }
     if (fire < 0) return;
     BurningArrow& f = burning[fire];
@@ -3401,11 +3578,17 @@ static void arrow_post(ModContext*, void* args, void*, void*) {
     if (!nocked && !flying && !f.spread) {
         u32 stuckIn = arrow->getHitAcID();
         if (stuckIn != 0xFFFFFFFFu && arrow->field_0x93e == 0 && !blocked_arrow(f, stuckIn))
-            f.spread = set_on_fire(fopAcM_SearchByID(stuckIn));
+            f.spread = arrow_hits_target(f, fopAcM_SearchByID(stuckIn));
+    }
+
+    // an ice arrow's landing sound, once, when it comes to rest stuck
+    if (f.ice && !nocked && !flying && !f.landSaid) {
+        mDoAud_seStart(Z2SE_AL_FREEZE, &tip, 0, 0);
+        f.landSaid = true;
     }
 
     // the lantern's fire hit for torches, candles, webs and grass, over the same stretch, and on
-    // the head once it's stuck
+    // the head once it's stuck (fire only; ice arrows don't light anything)
     if (!nocked && f.hitReady) {
         static_cast<cM3dGCps*>(&f.hit)->Set(f.lastTip, ahead, kFireReach);
         f.hit.CalcAtVec();
@@ -3414,6 +3597,23 @@ static void arrow_post(ModContext*, void* args, void*, void*) {
     f.moved = flying ? tip - f.lastTip : cXyz(0.0f, 0.0f, 0.0f);
     f.lastTip = tip;
     f.glow.mPosition = tip;
+
+    if (f.ice) {
+        // a little icy mist on the tip, kept small, following the head like the flame does
+        f32 s = nocked ? 0.12f : 0.2f;
+        f.flame[0] = dComIfGp_particle_set(f.flame[0], kIceMist, &tip, &arrow->shape_angle, nullptr);
+        if (JPABaseEmitter* mist = dComIfGp_particle_getEmitter(f.flame[0])) {
+            mist->setGlobalScale(JGeometry::TVec3<f32>(s, s, s));
+            mist->setParticleCallBackPtr(dPa_control_c::getParticleTracePCB());
+            mist->setUserWork((uintptr_t)&f.moved);
+        }
+        return;
+    }
+
+    // the lantern's own burning crackle, played at the arrow each frame it burns. It's one of
+    // Link's own sounds (always loaded), so it's there in every area, unlike an area's own fire
+    // sounds. Re-starting a level sound each frame keeps it looping and following the arrow.
+    mDoAud_seStartLevel(Z2SE_AL_KANTERA_BURNING, &tip, 0, dComIfGp_getReverb(fopAcM_GetRoomNo(arrow)));
 
     // The lantern's flame, the same one a burning enemy gets, only smaller: a third of the enemy's
     // size once it's loose, and smaller again while it sits on the bow so it doesn't swallow
@@ -3454,7 +3654,7 @@ static void fire_arrow_tick() {
         if (fire.id == fpcM_ERROR_PROCESS_ID_e || fire.id == 0) continue;
         if (fopAcM_SearchByID(fire.id) != nullptr) continue;
         for (fpc_ProcID who : fire.brushed)
-            if (who != fpcM_ERROR_PROCESS_ID_e && !blocked_arrow(fire, who)) set_on_fire(fopAcM_SearchByID(who));
+            if (who != fpcM_ERROR_PROCESS_ID_e && !blocked_arrow(fire, who)) arrow_hits_target(fire, fopAcM_SearchByID(who));
         put_out(fire);
     }
 }
@@ -3462,6 +3662,7 @@ static void fire_arrow_tick() {
 static void fire_arrow_shutdown() {
     for (int i = 0; i < kMaxBurning; i++) stop_burning(onFire[i]);
     for (int i = 0; i < kArrowMemory; i++) put_out(burning[i]);
+    ice_shutdown();
 }
 
 // --- the throw ---
@@ -5458,8 +5659,11 @@ static void combat_rows() {
     heading("Misc");
     choice("Sword Flourish", flourishOption, FLOURISH_DEFAULT, flourishNames, 4);
     toggle("Manual Shielding", vManualShield);
-    toggle("Deal Burn with Lantern", vLanternBurn);
     toggle("PVP True Damage", vTrueDamage);
+
+    heading("Burn");
+    toggle("Deal Burn with Lantern", vLanternBurn);
+    toggle("Enemies Deal Burn", vEnemiesBurn);
 }
 
 static void item_rows() {
@@ -5477,6 +5681,8 @@ static void item_rows() {
     note("Fire Arrows");
     toggle("Bow + Lantern", vFireArrows, combos_off);
     toggle("Deal Burn Damage", vFireDamage, fire_arrows_off);
+    note("Ice Arrows");
+    toggle("Bow + Ice Sled", vIceArrows, combos_off);
 }
 
 static void hud_rows() {
@@ -5591,6 +5797,8 @@ static void link_update_post(ModContext* ctx, void* args, void* ret, void* user)
     hang_bomb(lnk);                     // Gale-Bomb: a bomb on the boomerang the frame it's thrown
     lantern_swing_burns(lnk);           // Deal Burn with Lantern
     burn_enemies();                     // fire arrows / lantern: whoever's burning
+    link_burn_tick(lnk);                // Enemies Deal Burn: Link's own two-hit burn
+    freeze_tick();                      // ice arrows: hold frozen enemies, time freezes out
 }
 
 static bool add_bool_option(const char* key, bool def, ConfigVarHandle* out) {
@@ -5709,6 +5917,7 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     // --- Combat > Misc: Sword Flourish, Manual Shielding, Deal Burn with Lantern, PVP True Damage ---
     add_int_option("swordFlourish", FLOURISH_DEFAULT, &flourishOption);
     add_bool_option("lanternBurn", true, &vLanternBurn);
+    add_bool_option("enemiesBurn", false, &vEnemiesBurn);
     add_bool_option("manualShielding", false, &vManualShield);
     add_bool_option("pvpTrueDamage", false, &vTrueDamage);
     if (!pre_hook(AllUnequip, flourish_put_away)) mods::log::warn("sword flourish stays at the game's normal behaviour");
@@ -5720,12 +5929,15 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     add_bool_option("galeBomblings", true, &galeBombToggle[2]);
     add_bool_option("fireArrows", true, &vFireArrows);
     add_bool_option("fireDamage", true, &vFireDamage);
+    add_bool_option("iceArrows", true, &vIceArrows);
 
     // each combination's own picture on its button
     if (svc_resource->load(mod_ctx, "galebomb_icon.rgba", &galeBombIcon) != MOD_OK)
         mods::log::warn("galebomb_icon.rgba missing, the Gale-Bomb button shows the plain boomerang");
     if (svc_resource->load(mod_ctx, "firearrow_icon.rgba", &fireArrowIcon) != MOD_OK)
         mods::log::warn("firearrow_icon.rgba missing, the Fire Arrows button shows the plain bow");
+    if (svc_resource->load(mod_ctx, "icearrow_icon.rgba", &iceArrowIcon) != MOD_OK)
+        mods::log::warn("icearrow_icon.rgba missing, the Ice Arrows button shows the plain bow");
 
     // the item ring: who combines with what, and the line that says so
     bool ringOk = pre_hook(RingMove, ring_pre) && post_hook(RingMove, ring_post);
@@ -5748,6 +5960,7 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     // Fire Arrows
     if (!pre_hook(ButtonOilGauge, oil_gauge_pre)) mods::log::warn("no oil gauge on the fire-arrow bow");
     if (!post_hook(ArrowUpdate, arrow_post)) mods::log::warn("arrows won't catch fire");
+    if (!pre_hook(LinkCatchFire, link_catch_fire)) mods::log::warn("Enemies Deal Burn stays at the game's fire");
 
     settings_init();
 
