@@ -129,7 +129,6 @@ enum FlourishMode : int { FLOURISH_ON, FLOURISH_WOODEN, FLOURISH_DEFAULT, FLOURI
 static const char* const flourishNames[] = {"On", "Wooden", "Default", "Off"};
 static ConfigVarHandle flourishOption;
 static ConfigVarHandle vLanternBurn;  // Deal Burn with Lantern
-static ConfigVarHandle vEnemiesBurn;  // Enemies Deal Burn
 static ConfigVarHandle vTrueDamage;   // PVP True Damage
 static ConfigVarHandle vManualShield; // Manual Shielding
 static ConfigVarHandle vFireDamage;     // Deal Burn Damage (fire arrows)
@@ -2633,7 +2632,7 @@ static HookAction lantern_poses(ModContext*, void* args, void*, void*) {
     if (on_second_page(ring)) return HOOK_CONTINUE;  // no combining on the second page
     u8 slot = ring->mItemSlots[ring->mCurrentSlot];
     u8 item = dComIfGs_getItem(slot, false);
-    if (item != dItemNo_KANTERA_e || !fire_on()) return HOOK_CONTINUE;
+    if (item != dItemNo_KANTERA_e || !fire_on()) return HOOK_CONTINUE;  // only the lantern goes through the game's combining
     comboPosingWas = item;
     dComIfGs_setItem(slot, dItemNo_HAWK_EYE_e);
     comboPosing = slot;
@@ -2674,33 +2673,72 @@ static bool bow_on_a_button() {
     return false;
 }
 
-// a button holding the bow on its own, with nothing tied to it (not a Fire-Arrow or bomb combo).
-// There's only ever the one bow, so at most one button can match.
+// button b holds the bow on its own, with nothing tied to it (not a Fire-Arrow or bomb combo)
+static bool plain_bow(int b) {
+    return dComIfGp_getSelectItem(b) == dItemNo_BOW_e && dComIfGs_getMixItemIndex(b) == dItemNo_NONE_e;
+}
+
+// the button holding a plain bow. There's only ever the one bow, so at most one button can match.
 static int plain_bow_button() {
     for (int b = 0; b < 2; b++)
-        if (dComIfGp_getSelectItem(b) == dItemNo_BOW_e && dComIfGs_getMixItemIndex(b) == dItemNo_NONE_e)
-            return b;
+        if (plain_bow(b)) return b;
     return -1;
 }
 
 // Ice Arrows are a mode we keep ourselves, stored per save like the Gale-Bomb's tied bag: the game's
-// combining can't hold the modded Ice Sled, so R on the sled just flips this flag on the bow.
-static bool ice_tied() {
+// combining can't hold the modded Ice Sled, so R on the sled flips this flag on the bow instead. The
+// save holds which button it's tied to (0 = none, otherwise the button + 1).
+static int ice_tied() {
     uint8_t stored = 0;
     size_t n = 1;
-    if (svc_save->get_blob(mod_ctx, "iceBow", &stored, &n) != MOD_OK || n != 1) return false;
-    return stored != 0;
+    if (svc_save->get_blob(mod_ctx, "iceBow", &stored, &n) != MOD_OK || n != 1) return -1;
+    return stored == 0 ? -1 : stored - 1;
 }
 
-static void set_ice(bool on) {
-    uint8_t stored = on ? 1 : 0;
+static void set_ice(int button) {
+    uint8_t stored = button < 0 ? 0 : (uint8_t)(button + 1);
     svc_save->set_blob(mod_ctx, "iceBow", &stored, 1);
 }
 
-// the button with ice arrows on it: the bow, held plain, while the ice flag is on
+// the button with ice arrows on it: the tied button, as long as it's still a plain bow
 static int ice_button() {
-    if (!ice_on() || !ice_tied()) return -1;
-    return plain_bow_button();
+    if (!ice_on()) return -1;
+    int b = ice_tied();
+    return (b >= 0 && plain_bow(b)) ? b : -1;
+}
+
+// drop the flag once its button stops being a plain bow: the bow was moved, unequipped, or had a real
+// combo (Fire Arrows, bombs) put on it. Without this the ice would come back when that combo is split.
+static void ice_upkeep() {
+    int b = ice_tied();
+    if (b >= 0 && !plain_bow(b)) set_ice(-1);
+}
+
+// split a bow + lantern combo back to a plain bow, the way the ring's own "uncombine" does
+static void split_fire_combo() {
+    int b = bow_combo_button(dItemNo_KANTERA_e);
+    if (b < 0) return;
+    dComIfGs_setSelectItemIndex(b, SLOT_4);        // the bow's own slot
+    dComIfGs_setMixItemIndex(b, dItemNo_NONE_e);
+    dComIfGp_setSelectItem(b);
+    redraw_buttons();
+}
+
+// A combine switched off is forgotten, not just hidden: turning its toggle off breaks it apart, so
+// turning the toggle back on gives a plain item, the way the Gale-Bomb already behaves. This fires
+// only on an on->off change during play, never on load, so a combine made before quitting is still
+// there when the save is picked back up.
+static void forget_toggled_off_combos() {
+    static bool seen = false, wasFire = false, wasIce = false;
+    bool nowFire = fire_on();
+    bool nowIce = ice_on();
+    if (seen) {
+        if (wasFire && !nowFire) split_fire_combo();
+        if (wasIce && !nowIce) set_ice(-1);
+    }
+    wasFire = nowFire;
+    wasIce = nowIce;
+    seen = true;
 }
 
 // --- the item ring, for the Gale-Bomb combo (the boomerang isn't in the game's combining) ---
@@ -2768,21 +2806,39 @@ static void ring_prompt(dMenu_Ring_c* ring, int change) {
 static void ring_post(ModContext*, void* args, void*, void*) {
     auto* ring = mods::arg<dMenu_Ring_c*>(args, 0);
     if (on_second_page(ring)) return;  // no combining on the second page
-    bool idle = ring->mStatus == dMenu_Ring_c::STATUS_WAIT && !ring->mPlayerIsWolf &&
-                ring->mpItemExplain->getStatus() == 0;
+    bool active = ring->mStatus == dMenu_Ring_c::STATUS_WAIT && !ring->mPlayerIsWolf;
+    bool idle = active && ring->mpItemExplain->getStatus() == 0;
     u8 slot = ring->mItemSlots[ring->mCurrentSlot];
     u8 item = dComIfGs_getItem(slot, false);
+    bool setButton = mDoCPd_c::getTrigX(PAD_1) || mDoCPd_c::getTrigY(PAD_1);
+
+    // the bow's ice drops the moment its button isn't a plain bow anymore (moved, unequipped, or a
+    // real combo put on it), and also when the bow is re-set on a button, the way that splits a combo
+    ice_upkeep();
+    if (active && setButton && item == dItemNo_BOW_e && ice_tied() >= 0) set_ice(-1);
+
     int change = idle ? ring_r_action(slot) : 0;
 
-    // R on the Ice Sled ties it to the bow, if a plain bow is on a button and nothing else here needs R
-    bool iceHere = idle && change == 0 && ice_on() && item == leafItem && plain_bow_button() >= 0;
-    if (iceHere) change = ice_tied() ? -1 : 1;
+    // R on the Ice Sled ties/unties ice to a plain bow. It works as soon as the ring is interactive,
+    // not only once the item description has settled, so the press and its sound never get dropped.
+    int iceBow = (active && change == 0 && ice_on() && item == leafItem) ? plain_bow_button() : -1;
+    if (iceBow >= 0) change = (ice_tied() == iceBow) ? -1 : 1;
 
     ring_prompt(ring, change);
+
+    if (iceBow >= 0 && mDoCPd_c::getTrigR(PAD_1)) {
+        bool joining = ice_tied() != iceBow;
+        set_ice(joining ? iceBow : -1);
+        mods::log::info("[ice combine] R on sled: joining={} iceBow={} -> ice_tied now {}", joining, iceBow, ice_tied());  // DEBUG
+        mDoAud_seStart(joining ? Z2SE_SY_ITEM_COMBINE_ON : Z2SE_SY_ITEM_COMBINE_OFF, nullptr, 0, 0);
+        fly_item_icon(ring, iceBow, item, joining);
+        redraw_buttons();
+        return;
+    }
+
     if (!idle) return;
 
     // putting the boomerang on X or Y by itself splits the bombs off, like re-setting the bow does
-    bool setButton = mDoCPd_c::getTrigX(PAD_1) || mDoCPd_c::getTrigY(PAD_1);
     if (setButton && tied_bag() >= 0 && item == dItemNo_BOOMERANG_e) {
         tie_bag(-1);
         redraw_buttons();
@@ -2791,14 +2847,9 @@ static void ring_post(ModContext*, void* args, void*, void*) {
 
     if (change == 0 || !mDoCPd_c::getTrigR(PAD_1)) return;
     bool joining = change > 0;
+    tie_bag(joining ? slot : -1);
     mDoAud_seStart(joining ? Z2SE_SY_ITEM_COMBINE_ON : Z2SE_SY_ITEM_COMBINE_OFF, nullptr, 0, 0);
-    if (iceHere) {
-        set_ice(joining);
-        fly_item_icon(ring, plain_bow_button(), item, joining);
-    } else {
-        tie_bag(joining ? slot : -1);
-        fly_item_icon(ring, boomerang_button(), item, joining);
-    }
+    fly_item_icon(ring, boomerang_button(), item, joining);
     redraw_buttons();
 }
 
@@ -3501,38 +3552,6 @@ static void lantern_swing_burns(daAlink_c* link) {
     lightingFromLantern = false;
 }
 
-// ======================== Enemies Deal Burn ========================
-// A fire hit on Link (a Bulblin's fire arrow, a Dodongo's breath, and so on) normally engulfs him
-// in the game's big fire effect. With this on, that engulf is swapped for the mod's quiet burn:
-// two fire hits over the same few seconds a fire arrow gives a rival, and no big flame. The hit's
-// own damage still lands as usual; this is only the burn after it. We take over the one spot Link
-// would catch fire (initFirePointDamageEffectAll, called only from the fire branch of his damage
-// handling) and start his burn there instead of the engulf.
-DEFINE_HOOK(&daAlink_c::initFirePointDamageEffectAll, LinkCatchFire);
-
-static const int kLinkBurnTick = 2;  // a scorch's worth of damage per hit (half a heart)
-static int linkBurnFrames;           // counts down while Link is burning from a fire hit
-
-static HookAction link_catch_fire(ModContext*, void* args, void*, void*) {
-    if (!cfgOn(vEnemiesBurn, false)) return HOOK_CONTINUE;  // off: the game's own fire engulf
-    auto* lnk = mods::arg<daAlink_c*>(args, 0);
-    if (!lnk || lnk->checkWolf()) return HOOK_CONTINUE;      // wolf Link keeps the game's behaviour
-    linkBurnFrames = kBurnFrames;                            // our two-hit burn, no engulf
-    return HOOK_SKIP_ORIGINAL;
-}
-
-// runs with Link's update: the two hits land on the same frames a scorch would, and water or
-// turning into the wolf puts it out
-static void link_burn_tick(daAlink_c* lnk) {
-    if (linkBurnFrames <= 0) return;
-    if (!lnk || lnk->checkWolf() || in_water(lnk)) { linkBurnFrames = 0; return; }
-    int f = linkBurnFrames--;
-    if (f == kScorchAt[0] || f == kScorchAt[1]) {
-        int life = (int)dComIfGs_getLife() - kLinkBurnTick;
-        dComIfGs_setLife((u16)(life < 0 ? 0 : life));
-    }
-}
-
 
 static void arrow_post(ModContext*, void* args, void*, void*) {
     auto* arrow = mods::arg<daArrow_c*>(args, 0);
@@ -3576,6 +3595,12 @@ static void arrow_post(ModContext*, void* args, void*, void*) {
     // lantern. If somehow both are set up on two bow buttons at once, fire wins (we can't tell from
     // the arrow which button fired it).
     bool wantIce = fire_button() < 0 && ice_button() >= 0;
+    static fpc_ProcID lastNockLog = 0xFFFFFFFFu;  // DEBUG: one line per fresh nock
+    if (nocked && id != lastNockLog) {
+        lastNockLog = id;
+        mods::log::info("[ice? nock] ice_on={} ice_tied={} plain0={} plain1={} fireBtn={} iceBtn={} wantIce={}",
+                        ice_on(), ice_tied(), plain_bow(0), plain_bow(1), fire_button(), ice_button(), wantIce);
+    }
     bool canLight = wantIce ? true : can_fire();  // ice arrows cost nothing; fire needs oil
 
     int fire = find_burning(id);
@@ -5702,7 +5727,6 @@ static void combat_rows() {
 
     heading("Burn");
     toggle("Deal Burn with Lantern", vLanternBurn);
-    toggle("Enemies Deal Burn", vEnemiesBurn);
 }
 
 static void item_rows() {
@@ -5836,8 +5860,9 @@ static void link_update_post(ModContext* ctx, void* args, void* ret, void* user)
     hang_bomb(lnk);                     // Gale-Bomb: a bomb on the boomerang the frame it's thrown
     lantern_swing_burns(lnk);           // Deal Burn with Lantern
     burn_enemies();                     // fire arrows / lantern: whoever's burning
-    link_burn_tick(lnk);                // Enemies Deal Burn: Link's own two-hit burn
     freeze_tick();                      // ice arrows: hold frozen enemies, time freezes out
+    ice_upkeep();                       // ice arrows: drop the flag if the bow left its button
+    forget_toggled_off_combos();        // a combine switched off is broken apart, not remembered
 }
 
 static bool add_bool_option(const char* key, bool def, ConfigVarHandle* out) {
@@ -5956,7 +5981,6 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     // --- Combat > Misc: Sword Flourish, Manual Shielding, Deal Burn with Lantern, PVP True Damage ---
     add_int_option("swordFlourish", FLOURISH_DEFAULT, &flourishOption);
     add_bool_option("lanternBurn", true, &vLanternBurn);
-    add_bool_option("enemiesBurn", false, &vEnemiesBurn);
     add_bool_option("manualShielding", false, &vManualShield);
     add_bool_option("pvpTrueDamage", false, &vTrueDamage);
     if (!pre_hook(AllUnequip, flourish_put_away)) mods::log::warn("sword flourish stays at the game's normal behaviour");
@@ -5999,7 +6023,6 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     // Fire Arrows
     if (!pre_hook(ButtonOilGauge, oil_gauge_pre)) mods::log::warn("no oil gauge on the fire-arrow bow");
     if (!post_hook(ArrowUpdate, arrow_post)) mods::log::warn("arrows won't catch fire");
-    if (!pre_hook(LinkCatchFire, link_catch_fire)) mods::log::warn("Enemies Deal Burn stays at the game's fire");
 
     settings_init();
 
