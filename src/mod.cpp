@@ -76,6 +76,7 @@
 #include "d/d_stage.h"
 #include "f_op/f_op_actor_mng.h"
 #include "f_op/f_op_msg_mng.h"
+#include "f_pc/f_pc_executor.h"
 #include "f_pc/f_pc_manager.h"
 #include "f_pc/f_pc_name.h"
 #include "m_Do/m_Do_audio.h"
@@ -876,6 +877,7 @@ DEFINE_HOOK(&daAlink_c::checkSnowCode, SnowCode);
 DEFINE_HOOK(&daAlink_c::setStickData, StickData);
 DEFINE_HOOK(&dSv_player_item_c::setLineUpItem, LineUp);
 DEFINE_HOOK(&dMeter2Info_c::readItemTexture, ReadTex);
+DEFINE_HOOK(&fpcEx_Execute, FreezeExec);  // ice arrows: halt a frozen enemy's update
 // item-get text box, by name like the two below; arg 1 is the message id
 DEFINE_HOOK_SYMBOL("dMsgObject_c::setMessageIndexDemo", void(dMsgObject_c*, u32, bool), IceLeafGetBox);
 // these two are by name (the second is private); sigs are from the decomp, unchecked against this port
@@ -3345,9 +3347,15 @@ static void burn_enemies() {
 // An ice arrow freezes whoever it hits; a second ice hit while they're still frozen shatters them
 // and deals the burn's after-hit damage (its two scorches' worth). Another player (a Link model)
 // freezes the game's own way from the ice-material hit, on their end. An enemy has no frozen state
-// of its own, so the mod holds it in place with a frost effect over it for the freeze (best-effort;
-// its own animation may still play). The little icy mist on the tip is the same frost, kept small.
-static const u16 kIceMist = 0x85ba;           // a frost puff (freezard's); small on the tip
+// of its own, so the mod stops its update the way a pause does (its animation and AI halt where they
+// are, see freeze_execute) and covers it in the game's enemy-freeze ice.
+//
+// These are the game's own common ice effects, by their d_particle_name IDs. They live in the always-
+// loaded banks (AK_JN / IT_JN), so they show anywhere, unlike the Snowpeak freezard's frost.
+static const u16 kArrowIce    = 0x062;        // ID_IT_JN_ARWICE_SMOKE00: the icy mist on the arrow tip
+static const u16 kEnemyFreeze = 0x021;        // ID_AK_JN_ENEMYFREEZE00: the ice covering a frozen enemy
+static const u16 kIceShards   = 0x028;        // ID_AK_JN_ICEHAHEN00: the shards when it shatters
+static const u16 kIceThaw     = 0x029;        // ID_AK_JN_ICETHAW00: the puff when a freeze melts on its own
 static const int kFreezeFrames = 180;         // how long a freeze holds if nothing shatters it
 static const int kShatterPower = 2 * 2;       // the two burn scorches' worth, dealt at once
 
@@ -3409,6 +3417,8 @@ static bool ice_hit(fopAc_ac_c* actor) {
     for (FrozenTarget& fz : frozen) {
         if (fz.framesLeft > 0 && fz.id == id) {                 // already frozen: shatter
             register_hit(fz, actor, kShatterSrc, kShatterPower);
+            cXyz mid = (actor->current.pos + body_top(actor)) * 0.5f;
+            dComIfGp_particle_set(0, kIceShards, &mid, &actor->shape_angle, nullptr);
             mDoAud_seStart(Z2SE_AL_SNOBO_ICEBREAK, &actor->current.pos, 0, 0);
             thaw(fz);
             return true;
@@ -3428,20 +3438,40 @@ static bool ice_hit(fopAc_ac_c* actor) {
     return true;
 }
 
-// each frame: hold frozen enemies still with frost over them, and let a freeze time out
+// A frozen enemy's own update is skipped, exactly the way the game skips a paused actor (fpcEx_Execute
+// returns 0 for it), so its animation and AI stop where they are until it thaws or shatters. Only
+// enemies are halted this way; another player's actor is left to its own game. The proximity fire/ice
+// check still reaches it, so a second ice arrow can shatter it even while it's held.
+static HookAction freeze_execute(ModContext*, void* args, void* retval, void*) {
+    auto* proc = mods::arg<base_process_class*>(args, 0);
+    fpc_ProcID id = fopAcM_GetID(proc);
+    for (FrozenTarget& fz : frozen) {
+        if (fz.framesLeft > 0 && !fz.player && fz.id == id) {
+            if (retval) *(int*)retval = 0;  // "not executed", like a paused actor
+            return HOOK_SKIP_ORIGINAL;
+        }
+    }
+    return HOOK_CONTINUE;
+}
+
+// the enemies frozen right now stop updating (see freeze_execute); this draws the ice over them and
+// lets a freeze time out, with a melt puff when it does
 static void freeze_tick() {
     for (FrozenTarget& fz : frozen) {
         if (fz.framesLeft <= 0) continue;
         fopAc_ac_c* actor = fopAcM_SearchByID(fz.id);
-        if (actor == nullptr || --fz.framesLeft == 0 || in_water(actor)) { thaw(fz); continue; }
+        bool melted = actor != nullptr && (fz.framesLeft - 1 == 0 || in_water(actor));
+        if (actor == nullptr || --fz.framesLeft == 0 || in_water(actor)) {
+            if (melted) dComIfGp_particle_set(0, kIceThaw, &actor->current.pos, &actor->shape_angle, nullptr);
+            thaw(fz);
+            continue;
+        }
         if (!fz.player) {
-            actor->current.pos = fz.holdPos;          // pin it in place (best-effort)
-            actor->speed.set(0.0f, 0.0f, 0.0f);
-            actor->speedF = 0.0f;
-            cXyz mid = (fz.holdPos + body_top(actor)) * 0.5f;
-            fz.mist = dComIfGp_particle_set(fz.mist, kIceMist, &mid, &actor->shape_angle, nullptr);
+            // the enemy is already halted by freeze_execute; keep the ice drawn over it
+            cXyz mid = (actor->current.pos + body_top(actor)) * 0.5f;
+            fz.mist = dComIfGp_particle_set(fz.mist, kEnemyFreeze, &mid, &actor->shape_angle, nullptr);
             if (JPABaseEmitter* e = dComIfGp_particle_getEmitter(fz.mist))
-                e->setGlobalScale(JGeometry::TVec3<f32>(1.2f, 1.2f, 1.2f));
+                e->setGlobalScale(JGeometry::TVec3<f32>(1.0f, 1.0f, 1.0f));
         }
     }
 }
@@ -3662,8 +3692,8 @@ static void arrow_post(ModContext*, void* args, void*, void*) {
 
     if (f.ice) {
         // a little icy mist on the tip, kept small, following the head like the flame does
-        f32 s = nocked ? 0.12f : 0.2f;
-        f.flame[0] = dComIfGp_particle_set(f.flame[0], kIceMist, &tip, &arrow->shape_angle, nullptr);
+        f32 s = nocked ? 0.5f : 0.8f;
+        f.flame[0] = dComIfGp_particle_set(f.flame[0], kArrowIce, &tip, &arrow->shape_angle, nullptr);
         if (JPABaseEmitter* mist = dComIfGp_particle_getEmitter(f.flame[0])) {
             mist->setGlobalScale(JGeometry::TVec3<f32>(s, s, s));
             mist->setParticleCallBackPtr(dPa_control_c::getParticleTracePCB());
@@ -6021,6 +6051,9 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     // Fire Arrows
     if (!pre_hook(ButtonOilGauge, oil_gauge_pre)) mods::log::warn("no oil gauge on the fire-arrow bow");
     if (!post_hook(ArrowUpdate, arrow_post)) mods::log::warn("arrows won't catch fire");
+
+    // Ice Arrows: a frozen enemy stops updating
+    if (!pre_hook(FreezeExec, freeze_execute)) mods::log::warn("frozen enemies will keep moving");
 
     settings_init();
 
