@@ -878,6 +878,7 @@ DEFINE_HOOK(&daAlink_c::setStickData, StickData);
 DEFINE_HOOK(&dSv_player_item_c::setLineUpItem, LineUp);
 DEFINE_HOOK(&dMeter2Info_c::readItemTexture, ReadTex);
 DEFINE_HOOK(&fpcEx_Execute, FreezeExec);  // ice arrows: halt a frozen enemy's update
+DEFINE_HOOK(&dScnKy_env_light_c::settingTevStruct, FreezeTint);  // ice arrows: paint a frozen model icy
 // item-get text box, by name like the two below; arg 1 is the message id
 DEFINE_HOOK_SYMBOL("dMsgObject_c::setMessageIndexDemo", void(dMsgObject_c*, u32, bool), IceLeafGetBox);
 // these two are by name (the second is private); sigs are from the decomp, unchecked against this port
@@ -3353,7 +3354,6 @@ static void burn_enemies() {
 // These are the game's own common ice effects, by their d_particle_name IDs. They live in the always-
 // loaded banks (AK_JN / IT_JN), so they show anywhere, unlike the Snowpeak freezard's frost.
 static const u16 kArrowIce    = 0x062;        // ID_IT_JN_ARWICE_SMOKE00: the icy mist on the arrow tip
-static const u16 kEnemyFreeze = 0x021;        // ID_AK_JN_ENEMYFREEZE00: the ice covering a frozen enemy
 static const u16 kIceShards   = 0x028;        // ID_AK_JN_ICEHAHEN00: the shards when it shatters
 static const u16 kIceThaw     = 0x029;        // ID_AK_JN_ICETHAW00: the puff when a freeze melts on its own
 static const int kFreezeFrames = 180;         // how long a freeze holds if nothing shatters it
@@ -3454,8 +3454,36 @@ static HookAction freeze_execute(ModContext*, void* args, void* retval, void*) {
     return HOOK_CONTINUE;
 }
 
-// the enemies frozen right now stop updating (see freeze_execute); this draws the ice over them and
-// lets a freeze time out, with a melt puff when it does
+// The ice look is a tint on the model itself, the way Link's own freeze works: his draw writes an icy
+// add-colour into tevStr.TevColor, and tevStr sits on the actor base, so the same write reaches any
+// enemy or arrow. The environment fills tevStr fresh for every model each frame right before it's
+// drawn (dScnKy_env_light_c::settingTevStruct), so we paint over the top of that, here, each draw.
+static const s16 kFreezeTintR = 110;
+static const s16 kFreezeTintG = 170;
+static const s16 kFreezeTintB = 255;
+
+static void ice_tint(dKy_tevstr_c* tevStr) {
+    tevStr->TevColor.r = kFreezeTintR;
+    tevStr->TevColor.g = kFreezeTintG;
+    tevStr->TevColor.b = kFreezeTintB;
+}
+
+static void freeze_tint(ModContext*, void* args, void*, void*) {
+    auto* tevStr = mods::arg<dKy_tevstr_c*>(args, 3);
+    for (FrozenTarget& fz : frozen) {
+        if (fz.framesLeft <= 0 || fz.player) continue;
+        fopAc_ac_c* a = fopAcM_SearchByID(fz.id);
+        if (a != nullptr && &a->tevStr == tevStr) { ice_tint(tevStr); return; }
+    }
+    for (BurningArrow& b : burning) {
+        if (!b.ice || b.id == fpcM_ERROR_PROCESS_ID_e) continue;
+        fopAc_ac_c* a = fopAcM_SearchByID(b.id);
+        if (a != nullptr && &a->tevStr == tevStr) { ice_tint(tevStr); return; }
+    }
+}
+
+// the enemies frozen right now are halted by freeze_execute and painted icy by freeze_tint; this just
+// counts a freeze down and melts it, with a puff when it goes
 static void freeze_tick() {
     for (FrozenTarget& fz : frozen) {
         if (fz.framesLeft <= 0) continue;
@@ -3464,14 +3492,6 @@ static void freeze_tick() {
         if (actor == nullptr || --fz.framesLeft == 0 || in_water(actor)) {
             if (melted) dComIfGp_particle_set(0, kIceThaw, &actor->current.pos, &actor->shape_angle, nullptr);
             thaw(fz);
-            continue;
-        }
-        if (!fz.player) {
-            // the enemy is already halted by freeze_execute; keep the ice drawn over it
-            cXyz mid = (actor->current.pos + body_top(actor)) * 0.5f;
-            fz.mist = dComIfGp_particle_set(fz.mist, kEnemyFreeze, &mid, &actor->shape_angle, nullptr);
-            if (JPABaseEmitter* e = dComIfGp_particle_getEmitter(fz.mist))
-                e->setGlobalScale(JGeometry::TVec3<f32>(1.0f, 1.0f, 1.0f));
         }
     }
 }
@@ -6052,8 +6072,9 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     if (!pre_hook(ButtonOilGauge, oil_gauge_pre)) mods::log::warn("no oil gauge on the fire-arrow bow");
     if (!post_hook(ArrowUpdate, arrow_post)) mods::log::warn("arrows won't catch fire");
 
-    // Ice Arrows: a frozen enemy stops updating
+    // Ice Arrows: a frozen enemy stops updating and is painted icy
     if (!pre_hook(FreezeExec, freeze_execute)) mods::log::warn("frozen enemies will keep moving");
+    if (!post_hook(FreezeTint, freeze_tint)) mods::log::warn("frozen enemies won't look icy");
 
     settings_init();
 
