@@ -2813,9 +2813,14 @@ static void ring_post(ModContext*, void* args, void*, void*) {
     bool setButton = mDoCPd_c::getTrigX(PAD_1) || mDoCPd_c::getTrigY(PAD_1);
 
     // the bow's ice drops the moment its button isn't a plain bow anymore (moved, unequipped, or a
-    // real combo put on it), and also when the bow is re-set on a button, the way that splits a combo
+    // real combo put on it), and also when the bow is re-set on a button, the way that splits a combo.
+    // The re-set clear isn't gated on the ring being idle: pressing X or Y kicks off the equip
+    // animation on the same frame, so a wait-for-idle check would miss the press.
     ice_upkeep();
-    if (active && setButton && item == dItemNo_BOW_e && ice_tied() >= 0) set_ice(-1);
+    if (setButton && item == dItemNo_BOW_e && ice_tied() >= 0) {
+        set_ice(-1);
+        redraw_buttons();
+    }
 
     int change = idle ? ring_r_action(slot) : 0;
 
@@ -2829,7 +2834,6 @@ static void ring_post(ModContext*, void* args, void*, void*) {
     if (iceBow >= 0 && mDoCPd_c::getTrigR(PAD_1)) {
         bool joining = ice_tied() != iceBow;
         set_ice(joining ? iceBow : -1);
-        mods::log::info("[ice combine] R on sled: joining={} iceBow={} -> ice_tied now {}", joining, iceBow, ice_tied());  // DEBUG
         mDoAud_seStart(joining ? Z2SE_SY_ITEM_COMBINE_ON : Z2SE_SY_ITEM_COMBINE_OFF, nullptr, 0, 0);
         fly_item_icon(ring, iceBow, item, joining);
         redraw_buttons();
@@ -3595,12 +3599,6 @@ static void arrow_post(ModContext*, void* args, void*, void*) {
     // lantern. If somehow both are set up on two bow buttons at once, fire wins (we can't tell from
     // the arrow which button fired it).
     bool wantIce = fire_button() < 0 && ice_button() >= 0;
-    static fpc_ProcID lastNockLog = 0xFFFFFFFFu;  // DEBUG: one line per fresh nock
-    if (nocked && id != lastNockLog) {
-        lastNockLog = id;
-        mods::log::info("[ice? nock] ice_on={} ice_tied={} plain0={} plain1={} fireBtn={} iceBtn={} wantIce={}",
-                        ice_on(), ice_tied(), plain_bow(0), plain_bow(1), fire_button(), ice_button(), wantIce);
-    }
     bool canLight = wantIce ? true : can_fire();  // ice arrows cost nothing; fire needs oil
 
     int fire = find_burning(id);
